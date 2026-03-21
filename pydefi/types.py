@@ -17,12 +17,17 @@ class ChainId(IntEnum):
     OPTIMISM = 10
     BSC = 56
     POLYGON = 137
+    UNICHAIN = 130
+    WORLDCHAIN = 480
+    BASE = 8453
     ARBITRUM = 42161
     AVALANCHE = 43114
-    BASE = 8453
     LINEA = 59144
+    BLAST = 81457
     SCROLL = 534352
     ZKSYNC = 324
+    ZORA = 7777777
+    SEPOLIA = 11155111
 
 
 @dataclass(frozen=True)
@@ -143,6 +148,22 @@ class SwapRoute:
             + [s.token_out.symbol for s in self.steps]
         )
         return f"SwapRoute({path}, in={self.amount_in.human_amount}, out={self.amount_out.human_amount})"
+
+
+@dataclass
+class SwapTransaction:
+    """An encoded transaction ready to submit to the Uniswap Universal Router.
+
+    Attributes:
+        to: Target contract address (the Universal Router).
+        data: ABI-encoded calldata for the ``execute`` call.
+        value: Amount of native ETH (in wei) to attach to the transaction.
+            Typically non-zero only when wrapping ETH as part of the swap.
+    """
+
+    to: str
+    data: bytes
+    value: int = 0
 
 
 @dataclass
