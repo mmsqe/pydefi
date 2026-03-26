@@ -7,6 +7,7 @@ import pytest
 from pydefi.bridge.across import Across
 from pydefi.bridge.base import BaseBridge
 from pydefi.bridge.gaszip import _SUPPORTED_CHAINS, GasZip
+from pydefi.bridge.layerzero_oft import _LZ_EID, LayerZeroOFT
 from pydefi.bridge.mayan import _CHAIN_NAMES, Mayan
 from pydefi.bridge.relay import Relay
 from pydefi.bridge.stargate import _LZ_CHAIN_ID, _POOL_IDS, Stargate
@@ -540,3 +541,279 @@ class TestRelay:
         with patch.object(r, "_request_quote", new=AsyncMock(return_value=mock_api_response)):
             with pytest.raises(BridgeError):
                 await r.build_bridge_tx(USDC_ETH, USDC_ARB, amount_in, recipient)
+
+
+# ---------------------------------------------------------------------------
+# LayerZeroOFT tests
+# ---------------------------------------------------------------------------
+
+OFT_ADDRESS = "0x" + "DD" * 20
+OFT_DST_ADDRESS = "0x" + "EE" * 20
+
+# Tokens for unified-address OFTs (same contract address on every chain,
+# e.g. USDT0 at 0x1E4a5963aBFD975d8c9021ce480b42188849D41d).
+OFT_TOKEN_ETH = Token(
+    chain_id=ChainId.ETHEREUM,
+    address=OFT_ADDRESS,
+    symbol="OFT",
+    decimals=18,
+)
+OFT_TOKEN_ARB = Token(
+    chain_id=ChainId.ARBITRUM,
+    address=OFT_ADDRESS,
+    symbol="OFT",
+    decimals=18,
+)
+# Token for a non-unified OFT (different address on the destination chain).
+OFT_TOKEN_ARB_ALT = Token(
+    chain_id=ChainId.ARBITRUM,
+    address=OFT_DST_ADDRESS,
+    symbol="OFT",
+    decimals=18,
+)
+
+
+class TestLayerZeroOFT:
+    def test_protocol_name(self):
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        assert oft.protocol_name == "LayerZeroOFT"
+
+    def test_chain_ids_stored(self):
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        assert oft.src_chain_id == 1
+        assert oft.dst_chain_id == 42161
+
+    def test_dst_oft_address_defaults_to_oft_address(self):
+        """For unified-address OFTs, dst_oft_address defaults to oft_address."""
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        assert oft.dst_oft_address == OFT_ADDRESS
+
+    def test_dst_oft_address_explicit(self):
+        """Non-unified OFTs can specify a distinct destination address."""
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+            dst_oft_address=OFT_DST_ADDRESS,
+        )
+        assert oft.dst_oft_address == OFT_DST_ADDRESS
+
+    def test_lz_eid_known(self):
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        assert oft._lz_eid(1) == _LZ_EID[1]
+        assert oft._lz_eid(42161) == _LZ_EID[42161]
+
+    def test_lz_eid_unknown_raises(self):
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=999999,
+            oft_address=OFT_ADDRESS,
+        )
+        with pytest.raises(BridgeError):
+            oft._lz_eid(999999)
+
+    def test_address_to_bytes32(self):
+        addr = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+        result = LayerZeroOFT._address_to_bytes32(addr)
+        assert len(result) == 32
+        # Address bytes should appear in the last 20 bytes
+        assert result[:12] == b"\x00" * 12
+        assert result[12:].hex() == addr[2:].lower()
+
+    def test_apply_slippage(self):
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        assert oft._apply_slippage(1_000_000, 50) == 995_000
+        assert oft._apply_slippage(1_000_000, 0) == 1_000_000
+
+    @pytest.mark.asyncio
+    async def test_get_quote(self):
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        amount_in = TokenAmount.from_human(OFT_TOKEN_ETH, "1000")
+        quote = await oft.get_quote(OFT_TOKEN_ETH, OFT_TOKEN_ARB, amount_in)
+
+        assert quote.protocol == "LayerZeroOFT"
+        # OFT is 1:1 — no token protocol fee
+        assert quote.amount_out.amount == amount_in.amount
+        assert quote.bridge_fee.amount == 0
+        assert quote.estimated_time_seconds == 30
+
+    @pytest.mark.asyncio
+    async def test_get_quote_validates_token_in(self):
+        """get_quote raises BridgeError when token_in address does not match."""
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        wrong_token = Token(
+            chain_id=ChainId.ETHEREUM,
+            address="0x" + "FF" * 20,
+            symbol="WRONG",
+            decimals=18,
+        )
+        amount_in = TokenAmount.from_human(wrong_token, "10")
+        with pytest.raises(BridgeError, match="token_in"):
+            await oft.get_quote(wrong_token, OFT_TOKEN_ARB, amount_in)
+
+    @pytest.mark.asyncio
+    async def test_get_quote_validates_token_out(self):
+        """get_quote raises BridgeError when token_out address does not match."""
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        wrong_token = Token(
+            chain_id=ChainId.ARBITRUM,
+            address="0x" + "FF" * 20,
+            symbol="WRONG",
+            decimals=18,
+        )
+        amount_in = TokenAmount.from_human(OFT_TOKEN_ETH, "10")
+        with pytest.raises(BridgeError, match="token_out"):
+            await oft.get_quote(OFT_TOKEN_ETH, wrong_token, amount_in)
+
+    @pytest.mark.asyncio
+    async def test_get_quote_non_unified_oft(self):
+        """For a non-unified OFT, token_out must match dst_oft_address."""
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+            dst_oft_address=OFT_DST_ADDRESS,
+        )
+        amount_in = TokenAmount.from_human(OFT_TOKEN_ETH, "10")
+        quote = await oft.get_quote(OFT_TOKEN_ETH, OFT_TOKEN_ARB_ALT, amount_in)
+        assert quote.amount_out.amount == amount_in.amount
+
+    @pytest.mark.asyncio
+    async def test_quote_send_fee(self):
+        """quote_send_fee calls quoteSend on the underlying OFT contract."""
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        # Mock the underlying OFT contract call so we exercise the real
+        # quote_send_fee logic (EID mapping, send_param construction, contract wiring)
+        # rather than patching quote_send_fee itself.
+        mock_call = AsyncMock(return_value=(5 * 10**15, 0))
+        mock_quote_send = MagicMock(return_value=MagicMock(call=mock_call))
+        oft._oft = MagicMock()
+        oft._oft.fns = MagicMock()
+        oft._oft.fns.quoteSend = mock_quote_send
+
+        fee = await oft.quote_send_fee(1_000_000, "0x" + "AA" * 20)
+
+        assert fee == 5 * 10**15
+        mock_quote_send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_build_bridge_tx(self):
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        amount_in = TokenAmount.from_human(OFT_TOKEN_ETH, "1000")
+        recipient = "0x" + "AA" * 20
+
+        with patch.object(oft, "quote_send_fee", new=AsyncMock(return_value=5 * 10**15)):
+            tx = await oft.build_bridge_tx(OFT_TOKEN_ETH, OFT_TOKEN_ARB, amount_in, recipient)
+
+        assert tx["to"] == OFT_ADDRESS
+        assert tx["data"].startswith("0x")
+        assert tx["value"] == str(5 * 10**15)
+        assert int(tx["gas"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_build_bridge_tx_uses_refund_address(self):
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        amount_in = TokenAmount.from_human(OFT_TOKEN_ETH, "100")
+        recipient = "0x" + "AA" * 20
+        refund = "0x" + "BB" * 20
+
+        with patch.object(oft, "quote_send_fee", new=AsyncMock(return_value=10**15)):
+            tx = await oft.build_bridge_tx(OFT_TOKEN_ETH, OFT_TOKEN_ARB, amount_in, recipient, refund_address=refund)
+
+        assert tx["to"] == OFT_ADDRESS
+        # The refund address must be encoded into the calldata
+        assert refund[2:].lower() in tx["data"].lower()
+
+    @pytest.mark.asyncio
+    async def test_build_bridge_tx_validates_token_in(self):
+        """build_bridge_tx raises BridgeError when token_in address does not match."""
+        oft = LayerZeroOFT(
+            w3=None,
+            src_chain_id=1,
+            dst_chain_id=42161,
+            oft_address=OFT_ADDRESS,
+        )
+        wrong_token = Token(
+            chain_id=ChainId.ETHEREUM,
+            address="0x" + "FF" * 20,
+            symbol="WRONG",
+            decimals=18,
+        )
+        amount_in = TokenAmount.from_human(wrong_token, "10")
+        with pytest.raises(BridgeError, match="token_in"):
+            with patch.object(oft, "quote_send_fee", new=AsyncMock(return_value=10**15)):
+                await oft.build_bridge_tx(wrong_token, OFT_TOKEN_ARB, amount_in, "0x" + "AA" * 20)
+
+    def test_lz_eid_constants(self):
+        assert _LZ_EID[1] == 30101  # Ethereum
+        assert _LZ_EID[42161] == 30110  # Arbitrum
+        assert _LZ_EID[10] == 30111  # Optimism
+        assert _LZ_EID[8453] == 30184  # Base
+        assert _LZ_EID[56] == 30102  # BNB Chain
+        assert _LZ_EID[137] == 30109  # Polygon
+        assert _LZ_EID[43114] == 30106  # Avalanche
+        assert _LZ_EID[59144] == 30183  # Linea
+        assert _LZ_EID[534352] == 30214  # Scroll
+        assert _LZ_EID[81457] == 30243  # Blast
+        assert _LZ_EID[324] == 30165  # zkSync Era
+        assert _LZ_EID[7777777] == 30195  # Zora
+        assert _LZ_EID[130] == 30320  # Unichain
+        assert _LZ_EID[480] == 30337  # World Chain
