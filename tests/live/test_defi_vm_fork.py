@@ -19,10 +19,14 @@ Run with::
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
-from web3 import AsyncWeb3
+from eth_contract import Contract
+from eth_utils.crypto import keccak
+from web3 import AsyncWeb3, Web3
 from web3.exceptions import ContractLogicError, Web3RPCError
+from web3.types import TxParams
 
 from pydefi.vm.program import (
     assert_ge,
@@ -47,6 +51,7 @@ from pydefi.vm.program import (
     sub,
     swap,
 )
+from pydefi.vm.virtual_machine import VirtualMachine
 
 # ---------------------------------------------------------------------------
 # Optional: skip whole module if solcx not installed
@@ -61,6 +66,10 @@ SOL_FILE = REPO_ROOT / "pydefi" / "vm" / "DeFiVM.sol"
 
 # Well-known mainnet addresses used in fork tests
 WETH_MAINNET = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+USDC_MAINNET = Web3.to_checksum_address("0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+UNISWAP_V2_ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
+LZ_OFT_ZRO = Web3.to_checksum_address("0x6985884C4392D348587B19cb9eAAf157F13271cd")
+ARBITRUM_LZ_EID = 30110
 # Coinbase 8 — a well-funded address on mainnet (used for introspection only)
 WHALE = "0x77134cbC06cB00b66F4c7e623D5fdBF6777635EC"
 
@@ -97,6 +106,132 @@ async def _deploy(w3: AsyncWeb3, compiled: dict, deployer: str) -> str:
     tx_hash = await contract.constructor().transact({"from": deployer})
     receipt = await w3.eth.get_transaction_receipt(tx_hash)
     return receipt["contractAddress"]
+
+
+def _adapter_call_program(adapter: str, calldata: bytes, *, value: int = 0, require_success: bool = True) -> bytes:
+    return (
+        push_bytes(calldata)
+        + push_u256(value)
+        + push_addr(adapter)
+        + push_u256(0)
+        + call(require_success=require_success)
+        + pop()
+    )
+
+
+def _adapter_call_with_buffer_on_stack(adapter: str, *, value: int = 0, require_success: bool = True) -> bytes:
+    return push_u256(value) + push_addr(adapter) + push_u256(0) + call(require_success=require_success) + pop()
+
+
+UNISWAP_V2_GET_AMOUNTS_OUT_ABI = [
+    "function getAmountsOut(uint256 amountIn, address[] path) external view returns (uint256[] amounts)",
+]
+
+UNISWAP_V2_QUOTE_PATH = [
+    Web3.to_checksum_address(WETH_MAINNET),
+    Web3.to_checksum_address(USDC_MAINNET),
+]
+QUOTE_AMOUNT_IN = 10**16  # 0.01 WETH
+
+LZ_OFT_QUOTE_SEND_ABI = [
+    "function quoteSend((uint32 dstEid, bytes32 to, uint256 amountLD, uint256 minAmountLD, bytes extraOptions, bytes composeMsg, bytes oftCmd) _sendParam, bool _payInLzToken) external view returns (uint256 nativeFee, uint256 lzTokenFee)",
+]
+LZ_OFT_QUOTE_SEND_SELECTOR = keccak(text="quoteSend((uint32,bytes32,uint256,uint256,bytes,bytes,bytes),bool)")[:4]
+
+
+def _decode_get_amounts_out_last(retdata: bytes) -> int:
+    """Decode last uint256 from UniswapV2 getAmountsOut returndata."""
+    if len(retdata) < 64:
+        raise ValueError("retdata too short for dynamic array header")
+
+    arr_offset = int.from_bytes(retdata[0:32], "big")
+    if arr_offset + 32 > len(retdata):
+        raise ValueError("invalid array offset in retdata")
+
+    arr_len = int.from_bytes(retdata[arr_offset : arr_offset + 32], "big")
+    if arr_len == 0:
+        raise ValueError("empty amounts array in getAmountsOut returndata")
+
+    last_word = arr_offset + 32 * arr_len
+    if last_word + 32 > len(retdata):
+        raise ValueError("retdata too short for last amount word")
+
+    return int.from_bytes(retdata[last_word : last_word + 32], "big")
+
+
+def _decode_quote_send_amounts_and_flag(calldata: bytes) -> tuple[int, int, bool]:
+    """Decode amountLD/minAmountLD/payInLzToken from quoteSend calldata."""
+    if len(calldata) < 4 + 64:
+        raise ValueError("calldata too short for quoteSend args")
+
+    args = calldata[4:]
+    send_param_offset = int.from_bytes(args[0:32], "big")
+    pay_in_lz_token = bool(int.from_bytes(args[32:64], "big"))
+
+    # sendParam tuple head layout:
+    # 0: dstEid, 1: to, 2: amountLD, 3: minAmountLD, 4/5/6: dynamic offsets
+    tuple_head_start = send_param_offset
+    if tuple_head_start + 128 > len(args):
+        raise ValueError("calldata too short for sendParam head")
+
+    amount_ld = int.from_bytes(args[tuple_head_start + 64 : tuple_head_start + 96], "big")
+    min_amount_ld = int.from_bytes(args[tuple_head_start + 96 : tuple_head_start + 128], "big")
+    return amount_ld, min_amount_ld, pay_in_lz_token
+
+
+def _decode_quote_send_amounts_for_planner(calldata: bytes) -> tuple[int, int] | None:
+    """Bridge sanity decoder shape expected by planner bridge_amount_decoders."""
+    if calldata[:4] != LZ_OFT_QUOTE_SEND_SELECTOR:
+        return None
+    amount_ld, min_amount_ld, _ = _decode_quote_send_amounts_and_flag(calldata)
+    return amount_ld, min_amount_ld
+
+
+def _tx_data_bytes(raw: Any) -> bytes:
+    if isinstance(raw, dict):
+        raw = raw.get("data")
+    assert isinstance(raw, (str, bytes)), "expected transaction data field"
+    if isinstance(raw, bytes):
+        return raw
+    return bytes.fromhex(raw.removeprefix("0x"))
+
+
+def _to_return_bytes(raw: Any) -> bytes:
+    if isinstance(raw, bytes):
+        return raw
+    if isinstance(raw, bytearray):
+        return bytes(raw)
+    if isinstance(raw, str):
+        hex_raw = raw[2:] if raw.startswith("0x") else raw
+        return bytes.fromhex(hex_raw)
+    return bytes(raw)
+
+
+def _make_async_eth_call_executor(
+    w3: AsyncWeb3,
+    deployer: str,
+    call_records: list[tuple[str, bytes, int, bytes]],
+):
+    async def _executor(target: str, calldata: bytes, value: int) -> bytes:
+        tx = cast(
+            TxParams,
+            {
+                "to": Web3.to_checksum_address(target),
+                "data": "0x" + calldata.hex(),
+                "value": value,
+                "from": deployer,
+            },
+        )
+        try:
+            result = await w3.eth.call(tx, block_identifier="latest")
+        except TypeError:
+            result = await w3.eth.call(tx, "latest")
+
+        retdata = _to_return_bytes(result)
+        call_records.append((target, calldata, value, retdata))
+        return retdata
+
+    return _executor
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +550,10 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         selector = keccak(b"getFortyTwo()")[:4]
         calldata = bytes(selector)
 
-        program = (
-            push_bytes(calldata) + push_u256(0) + push_addr(adapter) + push_u256(0) + call(require_success=True) + pop()
-        )
+        program = _adapter_call_program(adapter, calldata)
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
@@ -434,21 +565,10 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         selector = keccak(b"getFortyTwo()")[:4]
         calldata = bytes(selector)
 
-        program = (
-            push_bytes(calldata)
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
-            + ret_u256(0)
-            + pop()
-        )
+        program = _adapter_call_program(adapter, calldata) + ret_u256(0) + pop()
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
@@ -460,21 +580,10 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         selector = keccak(b"getFortyTwo()")[:4]
         calldata = bytes(selector)
 
-        program = (
-            push_bytes(calldata)
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
-            + ret_slice(0, 32)
-            + pop()
-        )
+        program = _adapter_call_program(adapter, calldata) + ret_slice(0, 32) + pop()
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
@@ -490,8 +599,6 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         # Use a dummy 4-byte selector that doesn't match any explicit function,
         # so the call is routed to MockAdapter.fallback() which emits Called and echoes calldata.
         selector = b"\xde\xad\xbe\xef"
@@ -501,11 +608,7 @@ class TestDeFiVMFork:
             push_bytes(bytes(template))
             + push_u256(0xABCD)
             + patch_u256(4)
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
+            + _adapter_call_with_buffer_on_stack(adapter)
         )
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
@@ -534,26 +637,20 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         # Use a dummy 4-byte selector to trigger MockAdapter.fallback()
         # which emits Called(sender, value, data) and echoes calldata.
         selector = b"\xca\xfe\xba\xbe"
         template = bytearray(selector + b"\x00" * 32)
 
-        # patch_offset=16: write the 20-byte address at byte 16 of the buffer,
+        # address_slot_offset=16: write the 20-byte address at byte 16 of the buffer,
         # which fills the right half of the 32-byte ABI slot starting at offset 4.
-        patch_offset = 4 + 12
+        address_slot_offset = 4 + 12
 
         program = (
             push_bytes(bytes(template))
             + push_addr(adapter)
-            + patch_addr(patch_offset)
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
+            + patch_addr(address_slot_offset)
+            + _adapter_call_with_buffer_on_stack(adapter)
         )
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
@@ -591,30 +688,19 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         double_sel = keccak(b"double(uint256)")[:4]
         calldata1 = double_sel + (5).to_bytes(32, "big")
         template2 = double_sel + (0).to_bytes(32, "big")  # placeholder; patched at runtime
 
         program = (
             # --- Call 1: double(5) → retdata = abi.encode(10) ---
-            push_bytes(calldata1)
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
+            _adapter_call_program(adapter, calldata1)
             # --- Calldata surgery: embed call-1 output into call-2 template ---
             + push_bytes(template2)  # stack: [buf1]
             + ret_u256(0)  # push 10 from retdata; stack: [buf1, 10]
             + patch_u256(4)  # patch buf1[4..36] = abi.encode(10); stack: [buf1]
             # --- Call 2: double(10) → retdata = abi.encode(20) ---
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
+            + _adapter_call_with_buffer_on_stack(adapter)
             # --- In-program assertion: result == 20 ---
             + push_u256(20)
             + ret_u256(0)
@@ -638,8 +724,6 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         double_sel = keccak(b"double(uint256)")[:4]
         add_sel = keccak(b"addInputs(uint256,uint256)")[:4]
 
@@ -649,22 +733,13 @@ class TestDeFiVMFork:
 
         program = (
             # --- Call 1: double(7) → retdata = abi.encode(14) ---
-            push_bytes(calldata1)
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
+            _adapter_call_program(adapter, calldata1)
             # --- Calldata surgery: embed call-1 output into the first arg of call-2 ---
             + push_bytes(template2)  # stack: [buf1]
             + ret_u256(0)  # push 14; stack: [buf1, 14]
             + patch_u256(4)  # patch buf1[4..36] = abi.encode(14); stack: [buf1]
             # --- Call 2: addInputs(14, 3) → retdata = abi.encode(17) ---
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
+            + _adapter_call_with_buffer_on_stack(adapter)
             # --- In-program assertion: result == 17 ---
             + push_u256(17)
             + ret_u256(0)
@@ -690,8 +765,6 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         # encodeDouble(uint256) returns bytes memory.
         # ABI layout of its returndata:
         #   [0..32)  offset of bytes value = 0x20
@@ -702,21 +775,12 @@ class TestDeFiVMFork:
 
         program = (
             # --- Call 1: encodeDouble(5) → retdata carries calldata for double(5) ---
-            push_bytes(calldata1)
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
+            _adapter_call_program(adapter, calldata1)
             # --- Surgery: extract the inner bytes as a new buffer ---
             # retdata[64..100] = selector(4) + abi.encode(5) = calldata for double(5)
             + ret_slice(64, 36)  # stack: [buf1]
             # --- Call 2: double(5) using the slice from call-1's returndata ---
-            + push_u256(0)
-            + push_addr(adapter)
-            + push_u256(0)
-            + call(require_success=True)
-            + pop()
+            + _adapter_call_with_buffer_on_stack(adapter)
             # --- In-program assertion: result == 10 ---
             + push_u256(10)
             + ret_u256(0)
@@ -728,6 +792,81 @@ class TestDeFiVMFork:
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
+
+    async def test_chained_real_dex_to_real_bridge_quote_surgery(self, ctx):
+        """PoC: real DEX quote output patched into real bridge quote input.
+
+        New method (Blueprint + VirtualMachine):
+        1) Planner analyzer infers placeholders from swap/bridge tx payloads.
+        2) Builder calls UniswapV2 ``getAmountsOut(WETH->USDC)``.
+        3) Extract amountOut from previous returndata (RET_LAST32 path).
+        4) Patch LayerZero OFT ``quoteSend`` calldata ``amountLD``.
+        5) Assert patched amount equals DEX amountOut and nativeFee > 0.
+        """
+        w3 = ctx["w3"]
+        deployer = ctx["deployer"]
+
+        router = Contract.from_abi(UNISWAP_V2_GET_AMOUNTS_OUT_ABI, to=UNISWAP_V2_ROUTER)
+        oft = Contract.from_abi(LZ_OFT_QUOTE_SEND_ABI, to=LZ_OFT_ZRO)
+        recipient_bytes32 = bytes.fromhex(deployer.removeprefix("0x")).rjust(32, b"\x00")
+
+        swap_calldata = _tx_data_bytes(router.fns.getAmountsOut(QUOTE_AMOUNT_IN, UNISWAP_V2_QUOTE_PATH).data)
+        bridge_calldata = _tx_data_bytes(
+            oft.fns.quoteSend(
+                (
+                    ARBITRUM_LZ_EID,
+                    recipient_bytes32,
+                    QUOTE_AMOUNT_IN,
+                    0,
+                    b"",
+                    b"",
+                    b"",
+                ),
+                False,
+            ).data
+        )
+
+        swap_quote = {
+            "amount_in": QUOTE_AMOUNT_IN,
+            "tx_data": {"to": UNISWAP_V2_ROUTER, "data": swap_calldata},
+        }
+        bridge_tx = {"to": LZ_OFT_ZRO, "data": bridge_calldata}
+
+        call_records: list[tuple[str, bytes, int, bytes]] = []
+        runtime_vm = VirtualMachine(async_call_executor=_make_async_eth_call_executor(w3, deployer, call_records))
+
+        result = await runtime_vm.compose(
+            from_token=WETH_MAINNET,
+            to_token=USDC_MAINNET,
+            amount=QUOTE_AMOUNT_IN,
+            dst_chain=ARBITRUM_LZ_EID,
+            receiver=deployer,
+            swap_quote=swap_quote,
+            bridge_tx=bridge_tx,
+            amm=UNISWAP_V2_ROUTER,
+            bridge=LZ_OFT_ZRO,
+            token_out=USDC_MAINNET,
+            dst_token=USDC_MAINNET,
+            bridge_amount_decoders={
+                LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
+            },
+        )
+
+        assert len(call_records) == 2
+        first_target, _, _, first_retdata = call_records[0]
+        second_target, second_calldata, _, _ = call_records[1]
+        assert first_target.lower() == UNISWAP_V2_ROUTER.lower()
+        assert second_target.lower() == LZ_OFT_ZRO.lower()
+
+        amount_out = _decode_get_amounts_out_last(first_retdata)
+        amount_ld, min_amount_ld, pay_in_lz_token = _decode_quote_send_amounts_and_flag(second_calldata)
+        assert pay_in_lz_token is False
+        assert amount_out > 0
+        assert amount_ld == amount_out
+        assert min_amount_ld == 0
+
+        native_fee = int.from_bytes(result[:32], "big")
+        assert native_fee > 0
 
     # ------------------------------------------------------------------
     # Safety / limits

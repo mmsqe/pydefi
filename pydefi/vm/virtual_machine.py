@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable as AwaitableABC
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Tuple
 
 from .patcher import Patcher
@@ -11,21 +12,41 @@ if TYPE_CHECKING:
 
 CallExecutor = Callable[[str, bytes, int], Tuple[bool, bytes] | bytes]
 AsyncCallExecutor = Callable[[str, bytes, int], Awaitable[Tuple[bool, bytes] | bytes]]
+ComposeResolver = Callable[[Any, Any, int, Any], Awaitable[dict[str, Any]] | dict[str, Any]]
 
 
 class VirtualMachine:
     """Minimal Python virtual machine for Blueprint command execution."""
+
+    _DEFAULT_COMPOSE_RECEIVER = "0x000000000000000000000000000000000000dEaD"
+    _COMPOSE_CONTEXT_KEYS = (
+        "swap_quote",
+        "bridge_tx",
+        "amm",
+        "bridge",
+        "token_out",
+        "dst_token",
+        "receiver",
+        "execution_kwargs",
+    )
 
     def __init__(
         self,
         register_count: int = 16,
         call_executor: CallExecutor | None = None,
         async_call_executor: AsyncCallExecutor | None = None,
+        compose_resolver: ComposeResolver | None = None,
     ):
         self._register_count = register_count
         self._call_executor = call_executor
         self._async_call_executor = async_call_executor
+        self._compose_resolver = compose_resolver
         self.registers: List[bytes] = [b""] * self._register_count
+
+    def set_compose_resolver(self, resolver: ComposeResolver | None) -> "VirtualMachine":
+        """Set or clear route resolver used by :meth:`compose`."""
+        self._compose_resolver = resolver
+        return self
 
     @classmethod
     def from_web3(
@@ -151,6 +172,72 @@ class VirtualMachine:
         from .builder import DeFiBuilder
 
         return DeFiBuilder(self)
+
+    async def compose(
+        self,
+        *,
+        from_token: Any,
+        to_token: Any,
+        amount: int,
+        dst_chain: Any,
+        receiver: str | None = None,
+        compose_resolver: ComposeResolver | None = None,
+        **execution_overrides: Any,
+    ) -> bytes:
+        """Compose and execute a flow using only high-level token inputs.
+
+        Route context can be provided either by a resolver or inline kwargs.
+        Required keys: ``swap_quote``, ``bridge_tx``, ``amm``, ``bridge``.
+        Optional keys: ``token_out``, ``dst_token``, ``receiver``,
+        ``execution_kwargs``.
+        """
+
+        resolver = compose_resolver or self._compose_resolver
+        context: dict[str, Any]
+        if resolver is not None:
+            resolved = resolver(from_token, to_token, amount, dst_chain)
+            if isinstance(resolved, AwaitableABC):
+                context = await resolved
+            else:
+                context = resolved
+        else:
+            context = {}
+            for key in self._COMPOSE_CONTEXT_KEYS:
+                if key in execution_overrides:
+                    context[key] = execution_overrides.pop(key)
+
+            if not context:
+                raise ValueError(
+                    "compose requires either compose_resolver or inline route context keys: "
+                    "swap_quote, bridge_tx, amm, bridge"
+                )
+
+        required = {"swap_quote", "bridge_tx", "amm", "bridge"}
+        missing = sorted(required - set(context.keys()))
+        if missing:
+            raise ValueError(f"compose route context missing required keys: {missing}")
+
+        receiver_addr = receiver or context.get("receiver") or self._DEFAULT_COMPOSE_RECEIVER
+
+        compose_builder = self.builder().from_token(from_token, amount_in=amount).to(receiver_addr)
+
+        execute_kwargs = dict(context.get("execution_kwargs", {}))
+        execute_kwargs.update(execution_overrides)
+
+        from .planner import execute_flow_from_quotes_async
+
+        result = await execute_flow_from_quotes_async(
+            compose_builder,
+            swap_quote=context["swap_quote"],
+            bridge_tx=context["bridge_tx"],
+            amm=context["amm"],
+            token_out=context.get("token_out", to_token),
+            bridge=context["bridge"],
+            dst_chain=dst_chain,
+            dst_token=context.get("dst_token", to_token),
+            **execute_kwargs,
+        )
+        return result
 
     def _require_register(self, reg_idx: int) -> None:
         if reg_idx < 0 or reg_idx >= len(self.registers):
