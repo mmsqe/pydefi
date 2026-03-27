@@ -320,7 +320,14 @@ contract DeFiVM {
                 s.retdata = ret;
 
                 if (requireSuccess) {
-                    require(ok, "DeFiVM: adapter call failed");
+                    if (!ok) {
+                        if (ret.length > 0) {
+                            assembly {
+                                revert(add(ret, 32), mload(ret))
+                            }
+                        }
+                        revert("DeFiVM: adapter call failed");
+                    }
                 }
                 _push(s, ok ? bytes32(uint256(1)) : bytes32(0));
 
