@@ -129,6 +129,12 @@ class VirtualMachine:
         ``execution_kwargs``.
         """
 
+        # Strip route-context keys from execution_overrides to avoid duplicate kwargs.
+        route_context_overrides: dict[str, Any] = {}
+        for key in self._COMPOSE_CONTEXT_KEYS:
+            if key in execution_overrides:
+                route_context_overrides[key] = execution_overrides.pop(key)
+
         resolver = compose_resolver or self._compose_resolver
         context: dict[str, Any]
         if resolver is not None:
@@ -137,11 +143,11 @@ class VirtualMachine:
                 context = await resolved
             else:
                 context = resolved
+
+            if route_context_overrides:
+                context = {**context, **route_context_overrides}
         else:
-            context = {}
-            for key in self._COMPOSE_CONTEXT_KEYS:
-                if key in execution_overrides:
-                    context[key] = execution_overrides.pop(key)
+            context = route_context_overrides
 
             if not context:
                 raise ValueError(
