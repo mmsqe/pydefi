@@ -793,15 +793,12 @@ class TestDeFiVMFork:
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-    async def test_chained_real_dex_to_real_bridge_quote_surgery(self, ctx):
-        """PoC: real DEX quote output patched into real bridge quote input.
-
-        New method (Blueprint + VirtualMachine):
-        1) Planner analyzer infers placeholders from swap/bridge tx payloads.
-        2) Builder calls UniswapV2 ``getAmountsOut(WETH->USDC)``.
-        3) Extract amountOut from previous returndata (RET_LAST32 path).
-        4) Patch LayerZero OFT ``quoteSend`` calldata ``amountLD``.
-        5) Assert patched amount equals DEX amountOut and nativeFee > 0.
+    @pytest.mark.parametrize("use_builder", [False, True], ids=["compose_planner", "builder_chain"])
+    async def test_chained_real_dex_to_real_bridge_quote_surgery(self, ctx, use_builder: bool):
+        """PoC: patch DEX quote output into bridge quote input.
+        1) Call UniswapV2 ``getAmountsOut(WETH->USDC)``.
+        2) Extract ``amountOut`` from swap returndata (RET_LAST32 path).
+        3) Patch LayerZero OFT ``quoteSend`` calldata ``amountLD``.
         """
         w3 = ctx["w3"]
         deployer = ctx["deployer"]
@@ -826,31 +823,53 @@ class TestDeFiVMFork:
             ).data
         )
 
-        swap_quote = {
-            "amount_in": QUOTE_AMOUNT_IN,
-            "tx_data": {"to": UNISWAP_V2_ROUTER, "data": swap_calldata},
-        }
-        bridge_tx = {"to": LZ_OFT_ZRO, "data": bridge_calldata}
-
         call_records: list[tuple[str, bytes, int, bytes]] = []
-        runtime_vm = VirtualMachine(async_call_executor=_make_async_eth_call_executor(w3, deployer, call_records))
+        runtime_vm = VirtualMachine(call_executor=_make_async_eth_call_executor(w3, deployer, call_records))
 
-        result = await runtime_vm.compose(
-            from_token=WETH_MAINNET,
-            to_token=USDC_MAINNET,
-            amount=QUOTE_AMOUNT_IN,
-            dst_chain=ARBITRUM_LZ_EID,
-            receiver=deployer,
-            swap_quote=swap_quote,
-            bridge_tx=bridge_tx,
-            amm=UNISWAP_V2_ROUTER,
-            bridge=LZ_OFT_ZRO,
-            token_out=USDC_MAINNET,
-            dst_token=USDC_MAINNET,
-            bridge_amount_decoders={
-                LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
-            },
-        )
+        if use_builder:
+            result = await (
+                runtime_vm.builder()
+                .from_token(WETH_MAINNET, amount_in=QUOTE_AMOUNT_IN)
+                .to(deployer)
+                .swap(
+                    UNISWAP_V2_ROUTER,
+                    USDC_MAINNET,
+                    swap_calldata,
+                    amount_placeholder=QUOTE_AMOUNT_IN,
+                )
+                .amount_from_prev_call()
+                .bridge(
+                    LZ_OFT_ZRO,
+                    ARBITRUM_LZ_EID,
+                    USDC_MAINNET,
+                    amount_placeholder=QUOTE_AMOUNT_IN,
+                    calldata_template=bridge_calldata,
+                )
+                .execute_async()
+            )
+        else:
+            swap_quote = {
+                "amount_in": QUOTE_AMOUNT_IN,
+                "tx_data": {"to": UNISWAP_V2_ROUTER, "data": swap_calldata},
+            }
+            bridge_tx = {"to": LZ_OFT_ZRO, "data": bridge_calldata}
+
+            result = await runtime_vm.compose(
+                from_token=WETH_MAINNET,
+                to_token=USDC_MAINNET,
+                amount=QUOTE_AMOUNT_IN,
+                dst_chain=ARBITRUM_LZ_EID,
+                receiver=deployer,
+                swap_quote=swap_quote,
+                bridge_tx=bridge_tx,
+                amm=UNISWAP_V2_ROUTER,
+                bridge=LZ_OFT_ZRO,
+                token_out=USDC_MAINNET,
+                dst_token=USDC_MAINNET,
+                bridge_amount_decoders={
+                    LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
+                },
+            )
 
         assert len(call_records) == 2
         first_target, _, _, first_retdata = call_records[0]

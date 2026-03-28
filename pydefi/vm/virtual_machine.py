@@ -10,8 +10,7 @@ if TYPE_CHECKING:
     from .builder import DeFiBuilder
 
 
-CallExecutor = Callable[[str, bytes, int], Tuple[bool, bytes] | bytes]
-AsyncCallExecutor = Callable[[str, bytes, int], Awaitable[Tuple[bool, bytes] | bytes]]
+CallExecutor = Callable[[str, bytes, int], Awaitable[Tuple[bool, bytes] | bytes]]
 ComposeResolver = Callable[[Any, Any, int, Any], Awaitable[dict[str, Any]] | dict[str, Any]]
 
 
@@ -34,12 +33,10 @@ class VirtualMachine:
         self,
         register_count: int = 16,
         call_executor: CallExecutor | None = None,
-        async_call_executor: AsyncCallExecutor | None = None,
         compose_resolver: ComposeResolver | None = None,
     ):
         self._register_count = register_count
         self._call_executor = call_executor
-        self._async_call_executor = async_call_executor
         self._compose_resolver = compose_resolver
         self.registers: List[bytes] = [b""] * self._register_count
 
@@ -47,37 +44,6 @@ class VirtualMachine:
         """Set or clear route resolver used by :meth:`compose`."""
         self._compose_resolver = resolver
         return self
-
-    @classmethod
-    def from_web3(
-        cls,
-        w3: Any,
-        *,
-        sender: str | None = None,
-        block_identifier: Any = "latest",
-        register_count: int = 16,
-    ) -> "VirtualMachine":
-        """Create a VM wired to a sync web3 provider via eth_call."""
-
-        def _executor(target: str, calldata: bytes, value: int) -> bytes:
-            tx = {
-                "to": target,
-                "data": "0x" + calldata.hex(),
-                "value": value,
-            }
-            if sender is not None:
-                tx["from"] = sender
-
-            try:
-                result = w3.eth.call(tx, block_identifier=block_identifier)
-            except TypeError:
-                result = w3.eth.call(tx, block_identifier)
-
-            if isinstance(result, str):
-                return bytes.fromhex(result.removeprefix("0x"))
-            return bytes(result)
-
-        return cls(register_count=register_count, call_executor=_executor)
 
     @classmethod
     def from_async_web3(
@@ -108,35 +74,6 @@ class VirtualMachine:
                 return bytes.fromhex(result.removeprefix("0x"))
             return bytes(result)
 
-        return cls(register_count=register_count, async_call_executor=_executor)
-
-    @classmethod
-    def from_web3_transact(
-        cls,
-        w3: Any,
-        *,
-        sender: str,
-        gas: int | None = None,
-        register_count: int = 16,
-    ) -> "VirtualMachine":
-        """Create a VM wired to a sync web3 provider via send_transaction."""
-
-        def _executor(target: str, calldata: bytes, value: int) -> tuple[bool, bytes]:
-            tx: dict[str, Any] = {
-                "to": target,
-                "data": "0x" + calldata.hex(),
-                "value": value,
-                "from": sender,
-            }
-            if gas is not None:
-                tx["gas"] = gas
-
-            tx_hash = w3.eth.send_transaction(tx)
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-            status = receipt.get("status", 1)
-            tx_hash_bytes = bytes(tx_hash)
-            return bool(status == 1), tx_hash_bytes
-
         return cls(register_count=register_count, call_executor=_executor)
 
     @classmethod
@@ -166,7 +103,7 @@ class VirtualMachine:
             tx_hash_bytes = bytes(tx_hash)
             return bool(status == 1), tx_hash_bytes
 
-        return cls(register_count=register_count, async_call_executor=_executor)
+        return cls(register_count=register_count, call_executor=_executor)
 
     def builder(self) -> "DeFiBuilder":
         from .builder import DeFiBuilder
@@ -419,12 +356,8 @@ class VirtualMachine:
 
     def _perform_call(self, cmd: VMCommand):
         """Execute CALL-like command via injected executor or local fallback."""
-        target, value, calldata = self._decode_call(cmd)
-
-        if self._call_executor is None:
-            success, return_data = True, calldata
-        else:
-            success, return_data = self._normalize_exec_result(self._call_executor(target, calldata, value))
+        _, _, calldata = self._decode_call(cmd)
+        success, return_data = True, calldata
 
         self._store_call_result(success, return_data)
 
@@ -432,10 +365,8 @@ class VirtualMachine:
         """Async CALL execution for AsyncWeb3-backed workflows."""
         target, value, calldata = self._decode_call(cmd)
 
-        if self._async_call_executor is not None:
-            success, return_data = self._normalize_exec_result(await self._async_call_executor(target, calldata, value))
-        elif self._call_executor is not None:
-            success, return_data = self._normalize_exec_result(self._call_executor(target, calldata, value))
+        if self._call_executor is not None:
+            success, return_data = self._normalize_exec_result(await self._call_executor(target, calldata, value))
         else:
             success, return_data = True, calldata
 
