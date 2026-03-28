@@ -28,6 +28,7 @@ from web3 import AsyncWeb3, Web3
 from web3.exceptions import ContractLogicError, Web3RPCError
 from web3.types import TxParams
 
+from pydefi.vm.planner import ExtractionMode
 from pydefi.vm.program import (
     assert_ge,
     assert_le,
@@ -68,6 +69,9 @@ SOL_FILE = REPO_ROOT / "pydefi" / "vm" / "DeFiVM.sol"
 WETH_MAINNET = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 USDC_MAINNET = Web3.to_checksum_address("0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
 UNISWAP_V2_ROUTER = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
+UNISWAP_V3_ROUTER = Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564")
+UNISWAP_V3_QUOTER = Web3.to_checksum_address("0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
+UNISWAP_V3_POOL_FEE_3000 = 3000
 LZ_OFT_ZRO = Web3.to_checksum_address("0x6985884C4392D348587B19cb9eAAf157F13271cd")
 ARBITRUM_LZ_EID = 30110
 # Coinbase 8 — a well-funded address on mainnet (used for introspection only)
@@ -127,6 +131,10 @@ UNISWAP_V2_GET_AMOUNTS_OUT_ABI = [
     "function getAmountsOut(uint256 amountIn, address[] path) external view returns (uint256[] amounts)",
 ]
 
+UNISWAP_V3_QUOTER_ABI = [
+    "function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96) params) external returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)",
+]
+
 UNISWAP_V2_QUOTE_PATH = [
     Web3.to_checksum_address(WETH_MAINNET),
     Web3.to_checksum_address(USDC_MAINNET),
@@ -157,6 +165,13 @@ def _decode_get_amounts_out_last(retdata: bytes) -> int:
         raise ValueError("retdata too short for last amount word")
 
     return int.from_bytes(retdata[last_word : last_word + 32], "big")
+
+
+def _decode_uniswap_v3_quote_amount_out(retdata: bytes) -> int:
+    """Decode amountOut from QuoterV2 quoteExactInputSingle returndata."""
+    if len(retdata) < 32:
+        raise ValueError("retdata too short for QuoterV2 amountOut")
+    return int.from_bytes(retdata[:32], "big")
 
 
 def _decode_quote_send_amounts_and_flag(calldata: bytes) -> tuple[int, int, bool]:
@@ -794,20 +809,46 @@ class TestDeFiVMFork:
         assert receipt["status"] == 1
 
     @pytest.mark.parametrize("use_builder", [False, True], ids=["compose_planner", "builder_chain"])
-    async def test_chained_real_dex_to_real_bridge_quote_surgery(self, ctx, use_builder: bool):
+    @pytest.mark.parametrize("swap_source", ["v2_router", "v3_quoter"])
+    async def test_chained_real_dex_to_real_bridge_quote_surgery(self, ctx, use_builder: bool, swap_source: str):
         """PoC: patch DEX quote output into bridge quote input.
-        1) Call UniswapV2 ``getAmountsOut(WETH->USDC)``.
-        2) Extract ``amountOut`` from swap returndata (RET_LAST32 path).
+        1) Call DEX quote endpoint (UniswapV2 router or UniswapV3 quoter).
+        2) Extract ``amountOut`` from swap returndata (v2: RET_LAST32, v3: RET_U256(0)).
         3) Patch LayerZero OFT ``quoteSend`` calldata ``amountLD``.
         """
         w3 = ctx["w3"]
         deployer = ctx["deployer"]
+        extraction_mode = ExtractionMode.RET_LAST32
+        extraction_offset: int | None = None
 
-        router = Contract.from_abi(UNISWAP_V2_GET_AMOUNTS_OUT_ABI, to=UNISWAP_V2_ROUTER)
         oft = Contract.from_abi(LZ_OFT_QUOTE_SEND_ABI, to=LZ_OFT_ZRO)
         recipient_bytes32 = bytes.fromhex(deployer.removeprefix("0x")).rjust(32, b"\x00")
 
-        swap_calldata = _tx_data_bytes(router.fns.getAmountsOut(QUOTE_AMOUNT_IN, UNISWAP_V2_QUOTE_PATH).data)
+        if swap_source == "v2_router":
+            v2_router = Contract.from_abi(UNISWAP_V2_GET_AMOUNTS_OUT_ABI, to=UNISWAP_V2_ROUTER)
+            swap_target = UNISWAP_V2_ROUTER
+            swap_calldata = _tx_data_bytes(v2_router.fns.getAmountsOut(QUOTE_AMOUNT_IN, UNISWAP_V2_QUOTE_PATH).data)
+            decode_amount_out = _decode_get_amounts_out_last
+        else:
+            # Note: V3 router itself is swap-only; quote path uses QuoterV2.
+            v3_quoter = Contract.from_abi(UNISWAP_V3_QUOTER_ABI, to=UNISWAP_V3_QUOTER)
+            swap_target = UNISWAP_V3_QUOTER
+            # QuoterV2 returns amountOut as the first tuple word, not the last one.
+            extraction_mode = ExtractionMode.RET_U256
+            extraction_offset = 0
+            swap_calldata = _tx_data_bytes(
+                v3_quoter.fns.quoteExactInputSingle(
+                    (
+                        Web3.to_checksum_address(WETH_MAINNET),
+                        USDC_MAINNET,
+                        QUOTE_AMOUNT_IN,
+                        UNISWAP_V3_POOL_FEE_3000,
+                        0,
+                    )
+                ).data
+            )
+            decode_amount_out = _decode_uniswap_v3_quote_amount_out
+
         bridge_calldata = _tx_data_bytes(
             oft.fns.quoteSend(
                 (
@@ -832,12 +873,11 @@ class TestDeFiVMFork:
                 .from_token(WETH_MAINNET, amount_in=QUOTE_AMOUNT_IN)
                 .to(deployer)
                 .swap(
-                    UNISWAP_V2_ROUTER,
+                    swap_target,
                     USDC_MAINNET,
                     swap_calldata,
                     amount_placeholder=QUOTE_AMOUNT_IN,
                 )
-                .amount_from_prev_call()
                 .bridge(
                     LZ_OFT_ZRO,
                     ARBITRUM_LZ_EID,
@@ -850,7 +890,7 @@ class TestDeFiVMFork:
         else:
             swap_quote = {
                 "amount_in": QUOTE_AMOUNT_IN,
-                "tx_data": {"to": UNISWAP_V2_ROUTER, "data": swap_calldata},
+                "tx_data": {"to": swap_target, "data": swap_calldata},
             }
             bridge_tx = {"to": LZ_OFT_ZRO, "data": bridge_calldata}
 
@@ -862,10 +902,12 @@ class TestDeFiVMFork:
                 receiver=deployer,
                 swap_quote=swap_quote,
                 bridge_tx=bridge_tx,
-                amm=UNISWAP_V2_ROUTER,
+                amm=swap_target,
                 bridge=LZ_OFT_ZRO,
                 token_out=USDC_MAINNET,
                 dst_token=USDC_MAINNET,
+                extraction_mode=extraction_mode,
+                extraction_offset=extraction_offset,
                 bridge_amount_decoders={
                     LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
                 },
@@ -874,10 +916,10 @@ class TestDeFiVMFork:
         assert len(call_records) == 2
         first_target, _, _, first_retdata = call_records[0]
         second_target, second_calldata, _, _ = call_records[1]
-        assert first_target.lower() == UNISWAP_V2_ROUTER.lower()
+        assert first_target.lower() == swap_target.lower()
         assert second_target.lower() == LZ_OFT_ZRO.lower()
 
-        amount_out = _decode_get_amounts_out_last(first_retdata)
+        amount_out = decode_amount_out(first_retdata)
         amount_ld, min_amount_ld, pay_in_lz_token = _decode_quote_send_amounts_and_flag(second_calldata)
         assert pay_in_lz_token is False
         assert amount_out > 0

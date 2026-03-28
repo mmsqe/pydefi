@@ -12,6 +12,16 @@ class DeFiBuilder:
     _AMOUNT_REG = 1
     _SWAP_CALLDATA_REG = 2
     _BRIDGE_CALLDATA_REG = 3
+    _RET_U256_WORD0_SELECTORS = {
+        # Uniswap V3 QuoterV1
+        bytes.fromhex("f7729d43"),  # quoteExactInputSingle(address,address,uint24,uint256,uint160)
+        bytes.fromhex("cdca1753"),  # quoteExactInput(bytes,uint256)
+        bytes.fromhex("30d07f21"),  # quoteExactOutputSingle(address,address,uint24,uint256,uint160)
+        bytes.fromhex("2f80bb1d"),  # quoteExactOutput(bytes,uint256)
+        # Uniswap V3 QuoterV2
+        bytes.fromhex("c6a5026a"),  # quoteExactInputSingle((address,address,uint256,uint24,uint160))
+        bytes.fromhex("bd21704a"),  # quoteExactOutputSingle((address,address,uint256,uint24,uint160))
+    }
 
     def __init__(self, vm: Any):
         self.vm = vm
@@ -89,6 +99,40 @@ class DeFiBuilder:
         if self.blueprint is None:
             raise ValueError("please call from_token() first")
         return self.blueprint
+
+    def _infer_prev_call_amount_extraction(self) -> tuple[str, bytes]:
+        """Infer RET_* opcode to extract amount from previous CALL returndata.
+        - Known Uniswap V3/V3 Quoter `quoteExact*` → amount at word 0 → RET_U256(0)
+        - V2 `getAmountsOut` / `getAmountsIn` → dynamic array → fallback
+        - Default → RET_LAST32
+        """
+        bp = self._require_blueprint()
+
+        if not bp.commands:
+            return "RET_LAST32", b""
+
+        for cmd in reversed(bp.commands):
+            if cmd.opcode != "CALL":
+                continue
+
+            calldata_reg = cmd.registers[0] if cmd.registers else 0
+            for prev in reversed(bp.commands):
+                if (
+                    prev.opcode == "CALLDATA_BUILD"
+                    and prev.registers
+                    and prev.registers[0] == calldata_reg
+                    and prev.data
+                    and len(prev.data) >= 4
+                    and prev.data[:4] in self._RET_U256_WORD0_SELECTORS
+                ):
+                    return "RET_U256", b"\x00\x00"
+
+                if prev.opcode == "CALLDATA_BUILD" and prev.registers and prev.registers[0] == calldata_reg:
+                    break
+
+            break
+
+        return "RET_LAST32", b""
 
     def _append_surgery(self, *, calldata_reg: int, patch_offsets: list[int]) -> None:
         bp = self._require_blueprint()
@@ -256,6 +300,7 @@ class DeFiBuilder:
         amount_placeholder: Optional[int] = None,
         value: int = 0,
         calldata_template: Optional[bytes] = None,
+        auto_amount_from_prev_call: bool = True,
     ) -> "DeFiBuilder":
         _ = dst_token
         bp = self._require_blueprint()
@@ -275,6 +320,18 @@ class DeFiBuilder:
                 raise ValueError(
                     f"multiple amount placeholders found in bridge calldata ({inferred}); pass patch_offset(s) explicitly"
                 )
+
+        # If bridge amount needs patching and the previous step is a CALL,
+        # auto-load the swap output into the amount register.
+        if auto_amount_from_prev_call and offsets and bp.commands and bp.commands[-1].opcode == "CALL":
+            ret_opcode, ret_data = self._infer_prev_call_amount_extraction()
+            bp.add_command(
+                VMCommand(
+                    opcode=ret_opcode,
+                    data=ret_data,
+                    registers=[self._AMOUNT_REG],
+                )
+            )
 
         bp.add_command(
             VMCommand(
