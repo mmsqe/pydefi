@@ -34,7 +34,7 @@ class AutoPlan:
     extraction: ExtractionPlan
 
 
-type BridgeAmountDecoder = Callable[[bytes], tuple[int, int] | None]
+BridgeAmountDecoder = Callable[[bytes], tuple[int, int] | None]
 
 
 class Analyzer:
