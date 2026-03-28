@@ -127,21 +127,27 @@ class Analyzer:
         extraction_offset: int | None,
         extraction_size: int | None,
     ) -> ExtractionPlan:
+        def _require_uint16(name: str, value: int | None) -> int:
+            if value is None:
+                raise ValueError(f"{name} is required for {extraction_mode.name} mode")
+            if value < 0 or value > 0xFFFF:
+                raise ValueError(f"{name} must fit in uint16, got {value}")
+            return value
+
         if extraction_mode == ExtractionMode.RET_U256:
-            if extraction_offset is None:
-                raise ValueError("extraction_offset is required for RET_U256 mode")
+            offset = _require_uint16("extraction_offset", extraction_offset)
             return ExtractionPlan(
                 mode=ExtractionMode.RET_U256,
-                offset=extraction_offset,
+                offset=offset,
             )
 
         if extraction_mode == ExtractionMode.RET_SLICE:
-            if extraction_offset is None or extraction_size is None:
-                raise ValueError("extraction_offset and extraction_size are required for RET_SLICE mode")
+            offset = _require_uint16("extraction_offset", extraction_offset)
+            size = _require_uint16("extraction_size", extraction_size)
             return ExtractionPlan(
                 mode=ExtractionMode.RET_SLICE,
-                offset=extraction_offset,
-                size=extraction_size,
+                offset=offset,
+                size=size,
             )
 
         if extraction_offset is not None or extraction_size is not None:
