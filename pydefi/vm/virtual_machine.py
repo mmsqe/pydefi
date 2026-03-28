@@ -302,6 +302,8 @@ class VirtualMachine:
         template = self.registers[source_reg]
 
         # data layout: 1-byte patch count + repeated 2-byte offsets.
+        if len(cmd.data) < 1:
+            raise ValueError("CALLDATA_SURGERY requires a non-empty payload with 1-byte patch count")
         surgery_count = cmd.data[0]
         if len(cmd.data) != 1 + surgery_count * 2:
             raise ValueError("CALLDATA_SURGERY payload length does not match patch count")
@@ -368,6 +370,13 @@ class VirtualMachine:
     def _perform_call(self, cmd: VMCommand):
         """Execute CALL-like command via injected executor or local fallback."""
         _, _, calldata = self._decode_call(cmd)
+
+        if self._call_executor is not None:
+            raise RuntimeError(
+                "Synchronous CALL execution is not supported when a call executor is configured. "
+                "Use the async execution path (e.g. execute_async)."
+            )
+
         success, return_data = True, calldata
 
         self._store_call_result(success, return_data)

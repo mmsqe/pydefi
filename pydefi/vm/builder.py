@@ -232,8 +232,10 @@ class DeFiBuilder:
             raise ValueError("offset and size must both be provided when not using auto mode")
         if offset < 0 or offset > 0xFFFF:
             raise ValueError(f"offset must fit in uint16, got {offset}")
-        if size < 0 or size > 0xFFFF:
-            raise ValueError(f"size must fit in uint16, got {size}")
+        # RET_SLICE output is later interpreted as a uint256 by CALLDATA_SURGERY,
+        # so the slice size must not exceed 32 bytes.
+        if size < 0 or size > 32:
+            raise ValueError(f"size must be between 0 and 32 bytes for uint256-compatible slice, got {size}")
 
         bp.add_command(
             VMCommand(
