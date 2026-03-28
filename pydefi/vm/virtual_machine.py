@@ -183,14 +183,21 @@ class VirtualMachine:
         return result
 
     def _require_register(self, reg_idx: int) -> None:
-        if reg_idx < 0 or reg_idx >= len(self.registers):
+        if reg_idx < 0 or reg_idx >= self._register_count:
             raise ValueError(f"register index out of range: {reg_idx}")
+
+    def _normalize_registers(self, initial_state: VMState) -> list[bytes]:
+        """Normalize registers to exactly ``_register_count`` entries."""
+        base_registers = list(initial_state.registers)
+        if len(base_registers) > self._register_count:
+            base_registers = base_registers[: self._register_count]
+        elif len(base_registers) < self._register_count:
+            base_registers.extend([b""] * (self._register_count - len(base_registers)))
+        return base_registers
 
     def run(self, commands: List[VMCommand], initial_state: VMState) -> Tuple[bytes, bool]:
         """Execute a full command sequence using the provided initial state."""
-        self.registers = initial_state.registers.copy()
-        if len(self.registers) < self._register_count:
-            self.registers.extend([b""] * (self._register_count - len(self.registers)))
+        self.registers = self._normalize_registers(initial_state)
 
         for cmd in commands:
             if cmd.opcode == "CALLDATA_BUILD":
@@ -219,9 +226,7 @@ class VirtualMachine:
 
     async def run_async(self, commands: List[VMCommand], initial_state: VMState) -> Tuple[bytes, bool]:
         """Async variant of run that supports async call executors."""
-        self.registers = initial_state.registers.copy()
-        if len(self.registers) < self._register_count:
-            self.registers.extend([b""] * (self._register_count - len(self.registers)))
+        self.registers = self._normalize_registers(initial_state)
 
         for cmd in commands:
             if cmd.opcode == "CALLDATA_BUILD":
