@@ -282,10 +282,8 @@ class VirtualMachine:
         if not success:
             raise ValueError("CALL execution failed")
 
-        # register[0] stores return data; register[1] mirrors 32-byte numeric output.
+        # register[0] stores raw return data from the last CALL.
         self.registers[0] = return_data
-        if len(return_data) == 32:
-            self.registers[1] = return_data
 
     def _calldata_build(self, cmd: VMCommand):
         """Load a calldata template into a register."""
