@@ -28,7 +28,7 @@ from web3 import AsyncWeb3, Web3
 from web3.exceptions import ContractLogicError, Web3RPCError
 from web3.types import TxParams
 
-from pydefi.vm.planner import ExtractionMode
+from pydefi.vm.planner import ExtractionMode, FlowCallOp, FlowPlan, FlowRunner, FlowSplitOp
 from pydefi.vm.program import (
     assert_ge,
     assert_le,
@@ -820,8 +820,6 @@ class TestDeFiVMFork:
         """
         w3 = ctx["w3"]
         deployer = ctx["deployer"]
-        extraction_mode = ExtractionMode.RET_LAST32
-        extraction_offset: int | None = None
 
         oft = Contract.from_abi(LZ_OFT_QUOTE_SEND_ABI, to=LZ_OFT_ZRO)
         recipient_bytes32 = bytes.fromhex(deployer.removeprefix("0x")).rjust(32, b"\x00")
@@ -835,9 +833,6 @@ class TestDeFiVMFork:
             # Note: V3 router itself is swap-only; quote path uses QuoterV2.
             v3_quoter = Contract.from_abi(UNISWAP_V3_QUOTER_ABI, to=UNISWAP_V3_QUOTER)
             swap_target = UNISWAP_V3_QUOTER
-            # QuoterV2 returns amountOut as the first tuple word, not the last one.
-            extraction_mode = ExtractionMode.RET_U256
-            extraction_offset = 0
             swap_calldata = _tx_data_bytes(
                 v3_quoter.fns.quoteExactInputSingle(
                     (
@@ -890,45 +885,77 @@ class TestDeFiVMFork:
                 .execute_async()
             )
         else:
-            actions = [
-                {
-                    "kind": "swap",
-                    "target": swap_target,
-                    "token_out": USDC_MAINNET,
-                    "calldata": swap_calldata,
-                    "amount_placeholder": QUOTE_AMOUNT_IN,
-                    "auto_amount_from_prev_call": False,
-                },
-                {
-                    "kind": "extract",
-                    "extraction_mode": extraction_mode.value,
-                    "extraction_offset": extraction_offset,
-                },
-                {
-                    "kind": "bridge",
-                    "target": LZ_OFT_ZRO,
-                    "dst_chain": ARBITRUM_LZ_EID,
-                    "dst_token": USDC_MAINNET,
-                    "token_out": USDC_MAINNET,
-                    "calldata": bridge_calldata,
-                    "amount_placeholder": QUOTE_AMOUNT_IN,
-                    "auto_amount_from_prev_call": False,
-                },
-            ]
+            flow_runner = FlowRunner(runtime_vm)
 
-            result = await runtime_vm.compose(
-                from_token=WETH_MAINNET,
-                to_token=USDC_MAINNET,
-                amount_in=QUOTE_AMOUNT_IN,
-                dst_chain=ARBITRUM_LZ_EID,
-                receiver=deployer,
-                actions=actions,
-                token_out=USDC_MAINNET,
-                dst_token=USDC_MAINNET,
-                bridge_amount_decoders={
-                    LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
-                },
+            if swap_source == "v2_router":
+                swap_extraction_mode = ExtractionMode.RET_LAST32
+                swap_extraction_offset = None
+            else:
+                swap_extraction_mode = ExtractionMode.RET_U256
+                swap_extraction_offset = 0
+
+            flow_result = await flow_runner.execute(
+                FlowPlan(
+                    source_token=WETH_MAINNET,
+                    source_amount=QUOTE_AMOUNT_IN,
+                    receiver=deployer,
+                    dst_chain=ARBITRUM_LZ_EID,
+                    first=FlowCallOp(
+                        target=swap_target,
+                        calldata_builder=(
+                            (
+                                lambda amount: _tx_data_bytes(
+                                    v2_router.fns.getAmountsOut(amount, UNISWAP_V2_QUOTE_PATH).data
+                                )
+                            )
+                            if swap_source == "v2_router"
+                            else (
+                                lambda amount: _tx_data_bytes(
+                                    v3_quoter.fns.quoteExactInputSingle(
+                                        (
+                                            Web3.to_checksum_address(WETH_MAINNET),
+                                            USDC_MAINNET,
+                                            amount,
+                                            UNISWAP_V3_POOL_FEE_3000,
+                                            0,
+                                        )
+                                    ).data
+                                )
+                            )
+                        ),
+                        token_in=WETH_MAINNET,
+                        token_out=USDC_MAINNET,
+                        extraction_mode=swap_extraction_mode,
+                        extraction_offset=swap_extraction_offset,
+                    ),
+                    split=FlowSplitOp(ratios_bps=[10_000]),
+                    branches=[
+                        FlowCallOp(
+                            target=LZ_OFT_ZRO,
+                            calldata_builder=lambda amount: _tx_data_bytes(
+                                oft.fns.quoteSend(
+                                    (
+                                        ARBITRUM_LZ_EID,
+                                        recipient_bytes32,
+                                        amount,
+                                        0,
+                                        b"",
+                                        b"",
+                                        b"",
+                                    ),
+                                    False,
+                                ).data
+                            ),
+                            token_in=USDC_MAINNET,
+                            token_out=USDC_MAINNET,
+                            extraction_mode=ExtractionMode.RET_U256,
+                            extraction_offset=0,
+                        )
+                    ],
+                )
             )
+            native_fee = int(flow_result["branches"][0]["amount_out"])
+            result = native_fee.to_bytes(32, "big")
 
         assert len(call_records) == 2
         first_target, _, _, first_retdata = call_records[0]

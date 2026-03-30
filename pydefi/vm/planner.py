@@ -14,6 +14,168 @@ class ExtractionMode(str, Enum):
 
 
 @dataclass(frozen=True)
+class FlowCallOp:
+    """Generic external call operation used by FlowRunner."""
+
+    target: str
+    calldata_builder: Callable[[int], bytes]
+    token_in: Any
+    token_out: Any
+    extraction_mode: ExtractionMode = ExtractionMode.RET_LAST32
+    extraction_offset: int | None = None
+    extraction_size: int | None = None
+    value: int = 0
+
+
+@dataclass(frozen=True)
+class FlowSplitOp:
+    """Split operation represented in basis points (10000 = 100%)."""
+
+    ratios_bps: list[int]
+
+
+@dataclass(frozen=True)
+class FlowPlan:
+    """Minimal generic flow model compiled to compose action graphs.
+
+    Shape:
+      source -> first call -> split -> branch calls
+    """
+
+    source_token: Any
+    source_amount: int
+    receiver: str
+    first: FlowCallOp
+    split: FlowSplitOp
+    branches: list[FlowCallOp]
+    dst_chain: Any = 1
+
+
+class FlowRunner:
+    """Execute generic call/split flow plans on top of VirtualMachine.compose."""
+
+    def __init__(self, vm: Any):
+        self.vm = vm
+
+    @staticmethod
+    def _call_actions(*, op: FlowCallOp, amount_in: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "kind": "call",
+                "target": op.target,
+                "token_out": op.token_out,
+                "calldata": op.calldata_builder(int(amount_in)),
+                "value": int(op.value),
+                "auto_amount_from_prev_call": False,
+            }
+        ]
+
+    @staticmethod
+    def _decode_from_returndata(*, op: FlowCallOp, ret: bytes) -> int:
+        if op.extraction_mode == ExtractionMode.RET_LAST32:
+            if len(ret) < 32:
+                raise ValueError("returndata too short for RET_LAST32")
+            return int.from_bytes(ret[-32:], "big")
+
+        if op.extraction_mode == ExtractionMode.RET_U256:
+            offset = int(op.extraction_offset or 0)
+            if offset < 0:
+                raise ValueError("RET_U256 offset must be non-negative")
+            if offset + 32 > len(ret):
+                raise ValueError("returndata too short for RET_U256 offset")
+            return int.from_bytes(ret[offset : offset + 32], "big")
+
+        if op.extraction_mode == ExtractionMode.RET_SLICE:
+            if op.extraction_offset is None or op.extraction_size is None:
+                raise ValueError("RET_SLICE requires extraction_offset and extraction_size")
+            start = int(op.extraction_offset)
+            size = int(op.extraction_size)
+            if start < 0 or size < 0:
+                raise ValueError("RET_SLICE offset/size must be non-negative")
+            end = start + size
+            if end > len(ret):
+                raise ValueError("returndata too short for RET_SLICE range")
+            chunk = ret[start:end]
+            if len(chunk) > 32:
+                raise ValueError("RET_SLICE chunk cannot exceed 32 bytes for uint256 decode")
+            return int.from_bytes(chunk.rjust(32, b"\x00"), "big")
+
+        raise ValueError(f"unsupported extraction mode: {op.extraction_mode}")
+
+    @staticmethod
+    def _validate_flow(flow: FlowPlan) -> None:
+        ratios = flow.split.ratios_bps
+        if not ratios:
+            raise ValueError("flow.split.ratios_bps must be non-empty")
+        if len(ratios) != len(flow.branches):
+            raise ValueError("split ratios and branches length mismatch")
+        if any((bps < 0 or bps > 10_000) for bps in ratios):
+            raise ValueError("each split ratio must be in [0, 10000]")
+        if sum(ratios) != 10_000:
+            raise ValueError("split ratios must sum to 10000 bps")
+
+    async def _run_single_call_compose(
+        self,
+        *,
+        from_token: Any,
+        amount_in: int,
+        receiver: str,
+        dst_chain: Any,
+        op: FlowCallOp,
+    ) -> bytes:
+        actions = self._call_actions(op=op, amount_in=amount_in)
+        return await self.vm.compose(
+            from_token=from_token,
+            to_token=op.token_out,
+            amount_in=amount_in,
+            dst_chain=dst_chain,
+            receiver=receiver,
+            actions=actions,
+            token_out=op.token_out,
+            dst_token=op.token_out,
+        )
+
+    async def execute(self, flow: FlowPlan) -> dict[str, Any]:
+        self._validate_flow(flow)
+
+        first_ret = await self._run_single_call_compose(
+            from_token=flow.source_token,
+            amount_in=int(flow.source_amount),
+            receiver=flow.receiver,
+            dst_chain=flow.dst_chain,
+            op=flow.first,
+        )
+        amount_mid = self._decode_from_returndata(op=flow.first, ret=first_ret)
+        split_amounts = [(amount_mid * bps) // 10_000 for bps in flow.split.ratios_bps]
+
+        branch_results: list[dict[str, Any]] = []
+        for idx, branch in enumerate(flow.branches):
+            branch_amount = split_amounts[idx]
+            branch_ret = await self._run_single_call_compose(
+                from_token=flow.first.token_out,
+                amount_in=branch_amount,
+                receiver=flow.receiver,
+                dst_chain=flow.dst_chain,
+                op=branch,
+            )
+            branch_out = self._decode_from_returndata(op=branch, ret=branch_ret)
+            branch_results.append(
+                {
+                    "branch_index": idx,
+                    "amount_in": branch_amount,
+                    "amount_out": branch_out,
+                    "to_token": branch.token_out,
+                }
+            )
+
+        return {
+            "amount_mid_total": amount_mid,
+            "split_amounts": split_amounts,
+            "branches": branch_results,
+        }
+
+
+@dataclass(frozen=True)
 class ActionPlan:
     kind: str
     target: Any | None = None
