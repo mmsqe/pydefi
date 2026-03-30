@@ -19,12 +19,15 @@ class VirtualMachine:
 
     _DEFAULT_COMPOSE_RECEIVER = "0x000000000000000000000000000000000000dEaD"
     _COMPOSE_CONTEXT_KEYS = (
+        "actions",
+        "action_graph",
         "swap_quote",
         "bridge_tx",
         "amm",
         "bridge",
         "token_out",
         "dst_token",
+        "dst_chain",
         "receiver",
         "execution_kwargs",
     )
@@ -124,7 +127,8 @@ class VirtualMachine:
         """Compose and execute a flow using only high-level token inputs.
 
         Route context can be provided either by a resolver or inline kwargs.
-        Required keys: ``swap_quote``, ``bridge_tx``, ``amm``, ``bridge``.
+        Action-graph mode required key: ``actions`` (or ``action_graph``).
+        Legacy two-step mode required keys: ``swap_quote``, ``bridge_tx``, ``amm``, ``bridge``.
         Optional keys: ``token_out``, ``dst_token``, ``receiver``,
         ``execution_kwargs``.
         """
@@ -152,13 +156,19 @@ class VirtualMachine:
             if not context:
                 raise ValueError(
                     "compose requires either compose_resolver or inline route context keys: "
-                    "swap_quote, bridge_tx, amm, bridge"
+                    "actions/action_graph, or swap_quote + bridge_tx + amm + bridge"
                 )
 
-        required = {"swap_quote", "bridge_tx", "amm", "bridge"}
-        missing = sorted(required - set(context.keys()))
-        if missing:
-            raise ValueError(f"compose route context missing required keys: {missing}")
+        actions_context = context.get("actions")
+        if actions_context is None:
+            actions_context = context.get("action_graph")
+
+        is_action_graph_mode = actions_context is not None
+        if not is_action_graph_mode:
+            required = {"swap_quote", "bridge_tx", "amm", "bridge"}
+            missing = sorted(required - set(context.keys()))
+            if missing:
+                raise ValueError(f"compose route context missing required keys: {missing}")
 
         receiver_addr = receiver or context.get("receiver") or self._DEFAULT_COMPOSE_RECEIVER
 
@@ -167,19 +177,36 @@ class VirtualMachine:
         execute_kwargs = dict(context.get("execution_kwargs", {}))
         execute_kwargs.update(execution_overrides)
 
-        from .planner import execute_flow_from_quotes_async
+        planner_dst_chain = context.get("dst_chain", dst_chain)
 
-        result = await execute_flow_from_quotes_async(
-            compose_builder,
-            swap_quote=context["swap_quote"],
-            bridge_tx=context["bridge_tx"],
-            amm=context["amm"],
-            token_out=context.get("token_out", to_token),
-            bridge=context["bridge"],
-            dst_chain=dst_chain,
-            dst_token=context.get("dst_token", to_token),
-            **execute_kwargs,
-        )
+        if is_action_graph_mode:
+            from .planner import execute_action_graph_async
+
+            if not isinstance(actions_context, list) or not actions_context:
+                raise ValueError("compose action graph mode requires a non-empty list in actions/action_graph")
+
+            result = await execute_action_graph_async(
+                compose_builder,
+                actions=actions_context,
+                token_out=context.get("token_out", to_token),
+                dst_chain=planner_dst_chain,
+                dst_token=context.get("dst_token", to_token),
+                **execute_kwargs,
+            )
+        else:
+            from .planner import execute_flow_from_quotes_async
+
+            result = await execute_flow_from_quotes_async(
+                compose_builder,
+                swap_quote=context["swap_quote"],
+                bridge_tx=context["bridge_tx"],
+                amm=context["amm"],
+                token_out=context.get("token_out", to_token),
+                bridge=context["bridge"],
+                dst_chain=planner_dst_chain,
+                dst_token=context.get("dst_token", to_token),
+                **execute_kwargs,
+            )
         return result
 
     def _require_register(self, reg_idx: int) -> None:
