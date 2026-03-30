@@ -916,7 +916,7 @@ class TestDeFiVMFork:
             result = await runtime_vm.compose(
                 from_token=WETH_MAINNET,
                 to_token=USDC_MAINNET,
-                amount=QUOTE_AMOUNT_IN,
+                amount_in=QUOTE_AMOUNT_IN,
                 dst_chain=ARBITRUM_LZ_EID,
                 receiver=deployer,
                 actions=actions,
@@ -1057,7 +1057,7 @@ class TestDeFiVMFork:
         result = await runtime_vm.compose(
             from_token=WETH_MAINNET,
             to_token=USDC_MAINNET,
-            amount=QUOTE_AMOUNT_IN,
+            amount_in=QUOTE_AMOUNT_IN,
             dst_chain=ARBITRUM_LZ_EID,
             receiver=deployer,
             actions=actions,

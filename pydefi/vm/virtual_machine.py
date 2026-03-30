@@ -114,7 +114,7 @@ class VirtualMachine:
         *,
         from_token: Any,
         to_token: Any,
-        amount: int,
+        amount_in: int,
         dst_chain: Any,
         receiver: str | None = None,
         compose_resolver: ComposeResolver | None = None,
@@ -137,7 +137,7 @@ class VirtualMachine:
         resolver = compose_resolver or self._compose_resolver
         context: dict[str, Any]
         if resolver is not None:
-            resolved = resolver(from_token, to_token, amount, dst_chain)
+            resolved = resolver(from_token, to_token, amount_in, dst_chain)
             if isinstance(resolved, AwaitableABC):
                 context = await resolved
             else:
@@ -162,7 +162,7 @@ class VirtualMachine:
 
         receiver_addr = receiver or context.get("receiver") or self._DEFAULT_COMPOSE_RECEIVER
 
-        compose_builder = self.builder().from_token(from_token, amount_in=amount).to(receiver_addr)
+        compose_builder = self.builder().from_token(from_token, amount_in=amount_in).to(receiver_addr)
 
         execute_kwargs = dict(context.get("execution_kwargs", {}))
         execute_kwargs.update(execution_overrides)
