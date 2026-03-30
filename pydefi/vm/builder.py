@@ -153,6 +153,88 @@ class DeFiBuilder:
             )
         )
 
+    def _resolve_patch_offsets(
+        self,
+        *,
+        template: bytes,
+        patch_offset: Optional[int],
+        patch_offsets: Optional[list[int]],
+        amount_placeholder: Optional[int],
+        role: str,
+    ) -> list[int]:
+        bp = self._require_blueprint()
+        offsets = list(patch_offsets or [])
+        if patch_offset is not None:
+            offsets.append(patch_offset)
+        if not offsets:
+            placeholder = bp.amount_in if amount_placeholder is None else amount_placeholder
+            inferred = self._find_u256_offsets(template, placeholder)
+            if len(inferred) == 1:
+                offsets = inferred
+            elif len(inferred) > 1:
+                raise ValueError(
+                    f"multiple amount placeholders found in {role} calldata ({inferred}); pass patch_offset(s) explicitly"
+                )
+        return offsets
+
+    def _maybe_auto_load_prev_output(self, *, offsets: list[int], auto_amount_from_prev_call: bool) -> None:
+        bp = self._require_blueprint()
+        if not (auto_amount_from_prev_call and offsets and bp.commands and bp.commands[-1].opcode == "CALL"):
+            return
+
+        ret_opcode, ret_data = self._infer_prev_call_amount_extraction()
+        bp.add_command(
+            VMCommand(
+                opcode=ret_opcode,
+                data=ret_data,
+                registers=[self._AMOUNT_REG],
+            )
+        )
+
+    def _append_call_action(
+        self,
+        *,
+        target: Any,
+        target_candidates: list[str],
+        calldata_template: bytes,
+        calldata_reg: int,
+        patch_offset: Optional[int],
+        patch_offsets: Optional[list[int]],
+        amount_placeholder: Optional[int],
+        value: int,
+        auto_amount_from_prev_call: bool,
+        role: str,
+    ) -> "DeFiBuilder":
+        bp = self._require_blueprint()
+        offsets = self._resolve_patch_offsets(
+            template=calldata_template,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            role=role,
+        )
+
+        self._maybe_auto_load_prev_output(offsets=offsets, auto_amount_from_prev_call=auto_amount_from_prev_call)
+
+        bp.add_command(
+            VMCommand(
+                opcode="CALLDATA_BUILD",
+                data=calldata_template,
+                registers=[calldata_reg],
+            )
+        )
+        self._append_surgery(calldata_reg=calldata_reg, patch_offsets=offsets)
+
+        resolved_target = self._resolve_target(target, candidates=target_candidates)
+        bp.add_command(
+            VMCommand(
+                opcode="CALL",
+                data=self._encode_call_meta(resolved_target, value),
+                registers=[calldata_reg],
+            )
+        )
+        return self
+
     def from_token(self, token: Any, *, amount_in: int) -> "DeFiBuilder":
         self.blueprint = Blueprint(from_token=token, amount_in=amount_in, receiver="")
         registers = [b""] * 16
@@ -256,40 +338,21 @@ class DeFiBuilder:
         patch_offsets: Optional[list[int]] = None,
         amount_placeholder: Optional[int] = None,
         value: int = 0,
+        auto_amount_from_prev_call: bool = True,
     ) -> "DeFiBuilder":
         _ = token_out
-        bp = self._require_blueprint()
-        offsets = list(patch_offsets or [])
-        if patch_offset is not None:
-            offsets.append(patch_offset)
-        if not offsets:
-            placeholder = bp.amount_in if amount_placeholder is None else amount_placeholder
-            inferred = self._find_u256_offsets(dex_calldata_template, placeholder)
-            if len(inferred) == 1:
-                offsets = inferred
-            elif len(inferred) > 1:
-                raise ValueError(
-                    f"multiple amount placeholders found in swap calldata ({inferred}); pass patch_offset(s) explicitly"
-                )
-
-        bp.add_command(
-            VMCommand(
-                opcode="CALLDATA_BUILD",
-                data=dex_calldata_template,
-                registers=[self._SWAP_CALLDATA_REG],
-            )
+        return self._append_call_action(
+            target=amm,
+            target_candidates=["router_address", "address", "to"],
+            calldata_template=dex_calldata_template,
+            calldata_reg=self._SWAP_CALLDATA_REG,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            value=value,
+            auto_amount_from_prev_call=auto_amount_from_prev_call,
+            role="swap",
         )
-        self._append_surgery(calldata_reg=self._SWAP_CALLDATA_REG, patch_offsets=offsets)
-
-        target = self._resolve_target(amm, candidates=["router_address", "address", "to"])
-        bp.add_command(
-            VMCommand(
-                opcode="CALL",
-                data=self._encode_call_meta(target, value),
-                registers=[self._SWAP_CALLDATA_REG],
-            )
-        )
-        return self
 
     def bridge(
         self,
@@ -307,55 +370,165 @@ class DeFiBuilder:
         _ = dst_token
         bp = self._require_blueprint()
         bp.chain_id = int(dst_chain)
-
-        offsets = list(patch_offsets or [])
-        if patch_offset is not None:
-            offsets.append(patch_offset)
-
         template = calldata_template if calldata_template is not None else self._resolve_calldata(bridge)
-        if not offsets:
-            placeholder = bp.amount_in if amount_placeholder is None else amount_placeholder
-            inferred = self._find_u256_offsets(template, placeholder)
-            if len(inferred) == 1:
-                offsets = inferred
-            elif len(inferred) > 1:
-                raise ValueError(
-                    f"multiple amount placeholders found in bridge calldata ({inferred}); pass patch_offset(s) explicitly"
-                )
-
-        # If bridge amount needs patching and the previous step is a CALL,
-        # auto-load the swap output into the amount register.
-        if auto_amount_from_prev_call and offsets and bp.commands and bp.commands[-1].opcode == "CALL":
-            ret_opcode, ret_data = self._infer_prev_call_amount_extraction()
-            bp.add_command(
-                VMCommand(
-                    opcode=ret_opcode,
-                    data=ret_data,
-                    registers=[self._AMOUNT_REG],
-                )
-            )
-
-        bp.add_command(
-            VMCommand(
-                opcode="CALLDATA_BUILD",
-                data=template,
-                registers=[self._BRIDGE_CALLDATA_REG],
-            )
+        return self._append_call_action(
+            target=bridge,
+            target_candidates=["oft_address", "bridge_address", "router_address", "address", "to"],
+            calldata_template=template,
+            calldata_reg=self._BRIDGE_CALLDATA_REG,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            value=value,
+            auto_amount_from_prev_call=auto_amount_from_prev_call,
+            role="bridge",
         )
-        self._append_surgery(calldata_reg=self._BRIDGE_CALLDATA_REG, patch_offsets=offsets)
 
-        target = self._resolve_target(
-            bridge,
-            candidates=["oft_address", "bridge_address", "router_address", "address", "to"],
+    def call(
+        self,
+        target: Any,
+        calldata_template: bytes,
+        *,
+        patch_offset: Optional[int] = None,
+        patch_offsets: Optional[list[int]] = None,
+        amount_placeholder: Optional[int] = None,
+        value: int = 0,
+        auto_amount_from_prev_call: bool = True,
+        target_candidates: Optional[list[str]] = None,
+    ) -> "DeFiBuilder":
+        candidates = target_candidates or [
+            "address",
+            "to",
+            "router_address",
+            "bridge_address",
+            "vault_address",
+            "staking_address",
+            "minter_address",
+            "wrapper_address",
+            "oft_address",
+        ]
+        return self._append_call_action(
+            target=target,
+            target_candidates=candidates,
+            calldata_template=calldata_template,
+            calldata_reg=self._BRIDGE_CALLDATA_REG,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            value=value,
+            auto_amount_from_prev_call=auto_amount_from_prev_call,
+            role="call",
         )
-        bp.add_command(
-            VMCommand(
-                opcode="CALL",
-                data=self._encode_call_meta(target, value),
-                registers=[self._BRIDGE_CALLDATA_REG],
-            )
+
+    def deposit(
+        self,
+        protocol: Any,
+        calldata_template: bytes,
+        *,
+        patch_offset: Optional[int] = None,
+        patch_offsets: Optional[list[int]] = None,
+        amount_placeholder: Optional[int] = None,
+        value: int = 0,
+        auto_amount_from_prev_call: bool = True,
+    ) -> "DeFiBuilder":
+        return self.call(
+            protocol,
+            calldata_template,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            value=value,
+            auto_amount_from_prev_call=auto_amount_from_prev_call,
+            target_candidates=["vault_address", "pool_address", "address", "to"],
         )
-        return self
+
+    def stake(
+        self,
+        protocol: Any,
+        calldata_template: bytes,
+        *,
+        patch_offset: Optional[int] = None,
+        patch_offsets: Optional[list[int]] = None,
+        amount_placeholder: Optional[int] = None,
+        value: int = 0,
+        auto_amount_from_prev_call: bool = True,
+    ) -> "DeFiBuilder":
+        return self.call(
+            protocol,
+            calldata_template,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            value=value,
+            auto_amount_from_prev_call=auto_amount_from_prev_call,
+            target_candidates=["staking_address", "gauge_address", "address", "to"],
+        )
+
+    def mint(
+        self,
+        protocol: Any,
+        calldata_template: bytes,
+        *,
+        patch_offset: Optional[int] = None,
+        patch_offsets: Optional[list[int]] = None,
+        amount_placeholder: Optional[int] = None,
+        value: int = 0,
+        auto_amount_from_prev_call: bool = True,
+    ) -> "DeFiBuilder":
+        return self.call(
+            protocol,
+            calldata_template,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            value=value,
+            auto_amount_from_prev_call=auto_amount_from_prev_call,
+            target_candidates=["minter_address", "address", "to"],
+        )
+
+    def wrap(
+        self,
+        wrapper: Any,
+        calldata_template: bytes,
+        *,
+        patch_offset: Optional[int] = None,
+        patch_offsets: Optional[list[int]] = None,
+        amount_placeholder: Optional[int] = None,
+        value: int = 0,
+        auto_amount_from_prev_call: bool = True,
+    ) -> "DeFiBuilder":
+        return self.call(
+            wrapper,
+            calldata_template,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            value=value,
+            auto_amount_from_prev_call=auto_amount_from_prev_call,
+            target_candidates=["wrapper_address", "address", "to"],
+        )
+
+    def unwrap(
+        self,
+        wrapper: Any,
+        calldata_template: bytes,
+        *,
+        patch_offset: Optional[int] = None,
+        patch_offsets: Optional[list[int]] = None,
+        amount_placeholder: Optional[int] = None,
+        value: int = 0,
+        auto_amount_from_prev_call: bool = True,
+    ) -> "DeFiBuilder":
+        return self.call(
+            wrapper,
+            calldata_template,
+            patch_offset=patch_offset,
+            patch_offsets=patch_offsets,
+            amount_placeholder=amount_placeholder,
+            value=value,
+            auto_amount_from_prev_call=auto_amount_from_prev_call,
+            target_candidates=["wrapper_address", "address", "to"],
+        )
 
     def build(self) -> Blueprint:
         bp = self._require_blueprint()
