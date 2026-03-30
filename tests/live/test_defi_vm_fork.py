@@ -943,6 +943,142 @@ class TestDeFiVMFork:
         native_fee = int.from_bytes(result[:32], "big")
         assert native_fee > 0
 
+    @pytest.mark.parametrize("swap_source", ["v2_router", "v3_quoter"])
+    @pytest.mark.parametrize(
+        "post_swap_actions",
+        [
+            ["bridge"],
+            ["bridge", "deposit"],
+            ["bridge", "mint", "wrap"],
+            ["bridge", "deposit", "mint", "wrap"],
+        ],
+        ids=[
+            "swap_bridge",
+            "swap_bridge_deposit",
+            "swap_bridge_mint_wrap",
+            "swap_bridge_deposit_mint_wrap",
+        ],
+    )
+    async def test_action_graph_multi_kind_combos(
+        self,
+        ctx,
+        swap_source: str,
+        post_swap_actions: list[str],
+    ):
+        w3 = ctx["w3"]
+        deployer = ctx["deployer"]
+        adapter = ctx["adapter_address"]
+
+        oft = Contract.from_abi(LZ_OFT_QUOTE_SEND_ABI, to=LZ_OFT_ZRO)
+        recipient_bytes32 = bytes.fromhex(deployer.removeprefix("0x")).rjust(32, b"\x00")
+
+        if swap_source == "v2_router":
+            v2_router = Contract.from_abi(UNISWAP_V2_GET_AMOUNTS_OUT_ABI, to=UNISWAP_V2_ROUTER)
+            swap_target = UNISWAP_V2_ROUTER
+            swap_calldata = _tx_data_bytes(v2_router.fns.getAmountsOut(QUOTE_AMOUNT_IN, UNISWAP_V2_QUOTE_PATH).data)
+            extraction_mode = ExtractionMode.RET_LAST32
+            extraction_offset: int | None = None
+        else:
+            v3_quoter = Contract.from_abi(UNISWAP_V3_QUOTER_ABI, to=UNISWAP_V3_QUOTER)
+            swap_target = UNISWAP_V3_QUOTER
+            swap_calldata = _tx_data_bytes(
+                v3_quoter.fns.quoteExactInputSingle(
+                    (
+                        Web3.to_checksum_address(WETH_MAINNET),
+                        USDC_MAINNET,
+                        QUOTE_AMOUNT_IN,
+                        UNISWAP_V3_POOL_FEE_3000,
+                        0,
+                    )
+                ).data
+            )
+            extraction_mode = ExtractionMode.RET_U256
+            extraction_offset = 0
+
+        bridge_calldata = _tx_data_bytes(
+            oft.fns.quoteSend(
+                (
+                    ARBITRUM_LZ_EID,
+                    recipient_bytes32,
+                    QUOTE_AMOUNT_IN,
+                    0,
+                    b"",
+                    b"",
+                    b"",
+                ),
+                False,
+            ).data
+        )
+
+        get_forty_two_calldata = keccak(b"getFortyTwo()")[:4]
+
+        actions: list[dict[str, Any]] = [
+            {
+                "kind": "swap",
+                "target": swap_target,
+                "token_out": USDC_MAINNET,
+                "calldata": swap_calldata,
+                "amount_placeholder": QUOTE_AMOUNT_IN,
+                "auto_amount_from_prev_call": False,
+            },
+            {
+                "kind": "extract",
+                "extraction_mode": extraction_mode.value,
+                "extraction_offset": extraction_offset,
+            },
+        ]
+
+        for kind in post_swap_actions:
+            if kind == "bridge":
+                actions.append(
+                    {
+                        "kind": "bridge",
+                        "target": LZ_OFT_ZRO,
+                        "dst_chain": ARBITRUM_LZ_EID,
+                        "dst_token": USDC_MAINNET,
+                        "token_out": USDC_MAINNET,
+                        "calldata": bridge_calldata,
+                        "amount_placeholder": QUOTE_AMOUNT_IN,
+                        "auto_amount_from_prev_call": False,
+                    }
+                )
+            else:
+                actions.append(
+                    {
+                        "kind": kind,
+                        "target": adapter,
+                        "calldata": get_forty_two_calldata,
+                    }
+                )
+
+        call_records: list[tuple[str, bytes, int, bytes]] = []
+        runtime_vm = VirtualMachine(call_executor=_make_async_eth_call_executor(w3, deployer, call_records))
+
+        result = await runtime_vm.compose(
+            from_token=WETH_MAINNET,
+            to_token=USDC_MAINNET,
+            amount=QUOTE_AMOUNT_IN,
+            dst_chain=ARBITRUM_LZ_EID,
+            receiver=deployer,
+            actions=actions,
+            token_out=USDC_MAINNET,
+            dst_token=USDC_MAINNET,
+            bridge_amount_decoders={
+                LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
+            },
+        )
+
+        expected_calls = 1 + len(post_swap_actions)
+        assert len(call_records) == expected_calls
+        assert call_records[0][0].lower() == swap_target.lower()
+
+        if "bridge" in post_swap_actions:
+            bridge_idx = post_swap_actions.index("bridge") + 1
+            assert call_records[bridge_idx][0].lower() == LZ_OFT_ZRO.lower()
+
+        if post_swap_actions[-1] in {"deposit", "mint", "wrap"}:
+            assert int.from_bytes(result[:32], "big") == 42
+
     # ------------------------------------------------------------------
     # Safety / limits
     # ------------------------------------------------------------------
