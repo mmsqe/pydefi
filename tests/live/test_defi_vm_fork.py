@@ -887,11 +887,31 @@ class TestDeFiVMFork:
                 .execute_async()
             )
         else:
-            swap_quote = {
-                "amount_in": QUOTE_AMOUNT_IN,
-                "tx_data": {"to": swap_target, "data": swap_calldata},
-            }
-            bridge_tx = {"to": LZ_OFT_ZRO, "data": bridge_calldata}
+            actions = [
+                {
+                    "kind": "swap",
+                    "target": swap_target,
+                    "token_out": USDC_MAINNET,
+                    "calldata": swap_calldata,
+                    "amount_placeholder": QUOTE_AMOUNT_IN,
+                    "auto_amount_from_prev_call": False,
+                },
+                {
+                    "kind": "extract",
+                    "extraction_mode": extraction_mode.value,
+                    "extraction_offset": extraction_offset,
+                },
+                {
+                    "kind": "bridge",
+                    "target": LZ_OFT_ZRO,
+                    "dst_chain": ARBITRUM_LZ_EID,
+                    "dst_token": USDC_MAINNET,
+                    "token_out": USDC_MAINNET,
+                    "calldata": bridge_calldata,
+                    "amount_placeholder": QUOTE_AMOUNT_IN,
+                    "auto_amount_from_prev_call": False,
+                },
+            ]
 
             result = await runtime_vm.compose(
                 from_token=WETH_MAINNET,
@@ -899,14 +919,9 @@ class TestDeFiVMFork:
                 amount=QUOTE_AMOUNT_IN,
                 dst_chain=ARBITRUM_LZ_EID,
                 receiver=deployer,
-                swap_quote=swap_quote,
-                bridge_tx=bridge_tx,
-                amm=swap_target,
-                bridge=LZ_OFT_ZRO,
+                actions=actions,
                 token_out=USDC_MAINNET,
                 dst_token=USDC_MAINNET,
-                extraction_mode=extraction_mode,
-                extraction_offset=extraction_offset,
                 bridge_amount_decoders={
                     LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
                 },

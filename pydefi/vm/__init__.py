@@ -14,6 +14,7 @@ bytecode programs::
     )
 """
 
+from pydefi.vm.planner import apply_action_graph, execute_action_graph_async
 from pydefi.vm.program import (
     OP_ASSERT_GE,
     OP_ASSERT_LE,
@@ -104,4 +105,6 @@ __all__ = [
     "patch_addr",
     "ret_u256",
     "ret_slice",
+    "apply_action_graph",
+    "execute_action_graph_async",
 ]
