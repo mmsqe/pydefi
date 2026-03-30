@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import List
 
 
 @dataclass
@@ -10,7 +9,7 @@ class VMCommand:
 
     opcode: str
     data: bytes
-    registers: List[int] = field(default_factory=list)
+    registers: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -19,5 +18,5 @@ class VMState:
     Initial VM state.
     """
 
-    registers: List[bytes]
-    stack: List[int] = field(default_factory=list)
+    registers: list[bytes]
+    stack: list[int] = field(default_factory=list)

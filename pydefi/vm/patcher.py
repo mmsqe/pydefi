@@ -1,11 +1,8 @@
-from typing import List
-
-
 class Patcher:
     """Python helper for calldata patching operations."""
 
     @staticmethod
-    def patch_calldata(template: bytes, offsets: List[int], dynamic_values: List[int]) -> bytes:
+    def patch_calldata(template: bytes, offsets: list[int], dynamic_values: list[int]) -> bytes:
         """
         Replace uint256 placeholders at provided offsets.
         """

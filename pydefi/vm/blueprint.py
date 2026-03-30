@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any
 
 from .vm_command import VMCommand, VMState
 
@@ -11,9 +11,9 @@ class Blueprint:
     from_token: Any
     amount_in: int
     receiver: str
-    commands: List[VMCommand] = field(default_factory=list)
-    initial_state: Optional[VMState] = None
-    chain_id: Optional[int] = None
+    commands: list[VMCommand] = field(default_factory=list)
+    initial_state: VMState | None = None
+    chain_id: int | None = None
 
     def add_command(self, cmd: VMCommand) -> None:
         self.commands.append(cmd)

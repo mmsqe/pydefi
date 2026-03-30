@@ -310,14 +310,19 @@ class VirtualMachine:
         if len(cmd.registers) != 1 + surgery_count:
             raise ValueError("CALLDATA_SURGERY registers length is insufficient")
         offset = 1
+        patch_offsets: list[int] = []
+        dynamic_values: list[int] = []
         for _ in range(surgery_count):
             patch_offset = int.from_bytes(cmd.data[offset : offset + 2], "big")
             value_reg = cmd.registers[1 + _]
             self._require_register(value_reg)
             dynamic_value = int.from_bytes(self.registers[value_reg], "big")
 
-            template = Patcher.patch_calldata(template, [patch_offset], [dynamic_value])
+            patch_offsets.append(patch_offset)
+            dynamic_values.append(dynamic_value)
             offset += 2
+
+        template = Patcher.patch_calldata(template, patch_offsets, dynamic_values)
 
         self.registers[source_reg] = template
 
