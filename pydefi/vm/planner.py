@@ -216,6 +216,11 @@ def _normalize_action(raw: Any) -> ActionPlan:
             raise ValueError("action.patch_offsets must be a list[int]")
         patch_offsets = [int(v) for v in patch_offsets_raw]
 
+    patch_offset_raw = raw.get("patch_offset")
+    patch_offset: int | None = None
+    if patch_offset_raw is not None:
+        patch_offset = int(patch_offset_raw)
+
     extraction_mode_raw = raw.get("extraction_mode", ExtractionMode.RET_LAST32)
     extraction_mode = _coerce_extraction_mode(extraction_mode_raw)
 
@@ -231,7 +236,7 @@ def _normalize_action(raw: Any) -> ActionPlan:
         target=target,
         calldata=calldata,
         patch_offsets=patch_offsets,
-        patch_offset=raw.get("patch_offset"),
+        patch_offset=patch_offset,
         amount_placeholder=amount_placeholder,
         value=int(raw.get("value", 0)),
         auto_amount_from_prev_call=bool(raw.get("auto_amount_from_prev_call", True)),
