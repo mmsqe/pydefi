@@ -28,7 +28,7 @@ from web3 import AsyncWeb3, Web3
 from web3.exceptions import ContractLogicError, Web3RPCError
 from web3.types import TxParams
 
-from pydefi.vm.planner import ExtractionMode, FlowCallOp, FlowPlan, FlowRunner, FlowSplitOp
+from pydefi.vm.planner import ExtractionMode, FlowPlan, FlowRunner, FlowSplitOp
 from pydefi.vm.program import (
     assert_ge,
     assert_le,
@@ -889,71 +889,36 @@ class TestDeFiVMFork:
 
             if swap_source == "v2_router":
                 swap_extraction_mode = ExtractionMode.RET_LAST32
-                swap_extraction_offset = None
             else:
                 swap_extraction_mode = ExtractionMode.RET_U256
-                swap_extraction_offset = 0
 
-            flow_result = await flow_runner.execute(
+            flow_result_any = await flow_runner.execute(
                 FlowPlan(
                     source_token=WETH_MAINNET,
                     source_amount=QUOTE_AMOUNT_IN,
                     receiver=deployer,
                     dst_chain=ARBITRUM_LZ_EID,
-                    first=FlowCallOp(
+                    first=flow_runner.call_template(
                         target=swap_target,
-                        calldata_builder=(
-                            (
-                                lambda amount: _tx_data_bytes(
-                                    v2_router.fns.getAmountsOut(amount, UNISWAP_V2_QUOTE_PATH).data
-                                )
-                            )
-                            if swap_source == "v2_router"
-                            else (
-                                lambda amount: _tx_data_bytes(
-                                    v3_quoter.fns.quoteExactInputSingle(
-                                        (
-                                            Web3.to_checksum_address(WETH_MAINNET),
-                                            USDC_MAINNET,
-                                            amount,
-                                            UNISWAP_V3_POOL_FEE_3000,
-                                            0,
-                                        )
-                                    ).data
-                                )
-                            )
-                        ),
-                        token_in=WETH_MAINNET,
+                        calldata_template=swap_calldata,
+                        amount_placeholder=QUOTE_AMOUNT_IN,
                         token_out=USDC_MAINNET,
                         extraction_mode=swap_extraction_mode,
-                        extraction_offset=swap_extraction_offset,
                     ),
-                    split=FlowSplitOp(ratios_bps=[10_000]),
+                    split=FlowSplitOp.full(),
                     branches=[
-                        FlowCallOp(
+                        flow_runner.call_template(
                             target=LZ_OFT_ZRO,
-                            calldata_builder=lambda amount: _tx_data_bytes(
-                                oft.fns.quoteSend(
-                                    (
-                                        ARBITRUM_LZ_EID,
-                                        recipient_bytes32,
-                                        amount,
-                                        0,
-                                        b"",
-                                        b"",
-                                        b"",
-                                    ),
-                                    False,
-                                ).data
-                            ),
-                            token_in=USDC_MAINNET,
+                            calldata_template=bridge_calldata,
+                            amount_placeholder=QUOTE_AMOUNT_IN,
                             token_out=USDC_MAINNET,
                             extraction_mode=ExtractionMode.RET_U256,
-                            extraction_offset=0,
                         )
                     ],
                 )
             )
+            assert isinstance(flow_result_any, dict)
+            flow_result = flow_result_any
             native_fee = int(flow_result["branches"][0]["amount_out"])
             result = native_fee.to_bytes(32, "big")
 
@@ -1080,6 +1045,7 @@ class TestDeFiVMFork:
 
             result = await builder.execute_async()
         else:
+            flow_runner = FlowRunner(runtime_vm)
             actions: list[dict[str, Any]] = [
                 {
                     "kind": "swap",
@@ -1119,7 +1085,7 @@ class TestDeFiVMFork:
                         }
                     )
 
-            result = await runtime_vm.compose(
+            result_any = await flow_runner.execute(
                 from_token=WETH_MAINNET,
                 to_token=USDC_MAINNET,
                 amount_in=QUOTE_AMOUNT_IN,
@@ -1132,6 +1098,8 @@ class TestDeFiVMFork:
                     LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
                 },
             )
+            assert isinstance(result_any, (bytes, bytearray))
+            result = bytes(result_any)
 
         expected_calls = 1 + len(post_swap_actions)
         assert len(call_records) == expected_calls

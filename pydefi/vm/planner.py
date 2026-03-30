@@ -19,7 +19,6 @@ class FlowCallOp:
 
     target: str
     calldata_builder: Callable[[int], bytes]
-    token_in: Any
     token_out: Any
     extraction_mode: ExtractionMode = ExtractionMode.RET_LAST32
     extraction_offset: int | None = None
@@ -32,6 +31,12 @@ class FlowSplitOp:
     """Split operation represented in basis points (10000 = 100%)."""
 
     ratios_bps: list[int]
+
+    @classmethod
+    def full(cls) -> "FlowSplitOp":
+        """A single-branch 100% split."""
+
+        return cls(ratios_bps=[10_000])
 
 
 @dataclass(frozen=True)
@@ -52,10 +57,102 @@ class FlowPlan:
 
 
 class FlowRunner:
-    """Execute generic call/split flow plans on top of VirtualMachine.compose."""
+    """Execute generic call/split and action-graph flows on top of DeFiBuilder."""
 
     def __init__(self, vm: Any):
         self.vm = vm
+
+    @staticmethod
+    def call(
+        *,
+        target: str,
+        calldata_builder: Callable[[int], bytes],
+        token_out: Any,
+        extraction_mode: ExtractionMode = ExtractionMode.RET_LAST32,
+        extraction_offset: int | None = None,
+        extraction_size: int | None = None,
+        value: int = 0,
+    ) -> FlowCallOp:
+        """Small factory for building FlowCallOp with less call-site noise."""
+
+        if extraction_mode == ExtractionMode.RET_U256 and extraction_offset is None:
+            extraction_offset = 0
+
+        return FlowCallOp(
+            target=target,
+            calldata_builder=calldata_builder,
+            token_out=token_out,
+            extraction_mode=extraction_mode,
+            extraction_offset=extraction_offset,
+            extraction_size=extraction_size,
+            value=value,
+        )
+
+    @staticmethod
+    def _find_u256_offsets(template: bytes, placeholder: int) -> list[int]:
+        needle = int(placeholder).to_bytes(32, "big", signed=False)
+        out: list[int] = []
+        i = template.find(needle)
+        while i != -1:
+            out.append(i)
+            i = template.find(needle, i + 1)
+        return out
+
+    @staticmethod
+    def call_template(
+        *,
+        target: str,
+        calldata_template: bytes,
+        token_out: Any,
+        amount_placeholder: int | None = None,
+        patch_offset: int | None = None,
+        patch_offsets: list[int] | None = None,
+        extraction_mode: ExtractionMode = ExtractionMode.RET_LAST32,
+        extraction_offset: int | None = None,
+        extraction_size: int | None = None,
+        value: int = 0,
+    ) -> FlowCallOp:
+        """Build a FlowCallOp from calldata template with optional amount patching."""
+
+        offsets = list(patch_offsets or [])
+        if patch_offset is not None:
+            offsets.append(int(patch_offset))
+
+        if not offsets and amount_placeholder is not None:
+            inferred = FlowRunner._find_u256_offsets(calldata_template, int(amount_placeholder))
+            if len(inferred) == 1:
+                offsets = inferred
+            elif len(inferred) > 1:
+                raise ValueError(
+                    f"multiple amount placeholders found in calldata ({inferred}); pass patch_offset(s) explicitly"
+                )
+
+        for off in offsets:
+            if off < 0:
+                raise ValueError("patch offsets must be non-negative")
+            if off + 32 > len(calldata_template):
+                raise ValueError(f"patch offset out of range: {off}")
+
+        frozen_template = bytes(calldata_template)
+
+        def _build(amount: int) -> bytes:
+            if not offsets:
+                return frozen_template
+            buf = bytearray(frozen_template)
+            word = int(amount).to_bytes(32, "big", signed=False)
+            for off in offsets:
+                buf[off : off + 32] = word
+            return bytes(buf)
+
+        return FlowRunner.call(
+            target=target,
+            calldata_builder=_build,
+            token_out=token_out,
+            extraction_mode=extraction_mode,
+            extraction_offset=extraction_offset,
+            extraction_size=extraction_size,
+            value=value,
+        )
 
     @staticmethod
     def _call_actions(*, op: FlowCallOp, amount_in: int) -> list[dict[str, Any]]:
@@ -114,7 +211,7 @@ class FlowRunner:
         if sum(ratios) != 10_000:
             raise ValueError("split ratios must sum to 10000 bps")
 
-    async def _run_single_call_compose(
+    async def _run_single_call_action_graph(
         self,
         *,
         from_token: Any,
@@ -124,55 +221,102 @@ class FlowRunner:
         op: FlowCallOp,
     ) -> bytes:
         actions = self._call_actions(op=op, amount_in=amount_in)
-        return await self.vm.compose(
-            from_token=from_token,
-            to_token=op.token_out,
-            amount_in=amount_in,
-            dst_chain=dst_chain,
-            receiver=receiver,
+        builder = self.vm.builder().from_token(from_token, amount_in=int(amount_in)).to(receiver)
+        return await execute_action_graph_async(
+            builder,
             actions=actions,
             token_out=op.token_out,
+            dst_chain=dst_chain,
             dst_token=op.token_out,
         )
 
-    async def execute(self, flow: FlowPlan) -> dict[str, Any]:
-        self._validate_flow(flow)
+    async def execute(
+        self,
+        flow: FlowPlan | None = None,
+        *,
+        from_token: Any | None = None,
+        to_token: Any | None = None,
+        amount_in: int | None = None,
+        dst_chain: Any | None = None,
+        receiver: str | None = None,
+        actions: list[Any] | None = None,
+        token_out: Any | None = None,
+        dst_token: Any | None = None,
+        enforce_chain_token_consistency: bool = True,
+        enforce_bridge_amount_sanity: bool = True,
+        max_slippage_bps: int | None = None,
+        bridge_amount_decoders: dict[bytes, "BridgeAmountDecoder"] | None = None,
+    ) -> dict[str, Any] | bytes:
+        """Unified FlowRunner entrypoint.
 
-        first_ret = await self._run_single_call_compose(
-            from_token=flow.source_token,
-            amount_in=int(flow.source_amount),
-            receiver=flow.receiver,
-            dst_chain=flow.dst_chain,
-            op=flow.first,
-        )
-        amount_mid = self._decode_from_returndata(op=flow.first, ret=first_ret)
-        split_amounts = [(amount_mid * bps) // 10_000 for bps in flow.split.ratios_bps]
+        Modes:
+          1) Plan mode: execute(flow=FlowPlan(...))
+          2) Action-graph mode: execute(from_token=..., actions=[...], ...)
+        """
 
-        branch_results: list[dict[str, Any]] = []
-        for idx, branch in enumerate(flow.branches):
-            branch_amount = split_amounts[idx]
-            branch_ret = await self._run_single_call_compose(
-                from_token=flow.first.token_out,
-                amount_in=branch_amount,
+        if flow is not None:
+            if any(v is not None for v in (from_token, to_token, amount_in, dst_chain, receiver, actions)):
+                raise ValueError("execute cannot mix flow=... with action-graph arguments")
+            self._validate_flow(flow)
+
+            first_ret = await self._run_single_call_action_graph(
+                from_token=flow.source_token,
+                amount_in=int(flow.source_amount),
                 receiver=flow.receiver,
                 dst_chain=flow.dst_chain,
-                op=branch,
+                op=flow.first,
             )
-            branch_out = self._decode_from_returndata(op=branch, ret=branch_ret)
-            branch_results.append(
-                {
-                    "branch_index": idx,
-                    "amount_in": branch_amount,
-                    "amount_out": branch_out,
-                    "to_token": branch.token_out,
-                }
+            amount_mid = self._decode_from_returndata(op=flow.first, ret=first_ret)
+            split_amounts = [(amount_mid * bps) // 10_000 for bps in flow.split.ratios_bps]
+
+            branch_results: list[dict[str, Any]] = []
+            for idx, branch in enumerate(flow.branches):
+                branch_amount = split_amounts[idx]
+                branch_ret = await self._run_single_call_action_graph(
+                    from_token=flow.first.token_out,
+                    amount_in=branch_amount,
+                    receiver=flow.receiver,
+                    dst_chain=flow.dst_chain,
+                    op=branch,
+                )
+                branch_out = self._decode_from_returndata(op=branch, ret=branch_ret)
+                branch_results.append(
+                    {
+                        "branch_index": idx,
+                        "amount_in": branch_amount,
+                        "amount_out": branch_out,
+                        "to_token": branch.token_out,
+                    }
+                )
+
+            return {
+                "amount_mid_total": amount_mid,
+                "split_amounts": split_amounts,
+                "branches": branch_results,
+            }
+
+        if actions is None:
+            raise ValueError("execute requires either flow=FlowPlan(...) or actions=[...]")
+        if from_token is None or to_token is None or amount_in is None or receiver is None or dst_chain is None:
+            raise ValueError(
+                "action-graph mode requires from_token, to_token, amount_in, receiver, dst_chain, and actions"
             )
 
-        return {
-            "amount_mid_total": amount_mid,
-            "split_amounts": split_amounts,
-            "branches": branch_results,
-        }
+        resolved_token_out = to_token if token_out is None else token_out
+        resolved_dst_token = resolved_token_out if dst_token is None else dst_token
+
+        builder = self.vm.builder().from_token(from_token, amount_in=int(amount_in)).to(receiver)
+        return await execute_action_graph_async(
+            builder,
+            actions=actions,
+            token_out=resolved_token_out,
+            dst_chain=dst_chain,
+            dst_token=resolved_dst_token,
+            enforce_chain_token_consistency=enforce_chain_token_consistency,
+            enforce_bridge_amount_sanity=enforce_bridge_amount_sanity,
+            max_slippage_bps=max_slippage_bps,
+            bridge_amount_decoders=bridge_amount_decoders,
+        )
 
 
 @dataclass(frozen=True)

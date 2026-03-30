@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable as AwaitableABC
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Tuple
 
 from .patcher import Patcher
@@ -11,38 +10,19 @@ if TYPE_CHECKING:
 
 
 CallExecutor = Callable[[str, bytes, int], Awaitable[Tuple[bool, bytes] | bytes]]
-ComposeResolver = Callable[[Any, Any, int, Any], Awaitable[dict[str, Any]] | dict[str, Any]]
 
 
 class VirtualMachine:
     """Minimal Python virtual machine for Blueprint command execution."""
 
-    _DEFAULT_COMPOSE_RECEIVER = "0x000000000000000000000000000000000000dEaD"
-    _COMPOSE_CONTEXT_KEYS = (
-        "actions",
-        "action_graph",
-        "token_out",
-        "dst_token",
-        "dst_chain",
-        "receiver",
-        "execution_kwargs",
-    )
-
     def __init__(
         self,
         register_count: int = 16,
         call_executor: CallExecutor | None = None,
-        compose_resolver: ComposeResolver | None = None,
     ):
         self._register_count = register_count
         self._call_executor = call_executor
-        self._compose_resolver = compose_resolver
         self.registers: List[bytes] = [b""] * self._register_count
-
-    def set_compose_resolver(self, resolver: ComposeResolver | None) -> "VirtualMachine":
-        """Set or clear route resolver used by :meth:`compose`."""
-        self._compose_resolver = resolver
-        return self
 
     @classmethod
     def from_async_web3(
@@ -108,81 +88,6 @@ class VirtualMachine:
         from .builder import DeFiBuilder
 
         return DeFiBuilder(self)
-
-    async def compose(
-        self,
-        *,
-        from_token: Any,
-        to_token: Any,
-        amount_in: int,
-        dst_chain: Any,
-        receiver: str | None = None,
-        compose_resolver: ComposeResolver | None = None,
-        **execution_overrides: Any,
-    ) -> bytes:
-        """Compose and execute a flow using high-level token inputs.
-
-        Route context can be provided either by a resolver or inline kwargs.
-        Action-graph mode required key: ``actions`` (or ``action_graph``).
-        Optional keys: ``token_out``, ``dst_token``, ``receiver``,
-        ``execution_kwargs``.
-        """
-
-        # Strip route-context keys from execution_overrides to avoid duplicate kwargs.
-        route_context_overrides: dict[str, Any] = {}
-        for key in self._COMPOSE_CONTEXT_KEYS:
-            if key in execution_overrides:
-                route_context_overrides[key] = execution_overrides.pop(key)
-
-        resolver = compose_resolver or self._compose_resolver
-        context: dict[str, Any]
-        if resolver is not None:
-            resolved = resolver(from_token, to_token, amount_in, dst_chain)
-            if isinstance(resolved, AwaitableABC):
-                context = await resolved
-            else:
-                context = resolved
-
-            if route_context_overrides:
-                context = {**context, **route_context_overrides}
-        else:
-            context = route_context_overrides
-
-            if not context:
-                raise ValueError(
-                    "compose requires either compose_resolver or inline route context keys: actions/action_graph"
-                )
-
-        actions_context = context.get("actions")
-        if actions_context is None:
-            actions_context = context.get("action_graph")
-
-        if actions_context is None:
-            raise ValueError("compose route context missing required key: actions (or action_graph)")
-
-        receiver_addr = receiver or context.get("receiver") or self._DEFAULT_COMPOSE_RECEIVER
-
-        compose_builder = self.builder().from_token(from_token, amount_in=amount_in).to(receiver_addr)
-
-        execute_kwargs = dict(context.get("execution_kwargs", {}))
-        execute_kwargs.update(execution_overrides)
-
-        planner_dst_chain = context.get("dst_chain", dst_chain)
-
-        from .planner import execute_action_graph_async
-
-        if not isinstance(actions_context, list) or not actions_context:
-            raise ValueError("compose action graph mode requires a non-empty list in actions/action_graph")
-
-        result = await execute_action_graph_async(
-            compose_builder,
-            actions=actions_context,
-            token_out=context.get("token_out", to_token),
-            dst_chain=planner_dst_chain,
-            dst_token=context.get("dst_token", to_token),
-            **execute_kwargs,
-        )
-        return result
 
     def _require_register(self, reg_idx: int) -> None:
         if reg_idx < 0 or reg_idx >= self._register_count:
