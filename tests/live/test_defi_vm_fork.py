@@ -108,7 +108,10 @@ async def _deploy(w3: AsyncWeb3, compiled: dict, deployer: str) -> str:
     contract = w3.eth.contract(abi=compiled["abi"], bytecode=compiled["bin"])
     tx_hash = await contract.constructor().transact({"from": deployer})
     receipt = await w3.eth.get_transaction_receipt(tx_hash)
-    return receipt["contractAddress"]
+    contract_address = receipt["contractAddress"]
+    if contract_address is None:
+        raise ValueError("deployment receipt missing contractAddress")
+    return str(contract_address)
 
 
 def _adapter_call_program(adapter: str, calldata: bytes, *, value: int = 0, require_success: bool = True) -> bytes:
@@ -943,6 +946,7 @@ class TestDeFiVMFork:
         native_fee = int.from_bytes(result[:32], "big")
         assert native_fee > 0
 
+    @pytest.mark.parametrize("use_builder", [False, True], ids=["compose_actions", "builder_chain"])
     @pytest.mark.parametrize("swap_source", ["v2_router", "v3_quoter"])
     @pytest.mark.parametrize(
         "post_swap_actions",
@@ -962,6 +966,7 @@ class TestDeFiVMFork:
     async def test_action_graph_multi_kind_combos(
         self,
         ctx,
+        use_builder: bool,
         swap_source: str,
         post_swap_actions: list[str],
     ):
@@ -1012,61 +1017,94 @@ class TestDeFiVMFork:
 
         get_forty_two_calldata = keccak(b"getFortyTwo()")[:4]
 
-        actions: list[dict[str, Any]] = [
-            {
-                "kind": "swap",
-                "target": swap_target,
-                "token_out": USDC_MAINNET,
-                "calldata": swap_calldata,
-                "amount_placeholder": QUOTE_AMOUNT_IN,
-                "auto_amount_from_prev_call": False,
-            },
-            {
-                "kind": "extract",
-                "extraction_mode": extraction_mode.value,
-                "extraction_offset": extraction_offset,
-            },
-        ]
-
-        for kind in post_swap_actions:
-            if kind == "bridge":
-                actions.append(
-                    {
-                        "kind": "bridge",
-                        "target": LZ_OFT_ZRO,
-                        "dst_chain": ARBITRUM_LZ_EID,
-                        "dst_token": USDC_MAINNET,
-                        "token_out": USDC_MAINNET,
-                        "calldata": bridge_calldata,
-                        "amount_placeholder": QUOTE_AMOUNT_IN,
-                        "auto_amount_from_prev_call": False,
-                    }
-                )
-            else:
-                actions.append(
-                    {
-                        "kind": kind,
-                        "target": adapter,
-                        "calldata": get_forty_two_calldata,
-                    }
-                )
-
         call_records: list[tuple[str, bytes, int, bytes]] = []
         runtime_vm = VirtualMachine(call_executor=_make_async_eth_call_executor(w3, deployer, call_records))
 
-        result = await runtime_vm.compose(
-            from_token=WETH_MAINNET,
-            to_token=USDC_MAINNET,
-            amount_in=QUOTE_AMOUNT_IN,
-            dst_chain=ARBITRUM_LZ_EID,
-            receiver=deployer,
-            actions=actions,
-            token_out=USDC_MAINNET,
-            dst_token=USDC_MAINNET,
-            bridge_amount_decoders={
-                LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
-            },
-        )
+        if use_builder:
+            builder = (
+                runtime_vm.builder()
+                .from_token(WETH_MAINNET, amount_in=QUOTE_AMOUNT_IN)
+                .to(deployer)
+                .swap(
+                    swap_target,
+                    USDC_MAINNET,
+                    swap_calldata,
+                    amount_placeholder=QUOTE_AMOUNT_IN,
+                )
+            )
+
+            for kind in post_swap_actions:
+                if kind == "bridge":
+                    builder = builder.bridge(
+                        LZ_OFT_ZRO,
+                        ARBITRUM_LZ_EID,
+                        USDC_MAINNET,
+                        amount_placeholder=QUOTE_AMOUNT_IN,
+                        calldata_template=bridge_calldata,
+                    )
+                elif kind == "deposit":
+                    builder = builder.deposit(adapter, get_forty_two_calldata)
+                elif kind == "mint":
+                    builder = builder.mint(adapter, get_forty_two_calldata)
+                elif kind == "wrap":
+                    builder = builder.wrap(adapter, get_forty_two_calldata)
+                else:
+                    raise ValueError(f"unsupported action kind in combo test: {kind}")
+
+            result = await builder.execute_async()
+        else:
+            actions: list[dict[str, Any]] = [
+                {
+                    "kind": "swap",
+                    "target": swap_target,
+                    "token_out": USDC_MAINNET,
+                    "calldata": swap_calldata,
+                    "amount_placeholder": QUOTE_AMOUNT_IN,
+                    "auto_amount_from_prev_call": False,
+                },
+                {
+                    "kind": "extract",
+                    "extraction_mode": extraction_mode.value,
+                    "extraction_offset": extraction_offset,
+                },
+            ]
+
+            for kind in post_swap_actions:
+                if kind == "bridge":
+                    actions.append(
+                        {
+                            "kind": "bridge",
+                            "target": LZ_OFT_ZRO,
+                            "dst_chain": ARBITRUM_LZ_EID,
+                            "dst_token": USDC_MAINNET,
+                            "token_out": USDC_MAINNET,
+                            "calldata": bridge_calldata,
+                            "amount_placeholder": QUOTE_AMOUNT_IN,
+                            "auto_amount_from_prev_call": False,
+                        }
+                    )
+                else:
+                    actions.append(
+                        {
+                            "kind": kind,
+                            "target": adapter,
+                            "calldata": get_forty_two_calldata,
+                        }
+                    )
+
+            result = await runtime_vm.compose(
+                from_token=WETH_MAINNET,
+                to_token=USDC_MAINNET,
+                amount_in=QUOTE_AMOUNT_IN,
+                dst_chain=ARBITRUM_LZ_EID,
+                receiver=deployer,
+                actions=actions,
+                token_out=USDC_MAINNET,
+                dst_token=USDC_MAINNET,
+                bridge_amount_decoders={
+                    LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
+                },
+            )
 
         expected_calls = 1 + len(post_swap_actions)
         assert len(call_records) == expected_calls
