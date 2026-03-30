@@ -237,7 +237,12 @@ class DeFiBuilder:
 
     def from_token(self, token: Any, *, amount_in: int) -> "DeFiBuilder":
         self.blueprint = Blueprint(from_token=token, amount_in=amount_in, receiver="")
-        registers = [b""] * 16
+        register_count = int(getattr(self.vm, "register_count", 16))
+        if register_count < 4:
+            raise ValueError(
+                f"register_count must be >= 4 to preserve DeFiBuilder register indexes (1,2,3), got {register_count}"
+            )
+        registers = [b""] * register_count
         registers[self._AMOUNT_REG] = self._to_uint256_bytes(amount_in)
         self.blueprint.initial_state = VMState(registers=registers)
         return self
