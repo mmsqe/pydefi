@@ -1,312 +1,86 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
-from .builder import DeFiBuilder
-
-
-class ExtractionMode(str, Enum):
-    RET_LAST32 = "ret_last32"
-    RET_U256 = "ret_u256"
-    RET_SLICE = "ret_slice"
-
-
-@dataclass(frozen=True)
-class FlowCallOp:
-    """Generic external call operation used by FlowRunner."""
-
-    target: str
-    calldata_builder: Callable[[int], bytes]
-    token_out: Any
-    extraction_mode: ExtractionMode = ExtractionMode.RET_LAST32
-    extraction_offset: int | None = None
-    extraction_size: int | None = None
-    value: int = 0
+from .action_graph import (
+    ActionPlan,
+    BridgeAmountDecoder,
+    ExtractionMode,
+    apply_action_graph,
+    coerce_extraction_mode,
+    execute_action_graph_async,
+)
 
 
 @dataclass(frozen=True)
-class FlowSplitOp:
-    """Split operation represented in basis points (10000 = 100%)."""
+class StepPlan:
+    """Declarative intent plan represented as a generic step list.
 
-    ratios_bps: list[int]
-
-    @classmethod
-    def full(cls) -> "FlowSplitOp":
-        """A single-branch 100% split."""
-
-        return cls(ratios_bps=[10_000])
-
-
-@dataclass(frozen=True)
-class FlowPlan:
-    """Minimal generic flow model compiled to compose action graphs.
-
-    Shape:
-      source -> first call -> split -> branch calls
+    This model decouples intent description from execution details. Steps are
+    plain dict entries (for example ``{"action": "swap", ...}``) and may
+    include a ``split`` node for proportion-based branching.
     """
 
     source_token: Any
     source_amount: int
     receiver: str
-    first: FlowCallOp
-    split: FlowSplitOp
-    branches: list[FlowCallOp]
+    steps: list[Any]
     dst_chain: Any = 1
+    token_out: Any | None = None
+    dst_token: Any | None = None
 
 
 class FlowRunner:
-    """Execute generic call/split and action-graph flows on top of DeFiBuilder."""
+    """Execute generic step plans and action graphs on top of DeFiBuilder."""
 
     def __init__(self, vm: Any):
         self.vm = vm
 
-    @staticmethod
-    def call(
+    def create(
+        self,
         *,
-        target: str,
-        calldata_builder: Callable[[int], bytes],
-        token_out: Any,
-        extraction_mode: ExtractionMode = ExtractionMode.RET_LAST32,
-        extraction_offset: int | None = None,
-        extraction_size: int | None = None,
-        value: int = 0,
-    ) -> FlowCallOp:
-        """Small factory for building FlowCallOp with less call-site noise."""
+        source_token: Any,
+        source_amount: int,
+        receiver: str,
+        steps: list[Any],
+        dst_chain: Any = 1,
+        token_out: Any | None = None,
+        dst_token: Any | None = None,
+    ) -> StepPlan:
+        """Create a declarative step plan without executing it."""
 
-        if extraction_mode == ExtractionMode.RET_U256 and extraction_offset is None:
-            extraction_offset = 0
-
-        return FlowCallOp(
-            target=target,
-            calldata_builder=calldata_builder,
+        return StepPlan(
+            source_token=source_token,
+            source_amount=int(source_amount),
+            receiver=receiver,
+            steps=steps,
+            dst_chain=dst_chain,
             token_out=token_out,
-            extraction_mode=extraction_mode,
-            extraction_offset=extraction_offset,
-            extraction_size=extraction_size,
-            value=value,
+            dst_token=dst_token,
         )
 
-    @staticmethod
-    def _find_u256_offsets(template: bytes, placeholder: int) -> list[int]:
-        needle = int(placeholder).to_bytes(32, "big", signed=False)
-        out: list[int] = []
-        i = template.find(needle)
-        while i != -1:
-            out.append(i)
-            i = template.find(needle, i + 1)
-        return out
-
-    @staticmethod
-    def call_template(
-        *,
-        target: str,
-        calldata_template: bytes,
-        token_out: Any,
-        amount_placeholder: int | None = None,
-        patch_offset: int | None = None,
-        patch_offsets: list[int] | None = None,
-        extraction_mode: ExtractionMode = ExtractionMode.RET_LAST32,
-        extraction_offset: int | None = None,
-        extraction_size: int | None = None,
-        value: int = 0,
-    ) -> FlowCallOp:
-        """Build a FlowCallOp from calldata template with optional amount patching."""
-
-        offsets = list(patch_offsets or [])
-        if patch_offset is not None:
-            offsets.append(int(patch_offset))
-
-        if not offsets and amount_placeholder is not None:
-            inferred = FlowRunner._find_u256_offsets(calldata_template, int(amount_placeholder))
-            if len(inferred) == 1:
-                offsets = inferred
-            elif len(inferred) > 1:
-                raise ValueError(
-                    f"multiple amount placeholders found in calldata ({inferred}); pass patch_offset(s) explicitly"
-                )
-
-        for off in offsets:
-            if off < 0:
-                raise ValueError("patch offsets must be non-negative")
-            if off + 32 > len(calldata_template):
-                raise ValueError(f"patch offset out of range: {off}")
-
-        frozen_template = bytes(calldata_template)
-
-        def _build(amount: int) -> bytes:
-            if not offsets:
-                return frozen_template
-            buf = bytearray(frozen_template)
-            word = int(amount).to_bytes(32, "big", signed=False)
-            for off in offsets:
-                buf[off : off + 32] = word
-            return bytes(buf)
-
-        return FlowRunner.call(
-            target=target,
-            calldata_builder=_build,
-            token_out=token_out,
-            extraction_mode=extraction_mode,
-            extraction_offset=extraction_offset,
-            extraction_size=extraction_size,
-            value=value,
-        )
-
-    @staticmethod
-    def _call_actions(*, op: FlowCallOp, amount_in: int) -> list[dict[str, Any]]:
-        return [
-            {
-                "kind": "call",
-                "target": op.target,
-                "token_out": op.token_out,
-                "calldata": op.calldata_builder(int(amount_in)),
-                "value": int(op.value),
-                "auto_amount_from_prev_call": False,
-            }
-        ]
-
-    @staticmethod
-    def _decode_from_returndata(*, op: FlowCallOp, ret: bytes) -> int:
-        if op.extraction_mode == ExtractionMode.RET_LAST32:
-            if len(ret) < 32:
-                raise ValueError("returndata too short for RET_LAST32")
-            return int.from_bytes(ret[-32:], "big")
-
-        if op.extraction_mode == ExtractionMode.RET_U256:
-            offset = int(op.extraction_offset or 0)
-            if offset < 0:
-                raise ValueError("RET_U256 offset must be non-negative")
-            if offset + 32 > len(ret):
-                raise ValueError("returndata too short for RET_U256 offset")
-            return int.from_bytes(ret[offset : offset + 32], "big")
-
-        if op.extraction_mode == ExtractionMode.RET_SLICE:
-            if op.extraction_offset is None or op.extraction_size is None:
-                raise ValueError("RET_SLICE requires extraction_offset and extraction_size")
-            start = int(op.extraction_offset)
-            size = int(op.extraction_size)
-            if start < 0 or size < 0:
-                raise ValueError("RET_SLICE offset/size must be non-negative")
-            end = start + size
-            if end > len(ret):
-                raise ValueError("returndata too short for RET_SLICE range")
-            chunk = ret[start:end]
-            if len(chunk) > 32:
-                raise ValueError("RET_SLICE chunk cannot exceed 32 bytes for uint256 decode")
-            return int.from_bytes(chunk.rjust(32, b"\x00"), "big")
-
-        raise ValueError(f"unsupported extraction mode: {op.extraction_mode}")
-
-    @staticmethod
-    def _validate_flow(flow: FlowPlan) -> None:
-        ratios = flow.split.ratios_bps
-        if not ratios:
-            raise ValueError("flow.split.ratios_bps must be non-empty")
-        if len(ratios) != len(flow.branches):
-            raise ValueError("split ratios and branches length mismatch")
-        if any((bps < 0 or bps > 10_000) for bps in ratios):
-            raise ValueError("each split ratio must be in [0, 10000]")
-        if sum(ratios) != 10_000:
-            raise ValueError("split ratios must sum to 10000 bps")
-
-    async def _run_single_call_action_graph(
+    async def _execute_actions(
         self,
         *,
         from_token: Any,
+        to_token: Any,
         amount_in: int,
-        receiver: str,
         dst_chain: Any,
-        op: FlowCallOp,
-    ) -> bytes:
-        actions = self._call_actions(op=op, amount_in=amount_in)
-        builder = self.vm.builder().from_token(from_token, amount_in=int(amount_in)).to(receiver)
-        return await execute_action_graph_async(
-            builder,
-            actions=actions,
-            token_out=op.token_out,
-            dst_chain=dst_chain,
-            dst_token=op.token_out,
-        )
-
-    async def execute(
-        self,
-        flow: FlowPlan | None = None,
-        *,
-        from_token: Any | None = None,
-        to_token: Any | None = None,
-        amount_in: int | None = None,
-        dst_chain: Any | None = None,
-        receiver: str | None = None,
-        actions: list[Any] | None = None,
+        receiver: str,
+        actions: list[Any],
         token_out: Any | None = None,
         dst_token: Any | None = None,
         enforce_chain_token_consistency: bool = True,
         enforce_bridge_amount_sanity: bool = True,
         max_slippage_bps: int | None = None,
         bridge_amount_decoders: dict[bytes, "BridgeAmountDecoder"] | None = None,
-    ) -> dict[str, Any] | bytes:
-        """Unified FlowRunner entrypoint.
-
-        Modes:
-          1) Plan mode: execute(flow=FlowPlan(...))
-          2) Action-graph mode: execute(from_token=..., actions=[...], ...)
-        """
-
-        if flow is not None:
-            if any(v is not None for v in (from_token, to_token, amount_in, dst_chain, receiver, actions)):
-                raise ValueError("execute cannot mix flow=... with action-graph arguments")
-            self._validate_flow(flow)
-
-            first_ret = await self._run_single_call_action_graph(
-                from_token=flow.source_token,
-                amount_in=int(flow.source_amount),
-                receiver=flow.receiver,
-                dst_chain=flow.dst_chain,
-                op=flow.first,
-            )
-            amount_mid = self._decode_from_returndata(op=flow.first, ret=first_ret)
-            split_amounts = [(amount_mid * bps) // 10_000 for bps in flow.split.ratios_bps]
-
-            branch_results: list[dict[str, Any]] = []
-            for idx, branch in enumerate(flow.branches):
-                branch_amount = split_amounts[idx]
-                branch_ret = await self._run_single_call_action_graph(
-                    from_token=flow.first.token_out,
-                    amount_in=branch_amount,
-                    receiver=flow.receiver,
-                    dst_chain=flow.dst_chain,
-                    op=branch,
-                )
-                branch_out = self._decode_from_returndata(op=branch, ret=branch_ret)
-                branch_results.append(
-                    {
-                        "branch_index": idx,
-                        "amount_in": branch_amount,
-                        "amount_out": branch_out,
-                        "to_token": branch.token_out,
-                    }
-                )
-
-            return {
-                "amount_mid_total": amount_mid,
-                "split_amounts": split_amounts,
-                "branches": branch_results,
-            }
-
-        if actions is None:
-            raise ValueError("execute requires either flow=FlowPlan(...) or actions=[...]")
-        if from_token is None or to_token is None or amount_in is None or receiver is None or dst_chain is None:
-            raise ValueError(
-                "action-graph mode requires from_token, to_token, amount_in, receiver, dst_chain, and actions"
-            )
-
+    ) -> bytes:
         resolved_token_out = to_token if token_out is None else token_out
         resolved_dst_token = resolved_token_out if dst_token is None else dst_token
 
         builder = self.vm.builder().from_token(from_token, amount_in=int(amount_in)).to(receiver)
-        return await execute_action_graph_async(
+        result = await execute_action_graph_async(
             builder,
             actions=actions,
             token_out=resolved_token_out,
@@ -317,386 +91,330 @@ class FlowRunner:
             max_slippage_bps=max_slippage_bps,
             bridge_amount_decoders=bridge_amount_decoders,
         )
+        return bytes(result)
 
+    async def _execute_linear_steps(
+        self,
+        *,
+        from_token: Any,
+        amount_in: int,
+        receiver: str,
+        dst_chain: Any,
+        steps: list[Any],
+        token_out: Any | None,
+        dst_token: Any | None,
+    ) -> bytes:
+        """Compile linear steps into actions and execute them."""
+        actions = [_step_to_action(step) for step in steps]
+        resolved_to_token = _resolve_steps_terminal_token(
+            steps, default=token_out if token_out is not None else from_token
+        )
+        return await self._execute_actions(
+            from_token=from_token,
+            to_token=resolved_to_token,
+            amount_in=int(amount_in),
+            dst_chain=dst_chain,
+            receiver=receiver,
+            actions=actions,
+            token_out=resolved_to_token,
+            dst_token=dst_token if dst_token is not None else resolved_to_token,
+        )
 
-@dataclass(frozen=True)
-class ActionPlan:
-    kind: str
-    target: Any | None = None
-    calldata: bytes | None = None
-    patch_offsets: list[int] | None = None
-    patch_offset: int | None = None
-    amount_placeholder: int | None = None
-    value: int = 0
-    auto_amount_from_prev_call: bool = True
-    target_candidates: list[str] | None = None
-    token_out: Any | None = None
-    dst_chain: Any | None = None
-    dst_token: Any | None = None
-    extraction_mode: ExtractionMode = ExtractionMode.RET_LAST32
-    extraction_offset: int | None = None
-    extraction_size: int | None = None
-    prefer_slice_for_last32: bool = False
+    def _decode_steps_output_amount(self, *, steps: list[Any], ret: bytes) -> int:
+        """Decode amount-like output from step execution according to terminal extraction mode."""
+        extraction_mode, extraction_offset, extraction_size = _resolve_terminal_extraction(steps)
+        return self._decode_from_returndata(
+            extraction_mode=extraction_mode,
+            extraction_offset=extraction_offset,
+            extraction_size=extraction_size,
+            ret=ret,
+        )
 
+    @staticmethod
+    def _decode_from_returndata(
+        *,
+        extraction_mode: ExtractionMode,
+        extraction_offset: int | None,
+        extraction_size: int | None,
+        ret: bytes,
+    ) -> int:
+        if extraction_mode == ExtractionMode.RET_LAST32:
+            if len(ret) < 32:
+                raise ValueError("returndata too short for RET_LAST32")
+            return int.from_bytes(ret[-32:], "big")
 
-BridgeAmountDecoder = Callable[[bytes], tuple[int, int] | None]
+        if extraction_mode == ExtractionMode.RET_U256:
+            offset = int(extraction_offset or 0)
+            if offset < 0:
+                raise ValueError("RET_U256 offset must be non-negative")
+            if offset + 32 > len(ret):
+                raise ValueError("returndata too short for RET_U256 offset")
+            return int.from_bytes(ret[offset : offset + 32], "big")
 
+        if extraction_mode == ExtractionMode.RET_SLICE:
+            if extraction_offset is None or extraction_size is None:
+                raise ValueError("RET_SLICE requires extraction_offset and extraction_size")
+            start = int(extraction_offset)
+            size = int(extraction_size)
+            if start < 0 or size < 0:
+                raise ValueError("RET_SLICE offset/size must be non-negative")
+            end = start + size
+            if end > len(ret):
+                raise ValueError("returndata too short for RET_SLICE range")
+            chunk = ret[start:end]
+            if len(chunk) > 32:
+                raise ValueError("RET_SLICE chunk cannot exceed 32 bytes for uint256 decode")
+            return int.from_bytes(chunk.rjust(32, b"\x00"), "big")
 
-DEFAULT_BRIDGE_AMOUNT_DECODERS: dict[bytes, BridgeAmountDecoder] = {}
+        raise ValueError(f"unsupported extraction mode: {extraction_mode}")
 
+    async def _execute_step_sequence(
+        self,
+        *,
+        from_token: Any,
+        amount_in: int,
+        receiver: str,
+        dst_chain: Any,
+        steps: list[Any],
+        token_out: Any | None,
+        dst_token: Any | None,
+    ) -> dict[str, Any] | bytes:
+        if not steps:
+            raise ValueError("steps must be a non-empty list")
 
-def _selector(buf: bytes) -> bytes:
-    if len(buf) < 4:
-        return b""
-    return buf[:4]
+        split_idx = _find_split_index(steps)
+        if split_idx is None:
+            return await self._execute_linear_steps(
+                from_token=from_token,
+                amount_in=int(amount_in),
+                receiver=receiver,
+                dst_chain=dst_chain,
+                steps=steps,
+                token_out=token_out,
+                dst_token=dst_token,
+            )
 
+        prefix_steps = steps[:split_idx]
+        split_step = steps[split_idx]
+        suffix_steps = steps[split_idx + 1 :]
 
-def _as_calldata(raw: bytes | str | dict[str, Any]) -> bytes:
-    if isinstance(raw, bytes):
-        return raw
-    if isinstance(raw, str):
-        return bytes.fromhex(raw.removeprefix("0x"))
-    if isinstance(raw, dict):
-        data = raw.get("data")
-        if isinstance(data, bytes):
-            return data
-        if isinstance(data, str):
-            return bytes.fromhex(data.removeprefix("0x"))
-    raise ValueError("unsupported tx payload for calldata extraction")
+        if suffix_steps:
+            raise ValueError(
+                "steps after split are not supported yet; place downstream actions inside each split branch"
+            )
+        if not prefix_steps:
+            raise ValueError("split requires at least one step before it")
 
+        prefix_to_token = _resolve_steps_terminal_token(prefix_steps, default=from_token)
+        prefix_result = await self._execute_linear_steps(
+            from_token=from_token,
+            amount_in=int(amount_in),
+            receiver=receiver,
+            dst_chain=dst_chain,
+            steps=prefix_steps,
+            token_out=prefix_to_token,
+            dst_token=dst_token if dst_token is not None else prefix_to_token,
+        )
+        amount_mid = self._decode_steps_output_amount(steps=prefix_steps, ret=prefix_result)
 
-def _as_tx_payload(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        if isinstance(raw.get("tx_data"), dict):
-            return raw["tx_data"]
-        return raw
-    tx_data = getattr(raw, "tx_data", None)
-    if isinstance(tx_data, dict):
-        return tx_data
-    raise ValueError("expected tx payload dict or object with tx_data dict")
+        split_token = _resolve_split_token(split_step, default=prefix_to_token)
+        portions = _normalize_split_portions(split_step)
+        split_amounts = [(amount_mid * bps) // 10_000 for bps, _ in portions]
 
+        branch_results: list[dict[str, Any]] = []
+        for idx, (bps, branch_steps) in enumerate(portions):
+            branch_amount = split_amounts[idx]
+            branch_result = await self._execute_step_sequence(
+                from_token=split_token,
+                amount_in=branch_amount,
+                receiver=receiver,
+                dst_chain=dst_chain,
+                steps=branch_steps,
+                token_out=token_out,
+                dst_token=dst_token,
+            )
 
-def _extract_amount_in(raw: Any) -> int | None:
-    if isinstance(raw, dict):
-        value = raw.get("amount_in")
-        if isinstance(value, int):
-            return value
-        if isinstance(value, dict):
-            nested_amount = value.get("amount")
-            if isinstance(nested_amount, int):
-                return nested_amount
+            branch_amount_out: int | None = None
+            if isinstance(branch_result, (bytes, bytearray)):
+                branch_amount_out = self._decode_steps_output_amount(steps=branch_steps, ret=bytes(branch_result))
 
-    if hasattr(raw, "amount_in"):
-        amount_in_obj = getattr(raw, "amount_in")
-        if isinstance(amount_in_obj, int):
-            return amount_in_obj
+            branch_results.append(
+                {
+                    "branch_index": idx,
+                    "ratio_bps": bps,
+                    "amount_in": branch_amount,
+                    "amount_out": branch_amount_out,
+                    "result": branch_result,
+                }
+            )
 
-        amount_value = getattr(amount_in_obj, "amount", None)
-        if isinstance(amount_value, int):
-            return amount_value
+        return {
+            "amount_mid_total": amount_mid,
+            "split_amounts": split_amounts,
+            "branches": branch_results,
+            "split_token": split_token,
+        }
 
-    return None
+    async def execute(
+        self,
+        *,
+        plan: StepPlan,
+    ) -> dict[str, Any] | bytes:
+        """Execute a declarative step plan."""
 
-
-def _maybe_chain_id(value: Any) -> int | None:
-    chain_id = getattr(value, "chain_id", None)
-    if chain_id is None:
-        return None
-    try:
-        return int(chain_id)
-    except Exception:
-        return None
-
-
-def _validate_chain_token_consistency(*, token_out: Any, dst_chain: Any, dst_token: Any) -> None:
-    token_out_chain = _maybe_chain_id(token_out)
-    dst_token_chain = _maybe_chain_id(dst_token)
-    dst_chain_id = int(dst_chain)
-
-    if dst_token_chain is not None and dst_token_chain != dst_chain_id:
-        raise ValueError(f"dst_token.chain_id ({dst_token_chain}) does not match dst_chain ({dst_chain_id})")
-
-    if token_out_chain is not None and token_out_chain == dst_chain_id:
-        raise ValueError(
-            f"token_out.chain_id ({token_out_chain}) should differ from dst_chain ({dst_chain_id}) for bridge flow"
+        return await self._execute_step_sequence(
+            from_token=plan.source_token,
+            amount_in=int(plan.source_amount),
+            receiver=plan.receiver,
+            dst_chain=plan.dst_chain,
+            steps=plan.steps,
+            token_out=plan.token_out,
+            dst_token=plan.dst_token,
         )
 
 
-def _decode_bridge_amounts(
-    calldata: bytes,
-    *,
-    bridge_amount_decoders: dict[bytes, BridgeAmountDecoder] | None,
-) -> tuple[int, int] | None:
-    decoders = DEFAULT_BRIDGE_AMOUNT_DECODERS if bridge_amount_decoders is None else bridge_amount_decoders
-    decoder = decoders.get(_selector(calldata))
-    if decoder is None:
+def _step_action_name(raw_step: Any) -> str | None:
+    if not isinstance(raw_step, dict):
         return None
-    return decoder(calldata)
-
-
-def _validate_bridge_amount_sanity(
-    *,
-    bridge_calldata: bytes,
-    max_slippage_bps: int | None,
-    bridge_amount_decoders: dict[bytes, BridgeAmountDecoder] | None = None,
-) -> None:
-    amounts = _decode_bridge_amounts(
-        bridge_calldata,
-        bridge_amount_decoders=bridge_amount_decoders,
-    )
-    if amounts is None:
-        return
-
-    amount_ld, min_amount_ld = amounts
-    if min_amount_ld > amount_ld:
-        raise ValueError(f"bridge amount sanity failed: minAmountLD ({min_amount_ld}) exceeds amountLD ({amount_ld})")
-
-    if max_slippage_bps is None:
-        return
-    if max_slippage_bps < 0 or max_slippage_bps > 10_000:
-        raise ValueError("max_slippage_bps must be in [0, 10000]")
-    if amount_ld == 0:
-        return
-
-    slippage_bps = ((amount_ld - min_amount_ld) * 10_000) // amount_ld
-    if slippage_bps > max_slippage_bps:
-        raise ValueError(
-            f"bridge slippage sanity failed: {slippage_bps} bps exceeds max_slippage_bps ({max_slippage_bps})"
-        )
-
-
-def _coerce_extraction_mode(value: Any) -> ExtractionMode:
-    if isinstance(value, ExtractionMode):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        for mode in ExtractionMode:
-            if normalized == mode.value or normalized == mode.name.lower():
-                return mode
-    raise ValueError(f"unsupported extraction mode: {value!r}")
-
-
-def _normalize_action_kind(value: Any) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("action.kind must be a non-empty string")
+    value = raw_step.get("action")
+    if value is None:
+        value = raw_step.get("kind")
+    if not isinstance(value, str):
+        return None
     return value.strip().lower()
 
 
-def _normalize_action(raw: Any) -> ActionPlan:
-    if isinstance(raw, ActionPlan):
-        return raw
-    if not isinstance(raw, dict):
-        raise ValueError("each action must be a dict or ActionPlan")
-
-    kind = _normalize_action_kind(raw.get("kind") or raw.get("type"))
-
-    target = raw.get("target")
-    if target is None:
-        if kind == "swap":
-            target = raw.get("amm")
-        elif kind == "bridge":
-            target = raw.get("bridge")
-        elif kind in {"deposit", "stake", "mint", "wrap", "unwrap"}:
-            target = raw.get("protocol") or raw.get("wrapper")
-
-    calldata: bytes | None = None
-    if "calldata" in raw:
-        calldata = _as_calldata(raw["calldata"])
-    elif "calldata_template" in raw:
-        calldata = _as_calldata(raw["calldata_template"])
-    elif "tx" in raw:
-        calldata = _as_calldata(_as_tx_payload(raw["tx"]))
-    elif "quote" in raw:
-        calldata = _as_calldata(_as_tx_payload(raw["quote"]))
-
-    amount_placeholder = raw.get("amount_placeholder")
-    if amount_placeholder is None and "quote" in raw:
-        inferred_placeholder = _extract_amount_in(raw["quote"])
-        if inferred_placeholder is not None:
-            amount_placeholder = inferred_placeholder
-
-    patch_offsets_raw = raw.get("patch_offsets")
-    patch_offsets: list[int] | None = None
-    if patch_offsets_raw is not None:
-        if not isinstance(patch_offsets_raw, list):
-            raise ValueError("action.patch_offsets must be a list[int]")
-        patch_offsets = [int(v) for v in patch_offsets_raw]
-
-    patch_offset_raw = raw.get("patch_offset")
-    patch_offset: int | None = None
-    if patch_offset_raw is not None:
-        patch_offset = int(patch_offset_raw)
-
-    extraction_mode_raw = raw.get("extraction_mode", ExtractionMode.RET_LAST32)
-    extraction_mode = _coerce_extraction_mode(extraction_mode_raw)
-
-    target_candidates_raw = raw.get("target_candidates")
-    target_candidates: list[str] | None = None
-    if target_candidates_raw is not None:
-        if not isinstance(target_candidates_raw, list):
-            raise ValueError("action.target_candidates must be a list[str]")
-        target_candidates = [str(v) for v in target_candidates_raw]
-
-    return ActionPlan(
-        kind=kind,
-        target=target,
-        calldata=calldata,
-        patch_offsets=patch_offsets,
-        patch_offset=patch_offset,
-        amount_placeholder=amount_placeholder,
-        value=int(raw.get("value", 0)),
-        auto_amount_from_prev_call=bool(raw.get("auto_amount_from_prev_call", True)),
-        target_candidates=target_candidates,
-        token_out=raw.get("token_out"),
-        dst_chain=raw.get("dst_chain"),
-        dst_token=raw.get("dst_token"),
-        extraction_mode=extraction_mode,
-        extraction_offset=raw.get("extraction_offset"),
-        extraction_size=raw.get("extraction_size"),
-        prefer_slice_for_last32=bool(raw.get("prefer_slice_for_last32", False)),
-    )
+def _find_split_index(steps: list[Any]) -> int | None:
+    for idx, step in enumerate(steps):
+        if _step_action_name(step) == "split":
+            return idx
+    return None
 
 
-def _append_explicit_extraction(builder: DeFiBuilder, action: ActionPlan) -> DeFiBuilder:
-    if action.extraction_mode == ExtractionMode.RET_LAST32:
-        if action.extraction_offset is not None or action.extraction_size is not None:
-            raise ValueError("RET_LAST32 extraction does not accept extraction_offset/extraction_size")
-        return (
-            builder.amount_from_prev_call_slice() if action.prefer_slice_for_last32 else builder.amount_from_prev_call()
-        )
+def _step_to_action(raw_step: Any) -> Any:
+    if isinstance(raw_step, ActionPlan):
+        return raw_step
+    if not isinstance(raw_step, dict):
+        return raw_step
 
-    if action.extraction_mode == ExtractionMode.RET_U256:
-        if action.extraction_offset is None:
-            raise ValueError("extraction_offset is required for RET_U256")
-        return builder.amount_from_prev_call(offset=int(action.extraction_offset))
+    action_name = _step_action_name(raw_step)
+    if action_name == "split":
+        raise ValueError("split step cannot be converted into a linear action")
 
-    if action.extraction_mode == ExtractionMode.RET_SLICE:
-        if action.extraction_offset is None or action.extraction_size is None:
-            raise ValueError("extraction_offset and extraction_size are required for RET_SLICE")
-        return builder.amount_from_prev_call_slice(
-            offset=int(action.extraction_offset),
-            size=int(action.extraction_size),
-        )
+    out = dict(raw_step)
+    if "kind" not in out and "action" in out:
+        out["kind"] = out["action"]
+    out.pop("action", None)
 
-    raise ValueError(f"unsupported extraction mode: {action.extraction_mode}")
+    if "token_out" not in out and "to" in out:
+        out["token_out"] = out["to"]
+
+    return out
 
 
-def apply_action_graph(
-    builder: DeFiBuilder,
-    *,
-    actions: list[Any],
-    token_out: Any | None = None,
-    dst_chain: Any | None = None,
-    dst_token: Any | None = None,
-    enforce_chain_token_consistency: bool = True,
-    enforce_bridge_amount_sanity: bool = True,
-    max_slippage_bps: int | None = None,
-    bridge_amount_decoders: dict[bytes, BridgeAmountDecoder] | None = None,
-) -> DeFiBuilder:
-    """Apply a multi-step action graph into an existing DeFiBuilder flow."""
-    if not actions:
-        raise ValueError("actions must be a non-empty list")
+def _resolve_steps_terminal_token(steps: list[Any], *, default: Any) -> Any:
+    for raw_step in reversed(steps):
+        if not isinstance(raw_step, dict):
+            continue
+        action_name = _step_action_name(raw_step)
+        if action_name == "split":
+            continue
+        if "token_out" in raw_step and raw_step["token_out"] is not None:
+            return raw_step["token_out"]
+        if "to" in raw_step and raw_step["to"] is not None:
+            return raw_step["to"]
+    return default
 
-    for raw_action in actions:
-        action = _normalize_action(raw_action)
 
-        if action.kind == "extract":
-            builder = _append_explicit_extraction(builder, action)
+def _resolve_terminal_extraction(steps: list[Any]) -> tuple[ExtractionMode, int | None, int | None]:
+    for raw_step in reversed(steps):
+        if not isinstance(raw_step, dict):
             continue
 
-        if action.calldata is None:
-            raise ValueError(f"action {action.kind!r} requires calldata/calldata_template/tx/quote")
-        if action.target is None:
-            raise ValueError(f"action {action.kind!r} requires target")
-
-        if action.kind == "swap":
-            builder = builder.swap(
-                action.target,
-                action.token_out if action.token_out is not None else token_out,
-                action.calldata,
-                patch_offset=action.patch_offset,
-                patch_offsets=action.patch_offsets,
-                amount_placeholder=action.amount_placeholder,
-                value=action.value,
-                auto_amount_from_prev_call=action.auto_amount_from_prev_call,
-            )
+        action_name = _step_action_name(raw_step)
+        if action_name == "split":
             continue
 
-        if action.kind == "bridge":
-            resolved_dst_chain = action.dst_chain if action.dst_chain is not None else dst_chain
-            resolved_dst_token = action.dst_token if action.dst_token is not None else dst_token
-            if resolved_dst_chain is None:
-                raise ValueError("bridge action requires dst_chain (either per-action or function default)")
+        if action_name == "extract":
+            mode = coerce_extraction_mode(raw_step.get("extraction_mode", ExtractionMode.RET_LAST32))
+            return mode, raw_step.get("extraction_offset"), raw_step.get("extraction_size")
 
-            if enforce_chain_token_consistency:
-                _validate_chain_token_consistency(
-                    token_out=action.token_out if action.token_out is not None else token_out,
-                    dst_chain=resolved_dst_chain,
-                    dst_token=resolved_dst_token,
-                )
+        mode = coerce_extraction_mode(raw_step.get("extraction_mode", ExtractionMode.RET_LAST32))
+        return mode, raw_step.get("extraction_offset"), raw_step.get("extraction_size")
 
-            if enforce_bridge_amount_sanity:
-                _validate_bridge_amount_sanity(
-                    bridge_calldata=action.calldata,
-                    max_slippage_bps=max_slippage_bps,
-                    bridge_amount_decoders=bridge_amount_decoders,
-                )
-
-            builder = builder.bridge(
-                action.target,
-                resolved_dst_chain,
-                resolved_dst_token,
-                patch_offset=action.patch_offset,
-                patch_offsets=action.patch_offsets,
-                amount_placeholder=action.amount_placeholder,
-                value=action.value,
-                calldata_template=action.calldata,
-                auto_amount_from_prev_call=action.auto_amount_from_prev_call,
-            )
-            continue
-
-        if action.kind in {"call", "deposit", "stake", "mint", "wrap", "unwrap"}:
-            call_fn = getattr(builder, action.kind)
-            builder = call_fn(
-                action.target,
-                action.calldata,
-                patch_offset=action.patch_offset,
-                patch_offsets=action.patch_offsets,
-                amount_placeholder=action.amount_placeholder,
-                value=action.value,
-                auto_amount_from_prev_call=action.auto_amount_from_prev_call,
-                **({"target_candidates": action.target_candidates} if action.kind == "call" else {}),
-            )
-            continue
-
-        raise ValueError(f"unsupported action kind: {action.kind}")
-
-    return builder
+    raise ValueError("cannot resolve extraction mode from empty step sequence")
 
 
-async def execute_action_graph_async(
-    builder: DeFiBuilder,
-    *,
-    actions: list[Any],
-    token_out: Any | None = None,
-    dst_chain: Any | None = None,
-    dst_token: Any | None = None,
-    enforce_chain_token_consistency: bool = True,
-    enforce_bridge_amount_sanity: bool = True,
-    max_slippage_bps: int | None = None,
-    bridge_amount_decoders: dict[bytes, BridgeAmountDecoder] | None = None,
-    **_ignored: Any,
-) -> bytes:
-    """Compose and execute a generic multi-step action graph flow."""
-    applied = apply_action_graph(
-        builder,
-        actions=actions,
-        token_out=token_out,
-        dst_chain=dst_chain,
-        dst_token=dst_token,
-        enforce_chain_token_consistency=enforce_chain_token_consistency,
-        enforce_bridge_amount_sanity=enforce_bridge_amount_sanity,
-        max_slippage_bps=max_slippage_bps,
-        bridge_amount_decoders=bridge_amount_decoders,
-    )
-    return await applied.execute_async()
+def _normalize_bps(value: Any) -> int:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.endswith("%"):
+            return _normalize_bps(stripped[:-1])
+        value = float(stripped)
+
+    if isinstance(value, float):
+        if 0 <= value <= 1:
+            return int(round(value * 10_000))
+        return int(round(value * 100))
+
+    value_int = int(value)
+    if 0 <= value_int <= 100:
+        return value_int * 100
+    return value_int
+
+
+def _portion_to_steps(raw_portion: dict[str, Any]) -> list[Any]:
+    if "steps" in raw_portion:
+        raw_steps = raw_portion["steps"]
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise ValueError("split portion steps must be a non-empty list")
+        return raw_steps
+
+    single_step = {k: v for k, v in raw_portion.items() if k not in {"percent", "bps", "ratio", "steps"}}
+    if not single_step:
+        raise ValueError("split portion must define either steps or an inline action")
+    return [single_step]
+
+
+def _normalize_split_portions(raw_split_step: Any) -> list[tuple[int, list[Any]]]:
+    if not isinstance(raw_split_step, dict):
+        raise ValueError("split step must be a dict")
+    if _step_action_name(raw_split_step) != "split":
+        raise ValueError("expected split step")
+
+    raw_portions = raw_split_step.get("portions")
+    if not isinstance(raw_portions, list) or not raw_portions:
+        raise ValueError("split step requires non-empty portions list")
+
+    portions: list[tuple[int, list[Any]]] = []
+    for raw_portion in raw_portions:
+        if not isinstance(raw_portion, dict):
+            raise ValueError("each split portion must be a dict")
+        bps_raw = raw_portion.get("bps")
+        if bps_raw is None:
+            bps_raw = raw_portion.get("percent")
+        if bps_raw is None:
+            bps_raw = raw_portion.get("ratio")
+        if bps_raw is None:
+            raise ValueError("split portion requires bps/percent/ratio")
+
+        bps = _normalize_bps(bps_raw)
+        if bps < 0 or bps > 10_000:
+            raise ValueError("split portion ratio must be in [0, 10000] bps")
+
+        steps = _portion_to_steps(raw_portion)
+        portions.append((bps, steps))
+
+    if sum(bps for bps, _ in portions) != 10_000:
+        raise ValueError("split portions must sum to 10000 bps")
+
+    return portions
+
+
+def _resolve_split_token(raw_split_step: Any, *, default: Any) -> Any:
+    if isinstance(raw_split_step, dict):
+        if raw_split_step.get("token") is not None:
+            return raw_split_step["token"]
+        if raw_split_step.get("from") is not None:
+            return raw_split_step["from"]
+    return default

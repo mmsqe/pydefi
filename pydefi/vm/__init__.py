@@ -15,10 +15,8 @@ bytecode programs::
 """
 
 from pydefi.vm.planner import (
-    FlowCallOp,
-    FlowPlan,
     FlowRunner,
-    FlowSplitOp,
+    StepPlan,
     apply_action_graph,
     execute_action_graph_async,
 )
@@ -112,9 +110,7 @@ __all__ = [
     "patch_addr",
     "ret_u256",
     "ret_slice",
-    "FlowCallOp",
-    "FlowSplitOp",
-    "FlowPlan",
+    "StepPlan",
     "FlowRunner",
     "apply_action_graph",
     "execute_action_graph_async",

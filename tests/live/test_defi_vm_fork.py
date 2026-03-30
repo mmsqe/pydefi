@@ -28,7 +28,7 @@ from web3 import AsyncWeb3, Web3
 from web3.exceptions import ContractLogicError, Web3RPCError
 from web3.types import TxParams
 
-from pydefi.vm.planner import ExtractionMode, FlowPlan, FlowRunner, FlowSplitOp
+from pydefi.vm.planner import ExtractionMode, FlowRunner
 from pydefi.vm.program import (
     assert_ge,
     assert_le,
@@ -892,31 +892,46 @@ class TestDeFiVMFork:
             else:
                 swap_extraction_mode = ExtractionMode.RET_U256
 
-            flow_result_any = await flow_runner.execute(
-                FlowPlan(
-                    source_token=WETH_MAINNET,
-                    source_amount=QUOTE_AMOUNT_IN,
-                    receiver=deployer,
-                    dst_chain=ARBITRUM_LZ_EID,
-                    first=flow_runner.call_template(
-                        target=swap_target,
-                        calldata_template=swap_calldata,
-                        amount_placeholder=QUOTE_AMOUNT_IN,
-                        token_out=USDC_MAINNET,
-                        extraction_mode=swap_extraction_mode,
-                    ),
-                    split=FlowSplitOp.full(),
-                    branches=[
-                        flow_runner.call_template(
-                            target=LZ_OFT_ZRO,
-                            calldata_template=bridge_calldata,
-                            amount_placeholder=QUOTE_AMOUNT_IN,
-                            token_out=USDC_MAINNET,
-                            extraction_mode=ExtractionMode.RET_U256,
-                        )
-                    ],
-                )
+            plan = flow_runner.create(
+                source_token=WETH_MAINNET,
+                source_amount=QUOTE_AMOUNT_IN,
+                receiver=deployer,
+                dst_chain=ARBITRUM_LZ_EID,
+                token_out=USDC_MAINNET,
+                dst_token=USDC_MAINNET,
+                steps=[
+                    {
+                        "action": "swap",
+                        "target": swap_target,
+                        "to": USDC_MAINNET,
+                        "calldata": swap_calldata,
+                        "amount_placeholder": QUOTE_AMOUNT_IN,
+                        "auto_amount_from_prev_call": False,
+                        "extraction_mode": swap_extraction_mode.value,
+                        "extraction_offset": 0 if swap_extraction_mode == ExtractionMode.RET_U256 else None,
+                    },
+                    {
+                        "action": "split",
+                        "token": USDC_MAINNET,
+                        "portions": [
+                            {
+                                "percent": 100,
+                                "action": "bridge",
+                                "target": LZ_OFT_ZRO,
+                                "dst_chain": ARBITRUM_LZ_EID,
+                                "dst_token": USDC_MAINNET,
+                                "to": USDC_MAINNET,
+                                "calldata": bridge_calldata,
+                                "amount_placeholder": QUOTE_AMOUNT_IN,
+                                "auto_amount_from_prev_call": False,
+                                "extraction_mode": "ret_u256",
+                                "extraction_offset": 0,
+                            }
+                        ],
+                    },
+                ],
             )
+            flow_result_any = await flow_runner.execute(plan=plan)
             assert isinstance(flow_result_any, dict)
             flow_result = flow_result_any
             native_fee = int(flow_result["branches"][0]["amount_out"])
@@ -1046,17 +1061,17 @@ class TestDeFiVMFork:
             result = await builder.execute_async()
         else:
             flow_runner = FlowRunner(runtime_vm)
-            actions: list[dict[str, Any]] = [
+            steps: list[dict[str, Any]] = [
                 {
-                    "kind": "swap",
+                    "action": "swap",
                     "target": swap_target,
-                    "token_out": USDC_MAINNET,
+                    "to": USDC_MAINNET,
                     "calldata": swap_calldata,
                     "amount_placeholder": QUOTE_AMOUNT_IN,
                     "auto_amount_from_prev_call": False,
                 },
                 {
-                    "kind": "extract",
+                    "action": "extract",
                     "extraction_mode": extraction_mode.value,
                     "extraction_offset": extraction_offset,
                 },
@@ -1064,40 +1079,37 @@ class TestDeFiVMFork:
 
             for kind in post_swap_actions:
                 if kind == "bridge":
-                    actions.append(
+                    steps.append(
                         {
-                            "kind": "bridge",
+                            "action": "bridge",
                             "target": LZ_OFT_ZRO,
                             "dst_chain": ARBITRUM_LZ_EID,
                             "dst_token": USDC_MAINNET,
-                            "token_out": USDC_MAINNET,
+                            "to": USDC_MAINNET,
                             "calldata": bridge_calldata,
                             "amount_placeholder": QUOTE_AMOUNT_IN,
                             "auto_amount_from_prev_call": False,
                         }
                     )
                 else:
-                    actions.append(
+                    steps.append(
                         {
-                            "kind": kind,
+                            "action": kind,
                             "target": adapter,
                             "calldata": get_forty_two_calldata,
                         }
                     )
 
-            result_any = await flow_runner.execute(
-                from_token=WETH_MAINNET,
-                to_token=USDC_MAINNET,
-                amount_in=QUOTE_AMOUNT_IN,
-                dst_chain=ARBITRUM_LZ_EID,
+            plan = flow_runner.create(
+                source_token=WETH_MAINNET,
+                source_amount=QUOTE_AMOUNT_IN,
                 receiver=deployer,
-                actions=actions,
+                dst_chain=ARBITRUM_LZ_EID,
+                steps=steps,
                 token_out=USDC_MAINNET,
                 dst_token=USDC_MAINNET,
-                bridge_amount_decoders={
-                    LZ_OFT_QUOTE_SEND_SELECTOR: _decode_quote_send_amounts_for_planner,
-                },
             )
+            result_any = await flow_runner.execute(plan=plan)
             assert isinstance(result_any, (bytes, bytearray))
             result = bytes(result_any)
 
