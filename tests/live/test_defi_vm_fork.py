@@ -9,7 +9,7 @@ of Ethereum mainnet, and exercise the full instruction set including:
  - External calls to a mock adapter (CALL)
  - Balance introspection (BALANCE_OF, SELF_ADDR, SUB) using
    real on-chain WETH contract on the forked chain
- - ABI patching (PATCH_U256, PATCH_ADDR, RET_U256, RET_SLICE)
+ - ABI patching (PATCH_U256, PATCH_ADDR, RET_U256, RET_SLICE, RET_LAST32)
 
 Run with::
 
@@ -39,6 +39,7 @@ from pydefi.vm.program import (
     push_addr,
     push_bytes,
     push_u256,
+    ret_last32,
     ret_slice,
     ret_u256,
     revert_if,
@@ -473,6 +474,36 @@ class TestDeFiVMFork:
             + call(require_success=True)
             + pop()
             + ret_slice(0, 32)
+            + pop()
+        )
+        tx = await vm.functions.execute(program).transact({"from": deployer})
+        receipt = await w3.eth.get_transaction_receipt(tx)
+        assert receipt["status"] == 1
+
+    async def test_ret_last32(self, ctx):
+        """RET_LAST32 pushes the last 32 bytes of the last call's returndata as uint256.
+
+        getFortyTwo() returns uint256(42) as a single 32-byte word, so
+        RET_LAST32 should produce the same result as RET_U256(0).
+        """
+        w3 = ctx["w3"]
+        vm = ctx["vm"]
+        deployer = ctx["deployer"]
+        adapter = ctx["adapter_address"]
+
+        from eth_utils import keccak
+
+        selector = keccak(b"getFortyTwo()")[:4]
+        calldata = bytes(selector)
+
+        program = (
+            push_bytes(calldata)
+            + push_u256(0)
+            + push_addr(adapter)
+            + push_u256(0)
+            + call(require_success=True)
+            + pop()
+            + ret_last32()
             + pop()
         )
         tx = await vm.functions.execute(program).transact({"from": deployer})
