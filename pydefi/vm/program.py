@@ -51,6 +51,7 @@ ABI / data
   0x41  PATCH_ADDR <2-byte offset>
   0x42  RET_U256   <2-byte offset>
   0x43  RET_SLICE  <2-byte offset> <2-byte len>
+  0x44  RET_LAST32
 """
 
 from __future__ import annotations
@@ -86,6 +87,7 @@ OP_PATCH_U256: int = 0x40
 OP_PATCH_ADDR: int = 0x41
 OP_RET_U256: int = 0x42
 OP_RET_SLICE: int = 0x43
+OP_RET_LAST32: int = 0x44
 
 # ---------------------------------------------------------------------------
 # Low-level encoding helpers
@@ -325,3 +327,13 @@ def ret_slice(offset: int, length: int) -> bytes:
     and its index is pushed onto the stack.
     """
     return bytes([OP_RET_SLICE]) + _u16(offset) + _u16(length)
+
+
+def ret_last32() -> bytes:
+    """Emit RET_LAST32 — push the last 32 bytes of the last call's returndata as uint256.
+
+    Useful for Uniswap v2-style calls such as ``getAmountsOut(uint256,address[])``
+    which return a dynamic ``uint[]``; the final output amount is always the last
+    32-byte word regardless of path length.
+    """
+    return bytes([OP_RET_LAST32])

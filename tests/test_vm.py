@@ -49,6 +49,7 @@ from pydefi.vm.program import (
     push_u256,
     ret_slice,
     ret_u256,
+    ret_last32,
     revert_if,
     self_addr,
     store_reg,
@@ -149,6 +150,9 @@ class TestProgramInstructionEmission:
 
     def test_ret_slice(self):
         assert Program().ret_slice(0, 32).build() == ret_slice(0, 32)
+
+    def test_ret_last32(self):
+        assert Program().ret_last32().build() == ret_last32()
 
 
 # ---------------------------------------------------------------------------

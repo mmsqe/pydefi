@@ -56,6 +56,7 @@ pragma solidity ^0.8.24;
  *   0x41  PATCH_ADDR <2-byte offset>     pop: addr,  bufIdx -> patch 20-byte word in buffer
  *   0x42  RET_U256   <2-byte offset>     push uint256 from last returndata at offset
  *   0x43  RET_SLICE  <2-byte off> <2-byte len>  push bytes slice from last returndata
+ *   0x44  RET_LAST32                    push uint256 from the last 32 bytes of returndata
  */
 contract DeFiVM {
     // -------------------------------------------------------------------------
@@ -92,6 +93,7 @@ contract DeFiVM {
     uint8 private constant OP_PATCH_ADDR  = 0x41;
     uint8 private constant OP_RET_U256    = 0x42;
     uint8 private constant OP_RET_SLICE   = 0x43;
+    uint8 private constant OP_RET_LAST32  = 0x44;
 
     /// @notice Allow the VM to receive ETH (needed for value-bearing calls).
     receive() external payable {}
@@ -496,6 +498,17 @@ contract DeFiVM {
                 s.buffers[idx] = slice;
                 s.numBufs++;
                 _push(s, bytes32(uint256(idx)));
+
+            } else if (op == OP_RET_LAST32) {
+                // push uint256 from the last 32 bytes of last returndata
+                require(s.retdata.length >= 32, "DeFiVM: RET_LAST32 retdata too short");
+                bytes32 word;
+                bytes memory rd = s.retdata;
+                uint256 moff = rd.length - 32;
+                assembly {
+                    word := mload(add(add(rd, 32), moff))
+                }
+                _push(s, word);
 
             } else {
                 revert("DeFiVM: unknown opcode");

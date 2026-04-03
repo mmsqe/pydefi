@@ -197,6 +197,7 @@ from pydefi.vm.program import (
     push_addr,
     push_bytes,
     push_u256,
+    ret_last32,
     ret_slice,
     ret_u256,
     revert_if,
@@ -418,6 +419,15 @@ class Program:
     def ret_slice(self, offset: int, length: int) -> "Program":
         """Emit RET_SLICE — push bytes slice from last returndata."""
         return self._emit(ret_slice(offset, length))
+
+    def ret_last32(self) -> "Program":
+        """Emit RET_LAST32 — push the last 32 bytes of last returndata as uint256.
+
+        Convenient for Uniswap v2-style ``getAmountsOut`` where the final output
+        amount is the last word in the returned ``uint[]``, regardless of path
+        length.
+        """
+        return self._emit(ret_last32())
 
     # ------------------------------------------------------------------
     # High-level helpers

@@ -59,6 +59,7 @@ from pydefi.vm.program import (
     OP_PUSH_U256,
     OP_RET_SLICE,
     OP_RET_U256,
+    OP_RET_LAST32,
     OP_REVERT_IF,
     OP_SELF_ADDR,
     OP_STORE_REG,
@@ -82,6 +83,7 @@ from pydefi.vm.program import (
     push_addr,
     push_bytes,
     push_u256,
+    ret_last32,
     ret_slice,
     ret_u256,
     revert_if,
@@ -123,6 +125,7 @@ __all__ = [
     "OP_PATCH_ADDR",
     "OP_RET_U256",
     "OP_RET_SLICE",
+    "OP_RET_LAST32",
     # Program builder helpers
     "push_u256",
     "push_addr",
@@ -149,4 +152,5 @@ __all__ = [
     "patch_addr",
     "ret_u256",
     "ret_slice",
+    "ret_last32",
 ]
