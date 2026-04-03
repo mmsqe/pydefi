@@ -504,9 +504,8 @@ contract DeFiVM {
                 require(s.retdata.length >= 32, "DeFiVM: RET_LAST32 retdata too short");
                 bytes32 word;
                 bytes memory rd = s.retdata;
-                uint256 moff = rd.length - 32;
                 assembly {
-                    word := mload(add(add(rd, 32), moff))
+                    word := mload(add(rd, mload(rd)))
                 }
                 _push(s, word);
 
