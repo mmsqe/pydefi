@@ -37,7 +37,7 @@ Two complementary interfaces are provided:
         )
 """
 
-from pydefi.vm.builder import PatchSource, PatchSpec, Program
+from pydefi.vm.builder import Patch, PatchSource, PatchSpec, Program
 from pydefi.vm.program import (
     OP_ADD,
     OP_AND,
@@ -92,8 +92,6 @@ from pydefi.vm.program import (
     lt,
     mod,
     mul,
-    patch_addr,
-    patch_u256,
     pop,
     push_addr,
     push_bytes,
@@ -112,7 +110,8 @@ from pydefi.vm.program import (
 __all__ = [
     # Fluent builder
     "Program",
-    # Patch type aliases
+    # Patch type aliases and Patch class
+    "Patch",
     "PatchSource",
     "PatchSpec",
     # Opcode constants
@@ -181,8 +180,6 @@ __all__ = [
     "bitwise_not",
     "shl",
     "shr",
-    "patch_u256",
-    "patch_addr",
     "ret_u256",
     "ret_slice",
 ]

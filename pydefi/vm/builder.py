@@ -154,7 +154,7 @@ two separate destinations using arithmetic and composition::
         Program()
         .call_with_patches(
             SWAP12, swap12_template,
-            patches=[("u256", AMOUNT_OFFSET, load_reg(1))],
+            patches=[(AMOUNT_OFFSET, 32, load_reg(1))],
         )
         .pop()
     )
@@ -164,7 +164,7 @@ two separate destinations using arithmetic and composition::
         Program()
         .call_with_patches(
             SWAP13, swap13_template,
-            patches=[("u256", AMOUNT_OFFSET, load_reg(2))],
+            patches=[(AMOUNT_OFFSET, 32, load_reg(2))],
         )
         .pop()
     )
@@ -175,6 +175,12 @@ two separate destinations using arithmetic and composition::
 from __future__ import annotations
 
 import struct
+from typing import TYPE_CHECKING
+
+from eth_abi import encode_with_hooks
+
+if TYPE_CHECKING:
+    from eth_abi.hooks import EncodingContext
 
 from pydefi.vm.program import (
     OP_JUMPDEST,
@@ -199,8 +205,7 @@ from pydefi.vm.program import (
     lt,
     mod,
     mul,
-    patch_addr,
-    patch_u256,
+    patch_value,
     pop,
     push_addr,
     push_bytes,
@@ -235,12 +240,100 @@ from pydefi.vm.program import (
 #:     push_addr("0x…")   # static address literal
 PatchSource = bytes
 
-#: A single patch descriptor: ``(kind, calldata_offset, opcodes)`` where:
+#: A single patch descriptor: ``(calldata_offset, size, opcodes)`` where:
 #:
-#: - *kind*: ``"u256"`` (patch a 32-byte word) or ``"addr"`` (patch a 20-byte address).
 #: - *calldata_offset*: byte offset inside the calldata template to overwrite.
+#: - *size*: number of bytes to overwrite (0, 32].
 #: - *opcodes*: :data:`PatchSource` — raw bytecode that pushes the patch value.
-PatchSpec = tuple[str, int, PatchSource]
+PatchSpec = tuple[int, int, PatchSource]
+
+
+class Patch:
+    """Marks a runtime-patched argument for :meth:`Program.call_contract_abi`.
+
+    Wrap a :data:`PatchSource` (DeFiVM opcode bytes that push exactly one
+    value onto the stack) in a :class:`Patch` to signal that the corresponding
+    positional argument in ``call_contract_abi`` should be filled at runtime
+    rather than baked into the calldata template.
+
+    ``call_contract_abi`` automatically passes each :class:`Patch` object as a
+    callable hook to :func:`eth_abi.encode_with_hooks`.  The encoding library
+    calls the hook with an :class:`~eth_abi.hooks.EncodingContext` that carries
+    the exact byte offset and size of the value in the encoded output; the hook
+    stores those in :attr:`offset` and :attr:`size` and returns ``0`` as a
+    placeholder.  After encoding, :attr:`offset` holds the absolute calldata
+    offset (including the 4-byte function selector) and :attr:`size` holds the
+    number of bytes occupied by that value, ready for use in
+    :meth:`~Program.call_with_patches`.
+
+    Args:
+        opcodes: Raw DeFiVM bytecode that, when executed, pushes the runtime
+            value onto the stack.  Any instruction sequence that leaves a
+            single item on the stack is valid — for example
+            ``load_reg(1)``, ``ret_u256(0)``, or ``push_u256(42)``.
+
+    Example::
+
+        from pydefi.vm import Program, Patch
+        from pydefi.vm.program import load_reg, ret_u256
+
+        # Patch uint256 amountIn from register 1
+        bytecode = (
+            Program()
+            .call_contract_abi(
+                ROUTER,
+                "function swap(uint256 amountIn, uint256 minOut)",
+                Patch(load_reg(1)),
+                Patch(load_reg(2)),
+            )
+            .pop()
+            .build()
+        )
+    """
+
+    def __init__(self, opcodes: PatchSource, placeholder: object = 0) -> None:
+        self.opcodes: bytes = bytes(opcodes)
+        self.placeholder = placeholder
+        self.offset: int | None = None  # set by __call__ during encode_with_hooks
+        self.size: int | None = None  # set by __call__ during encode_with_hooks
+
+    def __call__(self, ctx: EncodingContext) -> object:
+        """Hook called by ``eth_abi.encode_with_hooks`` with the encoding context.
+
+        Stores the absolute calldata offset (selector + encoded-args offset) and
+        the size of the encoded value, then returns the placeholder value for the
+        ABI encoder.
+        """
+        self.offset = 4 + ctx.offset
+        self.size = ctx.size
+        return self.placeholder
+
+
+# ---------------------------------------------------------------------------
+# Patch-offset helpers — used by call_contract_abi to locate patch positions
+# ---------------------------------------------------------------------------
+
+
+def _collect_patches(arg: object, patches: list["Patch"]) -> bool:
+    """Recursively collect :class:`Patch` objects from an argument tree.
+
+    Traverses the value structure directly — no type-string parsing needed.
+    Supports :class:`Patch` leaves at any depth inside nested :class:`tuple`
+    and :class:`list` containers.
+
+    Returns:
+        ``True`` if any :class:`Patch` was found, ``False`` otherwise.
+    """
+    if isinstance(arg, Patch):
+        patches.append(arg)
+        return True
+
+    found = False
+    if isinstance(arg, (tuple, list)):
+        for item in arg:
+            found |= _collect_patches(item, patches)
+    return found
+
 
 # ---------------------------------------------------------------------------
 # Program builder
@@ -458,11 +551,11 @@ class Program:
 
     def patch_u256(self, offset: int) -> "Program":
         """Emit PATCH_U256 at *offset*."""
-        return self._emit(patch_u256(offset))
+        return self._emit(patch_value(offset, 32))
 
     def patch_addr(self, offset: int) -> "Program":
         """Emit PATCH_ADDR at *offset*."""
-        return self._emit(patch_addr(offset))
+        return self._emit(patch_value(offset, 20))
 
     def ret_u256(self, offset: int) -> "Program":
         """Emit RET_U256 — push uint256 from last returndata at *offset*."""
@@ -542,14 +635,35 @@ class Program:
         All Solidity primitive types as well as nested tuples and arrays are
         supported (anything that :func:`eth_abi.encode` can handle).
 
+        When one or more positional arguments are :class:`Patch` instances the
+        method automatically:
+
+        1. Collects all :class:`Patch` objects from the argument tree (including
+           those nested inside ``tuple`` or ``list`` arguments at any depth).
+        2. Encodes the full ABI calldata using
+           :func:`eth_abi.encode_with_hooks`, which calls each :class:`Patch`
+           hook with an :class:`~eth_abi.hooks.EncodingContext` carrying the
+           exact byte offset and size of that value in the encoded output.
+        3. Delegates to :meth:`call_with_patches` with the discovered offsets
+           and sizes, using the :attr:`~Patch.opcodes` as the source.
+
+        :class:`Patch` may appear as a leaf element at any nesting depth —
+        directly as a function argument, inside a ``tuple`` (struct) argument, or
+        inside a ``list`` (array) argument, including arrays of tuples and
+        multi-dimensional arrays.  The underlying ABI encoder determines whether
+        a given type is patchable (numeric types always work; types like
+        ``address`` and ``bool`` will raise an encoding error since they do not
+        accept ``0`` as a placeholder).
+
         Args:
             to: Target contract address (hex string with ``0x`` prefix).
             abi_sig: Human-readable function signature, e.g.
                 ``"transfer(address,uint256)"`` or
                 ``"function exactInputSingle((address,address,uint24,...) params)"``.
             *args: Positional arguments matching the signature's input parameters.
-                Addresses must be ``str``; numbers must be ``int``.
-                Tuple parameters are passed as Python ``tuple`` (or ``NamedTuple``).
+                Plain values (``int``, ``str`` address, ``tuple``, …) are encoded
+                statically.  :class:`Patch` instances are used as callable hooks;
+                their calldata offsets and sizes are resolved automatically.
             value: ETH value to forward with the call (wei), default 0.
             gas: Gas limit for the sub-call (0 = forward all remaining gas).
             require_success: If ``True`` (default), revert if the sub-call fails.
@@ -557,7 +671,7 @@ class Program:
         Returns:
             ``self`` for chaining.
 
-        Example::
+        Example (static args)::
 
             # ERC-20 transfer — no need to pre-build calldata
             bytecode = (
@@ -567,18 +681,19 @@ class Program:
                 .build()
             )
 
-            # Uniswap V3 exactInputSingle with a struct argument
+        Example with :class:`Patch`::
+
+            from pydefi.vm import Program, Patch
+            from pydefi.vm.program import load_reg
+
+            # Patch uint256 amountIn from register 1 and uint256 minOut from register 2
             bytecode = (
                 Program()
                 .call_contract_abi(
                     ROUTER,
-                    "function exactInputSingle("
-                    "  (address tokenIn, address tokenOut, uint24 fee,"
-                    "   address recipient, uint256 deadline,"
-                    "   uint256 amountIn, uint256 amountOutMinimum,"
-                    "   uint160 sqrtPriceLimitX96) params"
-                    ")",
-                    (TOKEN_IN, TOKEN_OUT, 3000, RECIPIENT, deadline, amount_in, 0, 0),
+                    "function swap(uint256 amountIn, uint256 minOut)",
+                    Patch(load_reg(1)),
+                    Patch(load_reg(2)),
                 )
                 .pop()
                 .build()
@@ -587,8 +702,34 @@ class Program:
         from eth_contract.contract import ContractFunction
 
         normalised = abi_sig if abi_sig.lstrip().startswith("function ") else "function " + abi_sig
-        calldata = bytes(ContractFunction.from_abi(normalised)(*args).data)
-        return self.call_contract(to, calldata, value=value, gas=gas, require_success=require_success)
+        fn = ContractFunction.from_abi(normalised)
+
+        # Collect all Patch objects from the arg tree and detect whether any
+        # patching is needed.
+        param_types: list[str] = fn.input_types
+
+        if len(args) != len(param_types):
+            raise ValueError(
+                f"call_contract_abi: expected {len(param_types)} argument(s) "
+                f"for signature {abi_sig!r}, got {len(args)}."
+            )
+
+        patch_list: list[Patch] = []
+        _collect_patches(args, patch_list)
+
+        # Fast path: no Patch objects anywhere in the argument tree.
+        if not patch_list:
+            return self.call_contract(to, fn(*args).data, value=value, gas=gas, require_success=require_success)
+
+        # Slow path: Patch objects are callable hooks; encode_with_hooks calls
+        # each one with the EncodingContext so each Patch stores its offset/size.
+        encoded_args = encode_with_hooks(param_types, args)
+        calldata = bytes(fn.selector) + encoded_args
+
+        patches: list[PatchSpec] = [
+            (p.offset, p.size, p.opcodes) for p in patch_list if p.offset is not None and p.size is not None
+        ]
+        return self.call_with_patches(to, calldata, patches, value=value, gas=gas, require_success=require_success)
 
     def call_with_patches(
         self,
@@ -607,10 +748,11 @@ class Program:
         overwrites a field at a specific byte offset using a value produced at
         runtime by arbitrary opcodes), then issues the ``CALL`` opcode.
 
-        Each entry in *patches* is a 3-tuple ``(kind, offset, opcodes)``:
+        Each entry in *patches* is a 3-tuple ``(offset, size, opcodes)``:
 
-        - *kind* — ``"u256"`` to overwrite a 32-byte word, ``"addr"`` for 20 bytes.
         - *offset* — byte offset in the calldata template to overwrite.
+        - *size* — number of bytes to overwrite: 32 for a ``uint256``/``int256``
+          word, or 20 for an ``address``.
         - *opcodes* — raw DeFiVM bytecode (``bytes``) that, when executed, pushes
           exactly one value onto the stack.  Any instruction sequence that leaves a
           single item on the stack is valid.  For example::
@@ -635,7 +777,7 @@ class Program:
                     ROUTER,
                     swap_template,          # swap(0, ...) — amount placeholder at offset 36
                     patches=[
-                        ("u256", 36, ret_u256(0)),   # fill amount from last retdata
+                        (36, 32, ret_u256(0)),   # fill 32-byte amount from last retdata
                     ],
                 )
                 .pop()
@@ -645,7 +787,7 @@ class Program:
         Args:
             to: Target contract address.
             calldata: Mutable calldata template bytes.
-            patches: List of ``(kind, offset, opcodes)`` patch descriptors.
+            patches: List of ``(offset, size, opcodes)`` patch descriptors.
             value: ETH value to forward (wei), default 0.
             gas: Sub-call gas limit (0 = forward all remaining gas).
             require_success: Revert if the sub-call fails (default ``True``).
@@ -657,20 +799,16 @@ class Program:
         self._emit(push_u256(0))  # retOffset
         self._emit(push_bytes(calldata))  # argsOffset (TOS), argsLen
 
-        for kind, offset, opcodes in patches:
-            if kind not in ("u256", "addr"):
-                raise ValueError(f"call_with_patches: unknown patch kind {kind!r}; expected 'u256' or 'addr'")
+        for offset, size, opcodes in patches:
+            if not (0 < size <= 32):
+                raise ValueError(f"call_with_patches: patch size {size!r} not supported; expected 0 < size <= 32")
             if not isinstance(opcodes, (bytes, bytearray)):
                 raise TypeError(
                     f"call_with_patches: opcodes must be bytes or bytearray, got {type(opcodes).__name__!r}"
                 )
 
             self._emit(opcodes)  # push the patch value onto the stack
-
-            if kind == "u256":
-                self._emit(patch_u256(offset))
-            else:  # kind == "addr"
-                self._emit(patch_addr(offset))
+            self._emit(patch_value(offset, size))
 
         # Stack now: [argsOffset(TOS), argsLen, retOffset, retSize] — ready for CALL prologue
         self._emit(push_u256(value))
