@@ -175,13 +175,22 @@ two separate destinations using arithmetic and composition::
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from eth_abi import encode_with_hooks
+from eth_abi.abi import encode_with_hooks
 
 if TYPE_CHECKING:
     from eth_abi.hooks import EncodingContext
 
+from pydefi.vm.approve_permit import (
+    ApproveProxyDeposit,
+    Permit2PermitSingle,
+    build_approve_proxy_execute_calldata,
+    build_permit2_permit_calldata,
+    build_permit2_transfer_from_calldata,
+    merge_deposits_by_token,
+)
 from pydefi.vm.program import (
     OP_JUMPDEST,
     add,
@@ -610,6 +619,118 @@ class Program:
             ._emit(gas_opcode() if gas == 0 else push_u256(gas))
             ._emit(call(require_success))
         )
+
+    def pull_token_via_proxy(
+        self,
+        approve_proxy: str,
+        vm_program: bytes,
+        deposits: list[ApproveProxyDeposit],
+        *,
+        value: int = 0,
+        gas: int = 0,
+        require_success: bool = True,
+    ) -> "Program":
+        """High-level primitive: call ``ApproveProxy.execute(program, deposits)``.
+
+        This helper wraps the proxy ABI call and automatically consumes the
+        CALL success flag via :meth:`pop`.
+        """
+        calldata = build_approve_proxy_execute_calldata(vm_program, merge_deposits_by_token(deposits))
+        return self.call_contract(
+            approve_proxy,
+            calldata,
+            value=value,
+            gas=gas,
+            require_success=require_success,
+        ).pop()
+
+    def permit2_pull_and_execute(
+        self,
+        permit2: str,
+        permit2_calldatas: Sequence[bytes] | None,
+        approve_proxy: str,
+        vm_program: bytes,
+        deposits: list[ApproveProxyDeposit],
+        *,
+        permit_single: Permit2PermitSingle | None = None,
+        permit_owner: str | None = None,
+        permit_signature: bytes | str | None = None,
+        value: int = 0,
+        gas: int = 0,
+        require_success: bool = True,
+    ) -> "Program":
+        """High-level primitive: Permit2 pre-calls + proxy pull/execute.
+
+        You can provide Permit2 actions in either form:
+
+        - raw pre-encoded calldata via ``permit2_calldatas``
+        - high-level Permit2 inputs via ``permit_single``/``permit_owner``/
+          ``permit_signature`` and ``transfer_details``
+
+        Each Permit2 call is executed and its CALL success flag is consumed
+        automatically.
+        """
+        if permit_single is not None or permit_owner is not None or permit_signature is not None:
+            if permit_single is None or permit_owner is None or permit_signature is None:
+                raise ValueError("permit_single, permit_owner, and permit_signature must be provided together")
+            self.permit2_permit(
+                permit2,
+                owner=permit_owner,
+                permit_single=permit_single,
+                signature=permit_signature,
+                gas=gas,
+                require_success=require_success,
+            )
+
+        for calldata in permit2_calldatas or []:
+            self.call_contract(permit2, calldata, gas=gas, require_success=require_success).pop()
+        return self.pull_token_via_proxy(
+            approve_proxy,
+            vm_program,
+            deposits,
+            value=value,
+            gas=gas,
+            require_success=require_success,
+        )
+
+    def permit2_permit(
+        self,
+        permit2: str,
+        *,
+        owner: str,
+        permit_single: Permit2PermitSingle,
+        signature: bytes | str,
+        gas: int = 0,
+        require_success: bool = True,
+    ) -> "Program":
+        """High-level helper for Permit2 ``permit(owner, permitSingle, signature)``."""
+        calldata = build_permit2_permit_calldata(owner, permit_single, signature)
+        return self.call_contract(
+            permit2,
+            calldata,
+            gas=gas,
+            require_success=require_success,
+        ).pop()
+
+    def permit2_transfer_from(
+        self,
+        permit2: str,
+        *,
+        from_addr: str,
+        to_addr: str,
+        amount: int,
+        token: str,
+        gas: int = 0,
+        require_success: bool = True,
+    ) -> "Program":
+        """High-level helper for Permit2 ``transferFrom(from,to,amount,token)``."""
+        calldata = build_permit2_transfer_from_calldata(from_addr, to_addr, amount, token)
+        return self.call_contract(
+            permit2,
+            calldata,
+            gas=gas,
+            require_success=require_success,
+        ).pop()
 
     def call_contract_abi(
         self,

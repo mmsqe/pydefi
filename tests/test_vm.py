@@ -20,6 +20,12 @@ import struct
 import pytest
 
 from pydefi.vm import Program
+from pydefi.vm.approve_permit import (
+    ApproveProxyDeposit,
+    Permit2PermitDetails,
+    Permit2PermitSingle,
+    build_permit2_transfer_from_calldata,
+)
 from pydefi.vm.program import (
     OP_ADD,
     OP_AND,
@@ -1095,6 +1101,205 @@ class TestCallContractAbi:
         assert len(bytecode) > 0
         # ERC-20 transfer selector appears at least twice (once per call)
         assert bytecode.count(bytes.fromhex("a9059cbb")) >= 2
+
+
+class TestProxyPrimitives:
+    """Verify new high-level primitives for ApproveProxy + Permit2 flows."""
+
+    def test_pull_token_via_proxy_matches_manual_call_contract_abi(self):
+        proxy = ADDR_A
+        vm_program = b"\x60\x00\x60\x00"
+        deposits = [ApproveProxyDeposit(token=ADDR_B, amount=123)]
+
+        via_primitive = Program().pull_token_via_proxy(proxy, vm_program, deposits).build()
+        via_manual = (
+            Program()
+            .call_contract_abi(
+                proxy,
+                "function execute(bytes program, (address token, uint256 amount)[] deposits)",
+                vm_program,
+                [(d.token, d.amount) for d in deposits],
+            )
+            .pop()
+            .build()
+        )
+        assert via_primitive == via_manual
+
+    def test_caller_merges_duplicate_tokens_before_pull(self):
+        proxy = ADDR_A
+        vm_program = b"\x60\x01"
+        deposits = [
+            ApproveProxyDeposit(token=ADDR_B, amount=20),
+            ApproveProxyDeposit(token=ADDR_B, amount=10),
+            ApproveProxyDeposit(token=ADDR_A, amount=5),
+        ]
+        via_primitive = Program().pull_token_via_proxy(proxy, vm_program, deposits).build()
+        via_manual = (
+            Program()
+            .pull_token_via_proxy(
+                proxy,
+                vm_program,
+                [
+                    ApproveProxyDeposit(token=ADDR_B, amount=30),
+                    ApproveProxyDeposit(token=ADDR_A, amount=5),
+                ],
+            )
+            .build()
+        )
+        assert via_primitive == via_manual
+
+    def test_permit2_pull_and_execute_matches_manual_sequence(self):
+        permit2 = ADDR_A
+        proxy = ADDR_B
+        vm_program = b"\x60\x02"
+        deposits = [ApproveProxyDeposit(token=ADDR_A, amount=77)]
+        permit2_calldatas = [b"\xaa\xbb\xcc\xdd", b"\x11\x22\x33\x44"]
+
+        via_primitive = (
+            Program()
+            .permit2_pull_and_execute(
+                permit2,
+                permit2_calldatas,
+                proxy,
+                vm_program,
+                deposits,
+            )
+            .build()
+        )
+
+        manual = Program()
+        for calldata in permit2_calldatas:
+            manual.call_contract(permit2, calldata).pop()
+        manual.pull_token_via_proxy(proxy, vm_program, deposits)
+        assert via_primitive == manual.build()
+
+    def test_permit2_permit_matches_manual_call_contract_abi(self):
+        permit2 = ADDR_A
+        owner = ADDR_B
+        permit_single = Permit2PermitSingle(
+            details=Permit2PermitDetails(
+                token=ADDR_A,
+                amount=10,
+                expiration=20,
+                nonce=1,
+            ),
+            spender=ADDR_B,
+            sigDeadline=999,
+        )
+        signature = bytes.fromhex("11" * 65)
+
+        via_primitive = (
+            Program()
+            .permit2_permit(
+                permit2,
+                owner=owner,
+                permit_single=permit_single,
+                signature=signature,
+            )
+            .build()
+        )
+        via_manual = (
+            Program()
+            .call_contract_abi(
+                permit2,
+                "function permit(address owner, ((address token, uint160 amount, uint48 expiration, uint48 nonce) details, address spender, uint256 sigDeadline) permitSingle, bytes signature)",
+                owner,
+                ((ADDR_A, 10, 20, 1), ADDR_B, 999),
+                signature,
+            )
+            .pop()
+            .build()
+        )
+        assert via_primitive == via_manual
+
+    def test_multiple_permit2_transfer_from_calls_match_manual_sequence(self):
+        permit2 = ADDR_A
+        details = [
+            (ADDR_A, ADDR_B, 3, ADDR_A),
+            (ADDR_B, ADDR_A, 4, ADDR_B),
+        ]
+
+        via_primitive_builder = Program()
+        for from_addr, to_addr, amount, token in details:
+            via_primitive_builder.permit2_transfer_from(
+                permit2,
+                from_addr=from_addr,
+                to_addr=to_addr,
+                amount=amount,
+                token=token,
+            )
+        via_primitive = via_primitive_builder.build()
+
+        via_manual_builder = Program()
+        for from_addr, to_addr, amount, token in details:
+            via_manual_builder.call_contract_abi(
+                permit2,
+                "function transferFrom(address from, address to, uint160 amount, address token)",
+                from_addr,
+                to_addr,
+                amount,
+                token,
+            ).pop()
+        via_manual = via_manual_builder.build()
+        assert via_primitive == via_manual
+
+    def test_permit2_pull_and_execute_inputs(self):
+        permit2 = ADDR_A
+        proxy = ADDR_B
+        owner = ADDR_A
+        permit_single = Permit2PermitSingle(
+            details=Permit2PermitDetails(
+                token=ADDR_B,
+                amount=123,
+                expiration=222,
+                nonce=7,
+            ),
+            spender=proxy,
+            sigDeadline=999,
+        )
+        signature = bytes.fromhex("22" * 65)
+        transfers = [
+            (owner, proxy, 11, ADDR_B),
+            (owner, proxy, 12, ADDR_A),
+        ]
+        permit2_calldatas = [
+            build_permit2_transfer_from_calldata(from_addr, to_addr, amount, token)
+            for from_addr, to_addr, amount, token in transfers
+        ]
+        vm_program = b"\x60\x03"
+        deposits = [ApproveProxyDeposit(token=ADDR_A, amount=9)]
+
+        via_primitive = (
+            Program()
+            .permit2_pull_and_execute(
+                permit2,
+                permit2_calldatas,
+                proxy,
+                vm_program,
+                deposits,
+                permit_single=permit_single,
+                permit_owner=owner,
+                permit_signature=signature,
+            )
+            .build()
+        )
+
+        manual = Program().permit2_permit(
+            permit2,
+            owner=owner,
+            permit_single=permit_single,
+            signature=signature,
+        )
+        for from_addr, to_addr, amount, token in transfers:
+            manual.permit2_transfer_from(
+                permit2,
+                from_addr=from_addr,
+                to_addr=to_addr,
+                amount=amount,
+                token=token,
+            )
+        manual = manual.pull_token_via_proxy(proxy, vm_program, deposits).build()
+        assert via_primitive == manual
 
 
 # ---------------------------------------------------------------------------
