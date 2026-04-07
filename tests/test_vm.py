@@ -26,6 +26,7 @@ from pydefi.vm.approve_permit import (
     Permit2PermitDetails,
     Permit2PermitRequest,
     Permit2PermitSingle,
+    build_approve_proxy_execute_calldata,
     build_permit2_transfer_from_calldata,
 )
 from pydefi.vm.program import (
@@ -1108,12 +1109,20 @@ class TestCallContractAbi:
 class TestProxyPrimitives:
     """Verify new high-level primitives for ApproveProxy + Permit2 flows."""
 
-    def test_pull_token_via_proxy_matches_manual_call_contract_abi(self):
+    def test_proxy_execute_calldata_matches_manual_call_contract_abi(self):
         proxy = ADDR_A
         vm_program = b"\x60\x00\x60\x00"
         deposits = [ApproveProxyDeposit(token=ADDR_B, amount=123)]
 
-        via_primitive = Program().pull_token_via_proxy(proxy, vm_program, deposits).build()
+        via_primitive = (
+            Program()
+            .call_contract(
+                proxy,
+                build_approve_proxy_execute_calldata(vm_program, deposits),
+            )
+            .pop()
+            .build()
+        )
         via_manual = (
             Program()
             .call_contract_abi(
@@ -1127,7 +1136,7 @@ class TestProxyPrimitives:
         )
         assert via_primitive == via_manual
 
-    def test_caller_merges_duplicate_tokens_before_pull(self):
+    def test_caller_merges_duplicate_tokens_before_proxy_execute(self):
         proxy = ADDR_A
         vm_program = b"\x60\x01"
         deposits = [
@@ -1135,17 +1144,28 @@ class TestProxyPrimitives:
             ApproveProxyDeposit(token=ADDR_B, amount=10),
             ApproveProxyDeposit(token=ADDR_A, amount=5),
         ]
-        via_primitive = Program().pull_token_via_proxy(proxy, vm_program, deposits).build()
+        via_primitive = (
+            Program()
+            .call_contract(
+                proxy,
+                build_approve_proxy_execute_calldata(vm_program, deposits),
+            )
+            .pop()
+            .build()
+        )
         via_manual = (
             Program()
-            .pull_token_via_proxy(
+            .call_contract(
                 proxy,
-                vm_program,
-                [
-                    ApproveProxyDeposit(token=ADDR_B, amount=30),
-                    ApproveProxyDeposit(token=ADDR_A, amount=5),
-                ],
+                build_approve_proxy_execute_calldata(
+                    vm_program,
+                    [
+                        ApproveProxyDeposit(token=ADDR_B, amount=30),
+                        ApproveProxyDeposit(token=ADDR_A, amount=5),
+                    ],
+                ),
             )
+            .pop()
             .build()
         )
         assert via_primitive == via_manual
@@ -1246,7 +1266,7 @@ class TestPermit2PullAndExecute:
         manual = Program()
         for calldata in permit2_calldatas:
             manual.call_contract(permit2, calldata).pop()
-        manual.pull_token_via_proxy(proxy, vm_program, deposits)
+        manual.call_contract(proxy, build_approve_proxy_execute_calldata(vm_program, deposits)).pop()
         assert via_primitive == manual.build()
 
     def test_permit2_pull_and_execute_inputs(self):
@@ -1306,7 +1326,7 @@ class TestPermit2PullAndExecute:
                 amount=amount,
                 token=token,
             )
-        manual = manual.pull_token_via_proxy(proxy, vm_program, deposits).build()
+        manual = manual.call_contract(proxy, build_approve_proxy_execute_calldata(vm_program, deposits)).pop().build()
         assert via_primitive == manual
 
     def test_permit2_pull_and_execute_transfer_details_input(self):
@@ -1363,7 +1383,7 @@ class TestPermit2PullAndExecute:
                 amount=detail.amount,
                 token=detail.token,
             )
-        manual = manual.pull_token_via_proxy(proxy, vm_program, deposits).build()
+        manual = manual.call_contract(proxy, build_approve_proxy_execute_calldata(vm_program, deposits)).pop().build()
         assert via_primitive == manual
 
 

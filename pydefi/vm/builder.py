@@ -622,30 +622,6 @@ class Program:
             ._emit(call(require_success))
         )
 
-    def pull_token_via_proxy(
-        self,
-        approve_proxy: str,
-        vm_program: bytes,
-        deposits: list[ApproveProxyDeposit],
-        *,
-        value: int = 0,
-        gas: int = 0,
-        require_success: bool = True,
-    ) -> "Program":
-        """High-level primitive: call ``ApproveProxy.execute(program, deposits)``.
-
-        This helper wraps the proxy ABI call and automatically consumes the
-        CALL success flag via :meth:`pop`.
-        """
-        calldata = build_approve_proxy_execute_calldata(vm_program, merge_deposits_by_token(deposits))
-        return self.call_contract(
-            approve_proxy,
-            calldata,
-            value=value,
-            gas=gas,
-            require_success=require_success,
-        ).pop()
-
     def permit2_pull_and_execute(
         self,
         permit2: str,
@@ -694,14 +670,13 @@ class Program:
 
         for calldata in permit2_calldatas or []:
             self.call_contract(permit2, calldata, gas=gas, require_success=require_success).pop()
-        return self.pull_token_via_proxy(
+        return self.call_contract(
             approve_proxy,
-            vm_program,
-            deposits,
+            build_approve_proxy_execute_calldata(vm_program, merge_deposits_by_token(deposits)),
             value=value,
             gas=gas,
             require_success=require_success,
-        )
+        ).pop()
 
     def permit2_permit(
         self,
