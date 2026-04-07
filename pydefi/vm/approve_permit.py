@@ -4,6 +4,7 @@ Input primitives for ApproveProxy and Permit2 flows.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Annotated
 
 from eth_contract import ABIStruct, Contract
@@ -40,6 +41,15 @@ class Permit2AllowanceTransferDetail(ABIStruct):
     to: Annotated[str, "address"]
     amount: Annotated[int, "uint160"]
     token: Annotated[str, "address"]
+
+
+@dataclass(frozen=True)
+class Permit2PermitRequest:
+    """Input bundle for Permit2 ``permit`` call."""
+
+    owner: str
+    permit_single: Permit2PermitSingle
+    signature: bytes | str
 
 
 _APPROVE_PROXY_ABI = ApproveProxyDeposit.human_readable_abi() + [

@@ -185,6 +185,8 @@ if TYPE_CHECKING:
 
 from pydefi.vm.approve_permit import (
     ApproveProxyDeposit,
+    Permit2AllowanceTransferDetail,
+    Permit2PermitRequest,
     Permit2PermitSingle,
     build_approve_proxy_execute_calldata,
     build_permit2_permit_calldata,
@@ -652,9 +654,8 @@ class Program:
         vm_program: bytes,
         deposits: list[ApproveProxyDeposit],
         *,
-        permit_single: Permit2PermitSingle | None = None,
-        permit_owner: str | None = None,
-        permit_signature: bytes | str | None = None,
+        permit: Permit2PermitRequest | None = None,
+        transfer_details: Sequence[Permit2AllowanceTransferDetail] | None = None,
         value: int = 0,
         gas: int = 0,
         require_success: bool = True,
@@ -664,20 +665,29 @@ class Program:
         You can provide Permit2 actions in either form:
 
         - raw pre-encoded calldata via ``permit2_calldatas``
-        - high-level Permit2 inputs via ``permit_single``/``permit_owner``/
-          ``permit_signature`` and ``transfer_details``
+        - high-level Permit2 inputs via ``permit`` and/or
+          ``transfer_details``
 
         Each Permit2 call is executed and its CALL success flag is consumed
         automatically.
         """
-        if permit_single is not None or permit_owner is not None or permit_signature is not None:
-            if permit_single is None or permit_owner is None or permit_signature is None:
-                raise ValueError("permit_single, permit_owner, and permit_signature must be provided together")
+        if permit is not None:
             self.permit2_permit(
                 permit2,
-                owner=permit_owner,
-                permit_single=permit_single,
-                signature=permit_signature,
+                owner=permit.owner,
+                permit_single=permit.permit_single,
+                signature=permit.signature,
+                gas=gas,
+                require_success=require_success,
+            )
+
+        for detail in transfer_details or []:
+            self.permit2_transfer_from(
+                permit2,
+                from_addr=detail.from_addr,
+                to_addr=detail.to,
+                amount=detail.amount,
+                token=detail.token,
                 gas=gas,
                 require_success=require_success,
             )
