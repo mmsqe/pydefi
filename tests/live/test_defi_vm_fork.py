@@ -26,6 +26,11 @@ from eth_contract.erc20 import ERC20
 from web3.exceptions import ContractLogicError, Web3RPCError
 
 from pydefi.vm import Patch, Program
+from pydefi.vm.approve_permit import (
+    Permit2AllowanceTransferDetail,
+    build_approve_proxy_execute_calldata,
+    build_permit2_transfer_from_calldata,
+)
 from pydefi.vm.program import (
     assert_ge,
     assert_le,
@@ -120,6 +125,39 @@ contract MockAdapter {
 """
 
 
+MOCK_PERMIT2_SOL = """
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+interface IERC20Like {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+/// @notice Minimal Permit2-like mock used by fork tests.
+contract MockPermit2 {
+    struct PermitDetails {
+        address token;
+        uint160 amount;
+        uint48 expiration;
+        uint48 nonce;
+    }
+
+    struct PermitSingle {
+        PermitDetails details;
+        address spender;
+        uint256 sigDeadline;
+    }
+
+    // Intentionally a no-op for tests; signature validation is out-of-scope here.
+    function permit(address, PermitSingle calldata, bytes calldata) external {}
+
+    function transferFrom(address from, address to, uint160 amount, address token) external {
+        require(IERC20Like(token).transferFrom(from, to, uint256(amount)), "transferFrom failed");
+    }
+}
+"""
+
+
 def _compile_mock_adapter() -> dict:
     ensure_solc("0.8.24")
     result = solcx.compile_source(
@@ -128,6 +166,17 @@ def _compile_mock_adapter() -> dict:
         solc_version="0.8.24",
     )
     key = "<stdin>:MockAdapter"
+    return result[key]
+
+
+def _compile_mock_permit2() -> dict:
+    ensure_solc("0.8.24")
+    result = solcx.compile_source(
+        MOCK_PERMIT2_SOL,
+        output_values=["abi", "bin"],
+        solc_version="0.8.24",
+    )
+    key = "<stdin>:MockPermit2"
     return result[key]
 
 
@@ -881,7 +930,7 @@ class TestDeFiVMFork:
 
 @pytest.fixture(scope="module")
 async def proxy_ctx(vm_fork_w3, compiled_vm, interpreter_addr):
-    """Deploy DeFiVM, ApproveProxy, and two MockTokens; return shared context."""
+    """Deploy DeFiVM, ApproveProxy, MockPermit2, and two MockTokens; return shared context."""
     w3 = vm_fork_w3
     accounts = await w3.eth.accounts
     deployer = accounts[0]
@@ -892,6 +941,9 @@ async def proxy_ctx(vm_fork_w3, compiled_vm, interpreter_addr):
 
     compiled_proxy = _compile_approve_proxy()
     proxy_address = await deploy(w3, compiled_proxy, deployer, vm_address)
+
+    compiled_permit2 = _compile_mock_permit2()
+    permit2_address = await deploy(w3, compiled_permit2, deployer)
 
     compiled_token = compile_sol_source(MOCK_TOKEN_SOL, "MockToken")
     token_a_address = await deploy(w3, compiled_token, deployer)
@@ -906,6 +958,7 @@ async def proxy_ctx(vm_fork_w3, compiled_vm, interpreter_addr):
 
     vm = w3.eth.contract(address=vm_address, abi=compiled_vm["abi"])
     proxy = w3.eth.contract(address=proxy_address, abi=compiled_proxy["abi"])
+    permit2 = w3.eth.contract(address=permit2_address, abi=compiled_permit2["abi"])
 
     return {
         "w3": w3,
@@ -913,6 +966,8 @@ async def proxy_ctx(vm_fork_w3, compiled_vm, interpreter_addr):
         "vm_address": vm_address,
         "proxy": proxy,
         "proxy_address": proxy_address,
+        "permit2": permit2,
+        "permit2_address": permit2_address,
         "token_a": token_a,
         "token_a_address": token_a_address,
         "token_b": token_b,
@@ -932,6 +987,205 @@ async def proxy_ctx(vm_fork_w3, compiled_vm, interpreter_addr):
 @pytest.mark.fork
 class TestApproveProxyFork:
     """Fork-level tests for ApproveProxy.sol on a local Anvil mainnet fork."""
+
+    async def _assert_two_token_transfer_balances(self, state: dict) -> None:
+        token_a = state["token_a"]
+        token_b = state["token_b"]
+        user = state["user"]
+        recipient = state["recipient"]
+        amount_a = state["amount_a"]
+        amount_b = state["amount_b"]
+
+        assert await token_a.functions.balanceOf(user).call() == state["bal_a_user_before"] - amount_a
+        assert await token_b.functions.balanceOf(user).call() == state["bal_b_user_before"] - amount_b
+        assert await token_a.functions.balanceOf(recipient).call() == state["bal_a_recipient_before"] + amount_a
+        assert await token_b.functions.balanceOf(recipient).call() == state["bal_b_recipient_before"] + amount_b
+
+    async def test_permit2_pull_and_execute(self, proxy_ctx):
+        w3 = proxy_ctx["w3"]
+        vm = proxy_ctx["vm"]
+        vm_address = proxy_ctx["vm_address"]
+        proxy_address = proxy_ctx["proxy_address"]
+        permit2_address = proxy_ctx["permit2_address"]
+        token_a = proxy_ctx["token_a"]
+        token_a_address = proxy_ctx["token_a_address"]
+        token_b = proxy_ctx["token_b"]
+        token_b_address = proxy_ctx["token_b_address"]
+        user = proxy_ctx["user"]
+        recipient = proxy_ctx["recipient"]
+
+        amount_a = 9 * 10**18
+        amount_b = 17 * 10**18
+
+        for token, amount in ((token_a, amount_a), (token_b, amount_b)):
+            tx = await token.functions.approve(permit2_address, amount).transact({"from": user})
+            await w3.eth.get_transaction_receipt(tx)
+
+        vm_program = (
+            Program()
+            .call_contract(token_a_address, ERC20.fns.transfer(recipient, amount_a).data)
+            .pop()
+            .call_contract(token_b_address, ERC20.fns.transfer(recipient, amount_b).data)
+            .pop()
+            .build()
+        )
+
+        state = {
+            "token_a": token_a,
+            "token_b": token_b,
+            "user": user,
+            "recipient": recipient,
+            "amount_a": amount_a,
+            "amount_b": amount_b,
+            "bal_a_user_before": await token_a.functions.balanceOf(user).call(),
+            "bal_b_user_before": await token_b.functions.balanceOf(user).call(),
+            "bal_a_recipient_before": await token_a.functions.balanceOf(recipient).call(),
+            "bal_b_recipient_before": await token_b.functions.balanceOf(recipient).call(),
+        }
+
+        transfer_details = [
+            Permit2AllowanceTransferDetail(
+                from_addr=user,
+                to=vm_address,
+                amount=amount_a,
+                token=token_a_address,
+            ),
+            Permit2AllowanceTransferDetail(
+                from_addr=user,
+                to=vm_address,
+                amount=amount_b,
+                token=token_b_address,
+            ),
+        ]
+
+        via_helper = (
+            Program()
+            .permit2_pull_and_execute(
+                permit2=permit2_address,
+                permit2_calldatas=None,
+                approve_proxy=proxy_address,
+                vm_program=vm_program,
+                deposits=[],
+                transfer_details=transfer_details,
+            )
+            .build()
+        )
+
+        manual = Program()
+        for detail in transfer_details:
+            manual.call_contract_abi(
+                permit2_address,
+                "function transferFrom(address from, address to, uint160 amount, address token)",
+                detail.from_addr,
+                detail.to,
+                detail.amount,
+                detail.token,
+            ).pop()
+        manual = (
+            manual.call_contract(
+                proxy_address,
+                build_approve_proxy_execute_calldata(vm_program, []),
+            )
+            .pop()
+            .build()
+        )
+
+        assert via_helper == manual
+
+        tx = await vm.functions.execute(via_helper).transact({"from": user})
+        receipt = await w3.eth.get_transaction_receipt(tx)
+        assert receipt["status"] == 1
+
+        await self._assert_two_token_transfer_balances(state)
+
+    async def test_permit2_pull_and_execute_multi_step_pulls(self, proxy_ctx):
+        w3 = proxy_ctx["w3"]
+        vm = proxy_ctx["vm"]
+        vm_address = proxy_ctx["vm_address"]
+        proxy_address = proxy_ctx["proxy_address"]
+        permit2_address = proxy_ctx["permit2_address"]
+        token_a = proxy_ctx["token_a"]
+        token_a_address = proxy_ctx["token_a_address"]
+        token_b = proxy_ctx["token_b"]
+        token_b_address = proxy_ctx["token_b_address"]
+        user = proxy_ctx["user"]
+        recipient = proxy_ctx["recipient"]
+
+        amount_a = 13 * 10**18
+        amount_b = 21 * 10**18
+
+        for token, amount in ((token_a, amount_a), (token_b, amount_b)):
+            tx = await token.functions.approve(permit2_address, amount).transact({"from": user})
+            await w3.eth.get_transaction_receipt(tx)
+
+        vm_program = (
+            Program()
+            .call_contract(token_a_address, ERC20.fns.transfer(recipient, amount_a).data)
+            .pop()
+            .call_contract(token_b_address, ERC20.fns.transfer(recipient, amount_b).data)
+            .pop()
+            .build()
+        )
+
+        state = {
+            "token_a": token_a,
+            "token_b": token_b,
+            "user": user,
+            "recipient": recipient,
+            "amount_a": amount_a,
+            "amount_b": amount_b,
+            "bal_a_user_before": await token_a.functions.balanceOf(user).call(),
+            "bal_b_user_before": await token_b.functions.balanceOf(user).call(),
+            "bal_a_recipient_before": await token_a.functions.balanceOf(recipient).call(),
+            "bal_b_recipient_before": await token_b.functions.balanceOf(recipient).call(),
+        }
+
+        pull_a = build_permit2_transfer_from_calldata(
+            user,
+            vm_address,
+            amount_a,
+            token_a_address,
+        )
+        pull_b = build_permit2_transfer_from_calldata(
+            user,
+            vm_address,
+            amount_b,
+            token_b_address,
+        )
+
+        via_helper = (
+            Program()
+            .permit2_pull_and_execute(
+                permit2=permit2_address,
+                permit2_calldatas=[pull_a, pull_b],
+                approve_proxy=proxy_address,
+                vm_program=vm_program,
+                deposits=[],
+            )
+            .build()
+        )
+
+        manual = (
+            Program()
+            .call_contract(permit2_address, pull_a)
+            .pop()
+            .call_contract(permit2_address, pull_b)
+            .pop()
+            .call_contract(
+                proxy_address,
+                build_approve_proxy_execute_calldata(vm_program, []),
+            )
+            .pop()
+            .build()
+        )
+
+        assert via_helper == manual
+
+        tx = await vm.functions.execute(via_helper).transact({"from": user})
+        receipt = await w3.eth.get_transaction_receipt(tx)
+        assert receipt["status"] == 1
+
+        await self._assert_two_token_transfer_balances(state)
 
     async def test_single_deposit_and_transfer(self, proxy_ctx):
         """Proxy deposits one token into DeFiVM; program transfers it to recipient."""
