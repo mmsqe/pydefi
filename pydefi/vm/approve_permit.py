@@ -91,8 +91,7 @@ def build_approve_proxy_execute_calldata(
     deposits: list[ApproveProxyDeposit],
 ) -> bytes:
     """Build calldata for ``ApproveProxy.execute(program, deposits)``."""
-    non_zero = [dep for dep in deposits if dep.amount > 0]
-    return _APPROVE_PROXY_TEMPLATE.fns.execute(vm_program, non_zero).data
+    return _APPROVE_PROXY_TEMPLATE.fns.execute(vm_program, merge_deposits_by_token(deposits)).data
 
 
 def build_permit2_permit_calldata(

@@ -188,10 +188,8 @@ from pydefi.vm.approve_permit import (
     Permit2AllowanceTransferDetail,
     Permit2PermitRequest,
     Permit2PermitSingle,
-    build_approve_proxy_execute_calldata,
     build_permit2_permit_calldata,
     build_permit2_transfer_from_calldata,
-    merge_deposits_by_token,
 )
 from pydefi.vm.program import (
     OP_JUMPDEST,
@@ -636,7 +634,7 @@ class Program:
         gas: int = 0,
         require_success: bool = True,
     ) -> "Program":
-        """High-level primitive: Permit2 pre-calls + proxy pull/execute.
+        """High-level primitive: Permit2 pre-calls + inline VM program execution.
 
         You can provide Permit2 actions in either form:
 
@@ -645,7 +643,14 @@ class Program:
           ``transfer_details``
 
         Each Permit2 call is executed and its CALL success flag is consumed
-        automatically.
+        automatically.  After those pre-calls, ``vm_program`` is appended and
+        executed inline by the current VM run.
+
+        Note:
+            ``ApproveProxy.execute`` pulls from ``msg.sender``. When invoked
+            from inside DeFiVM, ``msg.sender`` would be the VM contract rather
+            than the end user, so nested proxy deposits are not supported in
+            this helper.
         """
         if permit is not None:
             self.permit2_permit(
@@ -670,13 +675,14 @@ class Program:
 
         for calldata in permit2_calldatas or []:
             self.call_contract(permit2, calldata, gas=gas, require_success=require_success).pop()
-        return self.call_contract(
-            approve_proxy,
-            build_approve_proxy_execute_calldata(vm_program, merge_deposits_by_token(deposits)),
-            value=value,
-            gas=gas,
-            require_success=require_success,
-        ).pop()
+        if any(dep.amount > 0 for dep in deposits):
+            raise ValueError(
+                "permit2_pull_and_execute: deposits are not supported when called inside DeFiVM; "
+                "ApproveProxy.transferFrom would see msg.sender as the VM"
+            )
+        if value != 0:
+            raise ValueError("permit2_pull_and_execute: value forwarding is not supported for inline vm_program")
+        return self._emit(vm_program)
 
     def permit2_permit(
         self,

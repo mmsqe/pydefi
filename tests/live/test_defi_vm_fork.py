@@ -28,7 +28,6 @@ from web3.exceptions import ContractLogicError, Web3RPCError
 from pydefi.vm import Patch, Program
 from pydefi.vm.approve_permit import (
     Permit2AllowanceTransferDetail,
-    build_approve_proxy_execute_calldata,
     build_permit2_transfer_from_calldata,
 )
 from pydefi.vm.program import (
@@ -1042,14 +1041,7 @@ class TestApproveProxyFork:
                 detail.amount,
                 detail.token,
             ).pop()
-        manual = (
-            manual.call_contract(
-                proxy_address,
-                build_approve_proxy_execute_calldata(vm_program, []),
-            )
-            .pop()
-            .build()
-        )
+        manual = manual.build() + vm_program
 
         assert via_helper == manual
 
@@ -1140,18 +1132,9 @@ class TestApproveProxyFork:
         )
 
         manual = (
-            Program()
-            .call_contract(permit2_address, pull_a)
-            .pop()
-            .call_contract(permit2_address, pull_b)
-            .pop()
-            .call_contract(
-                proxy_address,
-                build_approve_proxy_execute_calldata(vm_program, []),
-            )
-            .pop()
-            .build()
+            Program().call_contract(permit2_address, pull_a).pop().call_contract(permit2_address, pull_b).pop().build()
         )
+        manual = manual + vm_program
 
         assert via_helper == manual
 
