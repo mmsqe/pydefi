@@ -45,6 +45,7 @@ class Permit2AllowanceTransferDetail(ABIStruct):
 _APPROVE_PROXY_ABI = ApproveProxyDeposit.human_readable_abi() + [
     "function execute(bytes program, ApproveProxyDeposit[] deposits)",
 ]
+_APPROVE_PROXY_TEMPLATE = Contract.from_abi(_APPROVE_PROXY_ABI)
 
 _PERMIT2_ABI = (
     Permit2PermitSingle.human_readable_abi()
@@ -80,7 +81,8 @@ def build_approve_proxy_execute_calldata(
     deposits: list[ApproveProxyDeposit],
 ) -> bytes:
     """Build calldata for ``ApproveProxy.execute(program, deposits)``."""
-    return Contract.from_abi(_APPROVE_PROXY_ABI).fns.execute(vm_program, deposits).data
+    non_zero = [dep for dep in deposits if dep.amount > 0]
+    return _APPROVE_PROXY_TEMPLATE.fns.execute(vm_program, non_zero).data
 
 
 def build_permit2_permit_calldata(

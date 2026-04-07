@@ -42,6 +42,8 @@ interface IDeFiVM {
  *    ``token.transfer(recipient, amount)`` from the VM's balance).
  */
 contract ApproveProxy {
+    error DepositFailed();
+
     /// @dev The DeFiVM instance this proxy is paired with.
     address public immutable vm;
 
@@ -71,9 +73,12 @@ contract ApproveProxy {
      *                 before program execution.  May be empty.
      */
     function execute(bytes calldata program, Deposit[] calldata deposits) external payable {
-        IDeFiVM _vm = IDeFiVM(vm);
+        address vmAddr = vm;
+        IDeFiVM _vm = IDeFiVM(vmAddr);
         for (uint256 i = 0; i < deposits.length; i++) {
-            _safeTransferFrom(deposits[i].token, msg.sender, address(_vm), deposits[i].amount);
+            uint256 amount = deposits[i].amount;
+            if (amount == 0) continue;
+            _safeTransferFrom(deposits[i].token, msg.sender, vmAddr, amount);
         }
         _vm.execute{value: msg.value}(program);
     }
@@ -84,12 +89,35 @@ contract ApproveProxy {
      *      non-compliant tokens that return no value.
      */
     function _safeTransferFrom(address token, address from, address to, uint256 amount) internal {
-        (bool success, bytes memory returndata) = token.call(
-            abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount)
-        );
-        require(success, "ApproveProxy: deposit failed");
-        if (returndata.length > 0) {
-            require(abi.decode(returndata, (bool)), "ApproveProxy: deposit failed");
+        bool callOk;
+        bool retOk;
+        assembly {
+            let ptr := mload(0x40)
+            // transferFrom(address,address,uint256) selector
+            mstore(ptr, shl(224, 0x23b872dd))
+            mstore(add(ptr, 0x04), from)
+            mstore(add(ptr, 0x24), to)
+            mstore(add(ptr, 0x44), amount)
+
+            // 4 + 32*3 = 100 bytes
+            callOk := call(gas(), token, 0, ptr, 100, 0, 32)
+
+            switch returndatasize()
+            case 0 {
+                // Non-standard ERC-20 (no return data): treat as success.
+                retOk := 1
+            }
+            case 32 {
+                // Standard ERC-20: require returned bool == true.
+                returndatacopy(ptr, 0, 32)
+                retOk := iszero(iszero(mload(ptr)))
+            }
+            default {
+                // Any other return-data size is considered malformed.
+                retOk := 0
+            }
         }
+
+        if (!(callOk && retOk)) revert DepositFailed();
     }
 }
