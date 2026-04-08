@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "../vm/IDeFiVM.sol";
-
 /**
  * @title OFTComposer
  * @notice LayerZero OFT compose receiver that executes a DeFiVM program after
@@ -74,6 +72,15 @@ import "../vm/IDeFiVM.sol";
 /// ``token()`` returns the address of that underlying ERC-20 contract.
 interface IOFT {
     function token() external view returns (address);
+}
+
+// ---------------------------------------------------------------------------
+// IDeFiVM
+// ---------------------------------------------------------------------------
+
+/// @notice Minimal interface for calling DeFiVM.execute.
+interface IDeFiVM {
+    function execute(bytes calldata program) external payable;
 }
 
 // ---------------------------------------------------------------------------
