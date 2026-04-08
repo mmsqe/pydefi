@@ -186,8 +186,6 @@ if TYPE_CHECKING:
 
 from pydefi.vm.abi import emit_abi_encode, emit_abi_encode_packed
 from pydefi.vm.approve_permit import (
-    ApproveProxy,
-    ApproveProxyDeposit,
     Permit2,
     Permit2PermitRequest,
     Permit2PermitSingle,
@@ -696,12 +694,9 @@ class Program:
             ._emit(call(require_success))
         )
 
-    def permit2_pull_and_execute(
+    def permit2_pre_calls(
         self,
         permit2: str,
-        approve_proxy: str,
-        vm_program: bytes,
-        deposits: Sequence[ApproveProxyDeposit] | None = None,
         *,
         permit: Permit2PermitRequest | None = None,
         permit_transfer_from_requests: Sequence[Permit2PermitTransferFromRequest] | None = None,
@@ -709,21 +704,22 @@ class Program:
         gas: int = 0,
         require_success: bool = True,
     ) -> "Program":
-        """High-level primitive: Permit2 pre-calls + ApproveProxy execution call.
+        """Emit Permit2 pre-call sequence without coupling to any downstream call.
 
         You can provide Permit2 actions in any combination:
 
-        - allowance-based: ``permit`` sets a Permit2 allowance for a spender
-        - signature-based: ``permit_transfer_from_requests`` for one-shot
-          ``permitTransferFrom`` pulls (no prior allowance needed)
-        - raw pre-encoded calldata via ``permit2_calldatas``
+        - ``permit`` — sets a Permit2 allowance for a spender via
+          ``permit(owner, permitSingle, signature)``
+        - ``permit_transfer_from_requests`` — signature-based one-shot pulls via
+          ``permitTransferFrom`` (no prior allowance needed)
+        - ``permit2_calldatas`` — raw pre-encoded Permit2 calldata
 
         Execution order: ``permit`` → ``permit_transfer_from_requests`` →
-        ``permit2_calldatas`` → ``ApproveProxy.execute``.
+        ``permit2_calldatas``.
 
-        Each Permit2 call is executed and its CALL success flag is consumed
-        automatically. After those pre-calls, this emits a call to
-        ``ApproveProxy.execute(vm_program, deposits)``.
+        Each call's success flag is consumed automatically.  Returns ``self``
+        so the caller can chain any subsequent call (e.g.
+        ``ApproveProxy.execute``) independently.
         """
         if permit is not None:
             self.permit2_permit(
@@ -749,13 +745,7 @@ class Program:
         for calldata in permit2_calldatas or []:
             self.call_contract(permit2, calldata, gas=gas, require_success=require_success).pop()
 
-        helper_calldata = ApproveProxy.fns.execute(vm_program, list(deposits or [])).data
-        return self.call_contract(
-            approve_proxy,
-            helper_calldata,
-            gas=gas,
-            require_success=require_success,
-        ).pop()
+        return self
 
     def permit2_permit(
         self,

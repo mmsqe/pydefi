@@ -999,27 +999,15 @@ class TestApproveProxyFork:
         ]
         deposits = [ApproveProxyDeposit(token=token_a_address, amount=0)]
 
-        via_helper = (
+        bytecode = (
             Program()
-            .permit2_pull_and_execute(
-                permit2_address,
-                proxy_address,
-                vm_program,
-                deposits,
-                permit2_calldatas=pull_calldatas,
-            )
+            .permit2_pre_calls(permit2_address, permit2_calldatas=pull_calldatas)
+            .call_contract(proxy_address, ApproveProxy.fns.execute(vm_program, deposits).data)
+            .pop()
             .build()
         )
 
-        manual = Program()
-        for calldata in pull_calldatas:
-            manual.call_contract(permit2_address, calldata).pop()
-        manual.call_contract(proxy_address, ApproveProxy.fns.execute(vm_program, deposits).data).pop()
-        manual = manual.build()
-
-        assert via_helper == manual
-
-        tx = await vm.functions.execute(via_helper).transact({"from": user})
+        tx = await vm.functions.execute(bytecode).transact({"from": user})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
@@ -1084,25 +1072,15 @@ class TestApproveProxyFork:
         pull_b = Permit2.fns.transferFrom(user, vm_address, amount_b, token_b_address).data
         deposits = [ApproveProxyDeposit(token=token_b_address, amount=0)]
 
-        via_helper = (
+        bytecode = (
             Program()
-            .permit2_pull_and_execute(
-                permit2_address,
-                proxy_address,
-                vm_program,
-                deposits,
-                permit2_calldatas=[pull_a, pull_b],
-            )
+            .permit2_pre_calls(permit2_address, permit2_calldatas=[pull_a, pull_b])
+            .call_contract(proxy_address, ApproveProxy.fns.execute(vm_program, deposits).data)
+            .pop()
             .build()
         )
 
-        manual = Program().call_contract(permit2_address, pull_a).pop().call_contract(permit2_address, pull_b).pop()
-        manual.call_contract(proxy_address, ApproveProxy.fns.execute(vm_program, deposits).data).pop()
-        manual = manual.build()
-
-        assert via_helper == manual
-
-        tx = await vm.functions.execute(via_helper).transact({"from": user})
+        tx = await vm.functions.execute(bytecode).transact({"from": user})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 

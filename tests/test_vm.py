@@ -1229,36 +1229,22 @@ class TestProxyPrimitives:
         assert via_primitive == via_manual
 
 
-class TestPermit2PullAndExecute:
-    """Tests focused on Program.permit2_pull_and_execute."""
+class TestPermit2PreCalls:
+    """Tests focused on Program.permit2_pre_calls."""
 
-    def test_permit2_pull_and_execute_matches_manual_sequence(self):
+    def test_permit2_pre_calls_matches_manual_sequence(self):
         permit2 = ADDR_A
-        proxy = ADDR_B
-        vm_program = b"\x60\x02"
         permit2_calldatas = [b"\xaa\xbb\xcc\xdd", b"\x11\x22\x33\x44"]
 
-        via_primitive = (
-            Program()
-            .permit2_pull_and_execute(
-                permit2,
-                proxy,
-                vm_program,
-                permit2_calldatas=permit2_calldatas,
-            )
-            .build()
-        )
+        via_primitive = Program().permit2_pre_calls(permit2, permit2_calldatas=permit2_calldatas).build()
 
         manual = Program()
         for calldata in permit2_calldatas:
             manual.call_contract(permit2, calldata).pop()
-        helper_calldata = ApproveProxy.fns.execute(vm_program, []).data
-        manual.call_contract(proxy, helper_calldata).pop()
         assert via_primitive == manual.build()
 
-    def test_permit2_pull_and_execute_inputs(self):
+    def test_permit2_pre_calls_with_permit(self):
         permit2 = ADDR_A
-        proxy = ADDR_B
         owner = ADDR_A
         permit_single = Permit2PermitSingle(
             details=Permit2PermitDetails(
@@ -1267,19 +1253,16 @@ class TestPermit2PullAndExecute:
                 expiration=222,
                 nonce=7,
             ),
-            spender=proxy,
+            spender=ADDR_B,
             sigDeadline=999,
         )
         signature = bytes.fromhex("22" * 65)
         permit2_calldatas = [b"\xaa\xbb", b"\xcc\xdd"]
-        vm_program = b"\x60\x03"
 
         via_primitive = (
             Program()
-            .permit2_pull_and_execute(
+            .permit2_pre_calls(
                 permit2,
-                proxy,
-                vm_program,
                 permit=Permit2PermitRequest(
                     owner=owner,
                     permit_single=permit_single,
@@ -1298,15 +1281,11 @@ class TestPermit2PullAndExecute:
         )
         for calldata in permit2_calldatas:
             manual.call_contract(permit2, calldata).pop()
-        helper_calldata = ApproveProxy.fns.execute(vm_program, []).data
-        manual.call_contract(proxy, helper_calldata).pop()
         assert via_primitive == manual.build()
 
-    def test_permit2_pull_and_execute_permit_transfer_from_requests(self):
+    def test_permit2_pre_calls_permit_transfer_from_requests(self):
         permit2 = ADDR_A
-        proxy = ADDR_B
         owner = ADDR_A
-        vm_program = b"\x60\x06"
         requests = [
             Permit2PermitTransferFromRequest(
                 permit=Permit2PermitTransferFrom(
@@ -1314,7 +1293,7 @@ class TestPermit2PullAndExecute:
                     nonce=1,
                     deadline=9999,
                 ),
-                transfer_details=Permit2SignatureTransferDetails(to=proxy, requestedAmount=10**18),
+                transfer_details=Permit2SignatureTransferDetails(to=ADDR_B, requestedAmount=10**18),
                 owner=owner,
                 signature=bytes.fromhex("aa" * 65),
             ),
@@ -1324,22 +1303,13 @@ class TestPermit2PullAndExecute:
                     nonce=2,
                     deadline=9999,
                 ),
-                transfer_details=Permit2SignatureTransferDetails(to=proxy, requestedAmount=5 * 10**17),
+                transfer_details=Permit2SignatureTransferDetails(to=ADDR_B, requestedAmount=5 * 10**17),
                 owner=owner,
                 signature=bytes.fromhex("bb" * 65),
             ),
         ]
 
-        via_primitive = (
-            Program()
-            .permit2_pull_and_execute(
-                permit2,
-                proxy,
-                vm_program,
-                permit_transfer_from_requests=requests,
-            )
-            .build()
-        )
+        via_primitive = Program().permit2_pre_calls(permit2, permit_transfer_from_requests=requests).build()
 
         manual = Program()
         for req in requests:
@@ -1350,8 +1320,6 @@ class TestPermit2PullAndExecute:
                 owner=req.owner,
                 signature=req.signature,
             )
-        helper_calldata = ApproveProxy.fns.execute(vm_program, []).data
-        manual.call_contract(proxy, helper_calldata).pop()
         assert via_primitive == manual.build()
 
 
