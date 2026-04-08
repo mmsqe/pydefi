@@ -52,21 +52,24 @@ class Permit2PermitRequest:
     signature: bytes | str
 
 
-_APPROVE_PROXY_ABI = ApproveProxyDeposit.human_readable_abi() + [
-    "function execute(bytes program, ApproveProxyDeposit[] deposits)",
+APPROVE_PROXY_ABI = ApproveProxyDeposit.human_readable_abi() + [
+    "function execute(bytes program, ApproveProxyDeposit[] deposits) payable",
+    "function vm() view returns (address)",
 ]
-_APPROVE_PROXY_TEMPLATE = Contract.from_abi(_APPROVE_PROXY_ABI)
+_APPROVE_PROXY_TEMPLATE = Contract.from_abi(APPROVE_PROXY_ABI)
 
-_PERMIT2_ABI = (
+PERMIT2_ABI = (
     Permit2PermitSingle.human_readable_abi()
     + Permit2AllowanceTransferDetail.human_readable_abi()
     + [
+        "function approve(address token, address spender, uint160 amount, uint48 expiration)",
+        "function allowance(address user, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)",
         "function permit(address owner, Permit2PermitSingle permitSingle, bytes signature)",
         "function transferFrom(address from, address to, uint160 amount, address token)",
         "function transferFrom(Permit2AllowanceTransferDetail[] transferDetails)",
     ]
 )
-_PERMIT2_TEMPLATE = Contract.from_abi(_PERMIT2_ABI)
+_PERMIT2_TEMPLATE = Contract.from_abi(PERMIT2_ABI)
 
 
 def _normalise_permit2_signature(signature: bytes | str) -> bytes:

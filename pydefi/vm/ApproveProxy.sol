@@ -1,39 +1,50 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "../vm/IDeFiVM.sol";
+
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
 /**
  * @title ApproveProxy
- * @notice User-facing entrypoint for deposit pull + DeFiVM execution.
+ * @notice A proxy entry-point that lets users safely grant ERC-20 token
+ *         allowances for DeFiVM programs without the security risks of
+ *         approving the permissionless DeFiVM executor directly.
  *
  * Problem
  * -------
  * ``DeFiVM.execute()`` is permissionless — any caller can run any program.
- * If the VM executes in proxy storage context (``delegatecall``), then every
- * downstream call observes ``msg.sender == proxy`` and can consume arbitrary
- * token allowances users previously granted to the proxy.
+ * Approving tokens directly to DeFiVM means *any* ``execute()`` call can
+ * drain those approvals.
  *
  * Solution
  * --------
- * Users approve tokens to this proxy and call ``ApproveProxy.execute()``.
- * The proxy pulls deposits from ``msg.sender`` directly into the paired VM and
- * then calls ``DeFiVM.execute(bytes)`` normally. This prevents VM programs
- * from spending approvals that were granted to the proxy by other users.
+ * Users approve ERC-20 tokens to *this* proxy and invoke DeFiVM programs
+ * through ``ApproveProxy.execute()`` instead of ``DeFiVM.execute()``.  The
+ * proxy pulls the declared token deposits from the caller into DeFiVM *before*
+ * forwarding the program.  Programs then operate on tokens already held by
+ * DeFiVM — no in-program ``transferFrom`` back-channel is required.
+ *
+ * Because the proxy only calls ``token.transferFrom(msg.sender, vm, amount)``
+ * (user → VM, caller-controlled), there is no shared mutable state and no
+ * reentrancy risk.
  *
  * Usage
  * -----
  * 1. User: ``token.approve(approveProxy, amount)``  — once per token/session.
- * 2. User: ``approveProxy.execute{value: v}(program, deposits)`` where
- *    ``deposits`` lists tokens and amounts to pull from the caller.
- * 3. Program executes in the VM contract context and spends assets held by VM.
+ * 2. User: ``approveProxy.execute{value: v}(program, deposits)``
+ *           where ``deposits`` lists the tokens and amounts to pull into DeFiVM.
+ * 3. DeFiVM program operates on the deposited tokens (e.g. calls
+ *    ``token.transfer(recipient, amount)`` from the VM's balance).
  */
 contract ApproveProxy {
-    error DepositFailed();
-
     /// @dev The DeFiVM instance this proxy is paired with.
     address public immutable vm;
 
     /// @notice A single ERC-20 token deposit: token address + amount to pull
-    ///         from the caller into VM before executing the program.
+    ///         from the caller into DeFiVM before executing the program.
     struct Deposit {
         address token;
         uint256 amount;
@@ -46,39 +57,23 @@ contract ApproveProxy {
     }
 
     /**
-        * @notice Pull caller deposits into VM and execute VM program via call.
+     * @notice Deposit ERC-20 tokens into DeFiVM and then execute a program.
      *
      * For each entry in ``deposits``, this function calls
-        * ``token.transferFrom(msg.sender, vm, amount)``. It then calls
-        * ``vm.execute(bytes)`` on the paired DeFiVM contract.
+     * ``token.transferFrom(msg.sender, vm, amount)``, moving the tokens from
+     * the caller directly into the paired DeFiVM contract.  It then forwards
+     * the program (and any ETH) to ``DeFiVM.execute()``.
      *
-     * @param program  Raw VM bytecode to execute.
-     * @param deposits List of ERC-20 tokens and amounts to pull into VM
-     *                 before program execution. May be empty.
+     * @param program  Raw EVM bytecode to execute (forwarded to DeFiVM).
+     * @param deposits List of ERC-20 tokens and amounts to deposit into DeFiVM
+     *                 before program execution.  May be empty.
      */
     function execute(bytes calldata program, Deposit[] calldata deposits) external payable {
+        IDeFiVM _vm = IDeFiVM(vm);
         for (uint256 i = 0; i < deposits.length; i++) {
-            uint256 amount = deposits[i].amount;
-            if (amount == 0) continue;
-            _safeTransferFrom(deposits[i].token, msg.sender, vm, amount);
+            _safeTransferFrom(deposits[i].token, msg.sender, address(_vm), deposits[i].amount);
         }
-        _callVm(abi.encodeWithSignature("execute(bytes)", program));
-    }
-
-    /// @notice Forward unknown selectors to VM fallback (e.g. DEX callbacks).
-    fallback() external payable {
-        _callVm(msg.data);
-    }
-
-    receive() external payable {}
-
-    function _callVm(bytes memory data) internal {
-        (bool ok, bytes memory ret) = vm.call{value: msg.value}(data);
-        if (!ok) {
-            assembly {
-                revert(add(ret, 32), mload(ret))
-            }
-        }
+        _vm.execute{value: msg.value}(program);
     }
 
     /**
@@ -87,35 +82,12 @@ contract ApproveProxy {
      *      non-compliant tokens that return no value.
      */
     function _safeTransferFrom(address token, address from, address to, uint256 amount) internal {
-        bool callOk;
-        bool retOk;
-        assembly {
-            let ptr := mload(0x40)
-            // transferFrom(address,address,uint256) selector
-            mstore(ptr, shl(224, 0x23b872dd))
-            mstore(add(ptr, 0x04), from)
-            mstore(add(ptr, 0x24), to)
-            mstore(add(ptr, 0x44), amount)
-
-            // 4 + 32*3 = 100 bytes
-            callOk := call(gas(), token, 0, ptr, 100, 0, 32)
-
-            switch returndatasize()
-            case 0 {
-                // Non-standard ERC-20 (no return data): treat as success.
-                retOk := 1
-            }
-            case 32 {
-                // Standard ERC-20: require returned bool == true.
-                returndatacopy(ptr, 0, 32)
-                retOk := iszero(iszero(mload(ptr)))
-            }
-            default {
-                // Any other return-data size is considered malformed.
-                retOk := 0
-            }
+        (bool success, bytes memory returndata) = token.call(
+            abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount)
+        );
+        require(success, "ApproveProxy: deposit failed");
+        if (returndata.length > 0) {
+            require(abi.decode(returndata, (bool)), "ApproveProxy: deposit failed");
         }
-
-        if (!(callOk && retOk)) revert DepositFailed();
     }
 }

@@ -22,14 +22,20 @@ from pathlib import Path
 
 import pytest
 import solcx
+from eth_contract import Contract
 from eth_contract.erc20 import ERC20
 from web3.exceptions import ContractLogicError, Web3RPCError
 
 from pydefi.vm import Patch, Program
 from pydefi.vm.approve_permit import (
+    APPROVE_PROXY_ABI,
+    PERMIT2_ABI,
     ApproveProxyDeposit,
     Permit2AllowanceTransferDetail,
+    Permit2PermitDetails,
+    Permit2PermitSingle,
     build_approve_proxy_execute_calldata,
+    build_permit2_permit_calldata,
     build_permit2_transfer_from_calldata,
 )
 from pydefi.vm.program import (
@@ -914,23 +920,10 @@ async def proxy_ctx(vm_fork_w3, compiled_vm, interpreter_addr):
         await w3.eth.get_transaction_receipt(tx)
 
     vm = w3.eth.contract(address=vm_address, abi=compiled_vm["abi"])
-    proxy = w3.eth.contract(address=proxy_address, abi=compiled_proxy["abi"])
+    proxy = w3.eth.contract(address=proxy_address, abi=Contract.from_abi(APPROVE_PROXY_ABI).abi)
     permit2 = w3.eth.contract(
         address=permit2_address,
-        abi=[
-            {
-                "type": "function",
-                "name": "approve",
-                "stateMutability": "nonpayable",
-                "inputs": [
-                    {"name": "token", "type": "address"},
-                    {"name": "spender", "type": "address"},
-                    {"name": "amount", "type": "uint160"},
-                    {"name": "expiration", "type": "uint48"},
-                ],
-                "outputs": [],
-            },
-        ],
+        abi=Contract.from_abi(PERMIT2_ABI).abi,
     )
 
     return {
@@ -1159,6 +1152,65 @@ class TestApproveProxyFork:
             before[3] + amount_b,
         )
 
+    async def test_permit2_permit_and_transfer_from_helpers(self, proxy_ctx):
+        """permit2_permit + permit2_transfer_from helpers emit expected call sequence."""
+        vm_address = proxy_ctx["vm_address"]
+        permit2_address = proxy_ctx["permit2_address"]
+        token_a_address = proxy_ctx["token_a_address"]
+        owner = proxy_ctx["user"]
+
+        amount = 5 * 10**18
+        permit_expiration = 2**48 - 1
+        sig_deadline = 2**256 - 1
+        nonce = 0
+        signature = b"\x11" * 65
+
+        permit_single = Permit2PermitSingle(
+            details=Permit2PermitDetails(
+                token=token_a_address,
+                amount=amount,
+                expiration=permit_expiration,
+                nonce=nonce,
+            ),
+            spender=vm_address,
+            sigDeadline=sig_deadline,
+        )
+
+        via_helpers = (
+            Program()
+            .permit2_permit(
+                permit2_address,
+                owner=owner,
+                permit_single=permit_single,
+                signature=signature,
+            )
+            .permit2_transfer_from(
+                permit2_address,
+                from_addr=owner,
+                to_addr=vm_address,
+                amount=amount,
+                token=token_a_address,
+            )
+            .build()
+        )
+
+        manual = (
+            Program()
+            .call_contract(
+                permit2_address,
+                build_permit2_permit_calldata(owner, permit_single, signature),
+            )
+            .pop()
+            .call_contract(
+                permit2_address,
+                build_permit2_transfer_from_calldata(owner, vm_address, amount, token_a_address),
+            )
+            .pop()
+            .build()
+        )
+
+        assert via_helpers == manual
+
     async def test_approve_proxy_execute_pulls_from_user_and_transfers(self, proxy_ctx):
         """ApproveProxy pulls from msg.sender and executes VM logic via vm.execute()."""
         w3 = proxy_ctx["w3"]
@@ -1217,7 +1269,10 @@ class TestApproveProxyFork:
         recipient_before = await token_a.functions.balanceOf(recipient).call()
 
         vm_program = (
-            Program().call_contract(token_a_address, ERC20.fns.transferFrom(user_a, recipient, amount).data).pop().build()
+            Program()
+            .call_contract(token_a_address, ERC20.fns.transferFrom(user_a, recipient, amount).data)
+            .pop()
+            .build()
         )
 
         with pytest.raises((ContractLogicError, Web3RPCError)):
