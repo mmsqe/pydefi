@@ -22,21 +22,17 @@ from pathlib import Path
 
 import pytest
 import solcx
-from eth_contract import Contract
 from eth_contract.erc20 import ERC20
 from web3.exceptions import ContractLogicError, Web3RPCError
 
 from pydefi.vm import Patch, Program
 from pydefi.vm.approve_permit import (
-    APPROVE_PROXY_ABI,
-    PERMIT2_ABI,
+    ApproveProxy,
     ApproveProxyDeposit,
+    Permit2,
     Permit2AllowanceTransferDetail,
     Permit2PermitDetails,
     Permit2PermitSingle,
-    build_approve_proxy_execute_calldata,
-    build_permit2_permit_calldata,
-    build_permit2_transfer_from_calldata,
 )
 from pydefi.vm.program import (
     assert_ge,
@@ -920,10 +916,10 @@ async def proxy_ctx(vm_fork_w3, compiled_vm, interpreter_addr):
         await w3.eth.get_transaction_receipt(tx)
 
     vm = w3.eth.contract(address=vm_address, abi=compiled_vm["abi"])
-    proxy = w3.eth.contract(address=proxy_address, abi=Contract.from_abi(APPROVE_PROXY_ABI).abi)
+    proxy = w3.eth.contract(address=proxy_address, abi=ApproveProxy.abi)
     permit2 = w3.eth.contract(
         address=permit2_address,
-        abi=Contract.from_abi(PERMIT2_ABI).abi,
+        abi=Permit2.abi,
     )
 
     return {
@@ -1036,7 +1032,7 @@ class TestApproveProxyFork:
                 detail.amount,
                 detail.token,
             ).pop()
-        manual.call_contract(proxy_address, build_approve_proxy_execute_calldata(vm_program, deposits)).pop()
+        manual.call_contract(proxy_address, ApproveProxy.fns.execute(vm_program, deposits).data).pop()
         manual = manual.build()
 
         assert via_helper == manual
@@ -1102,18 +1098,8 @@ class TestApproveProxyFork:
             await token_b.functions.balanceOf(recipient).call(),
         )
 
-        pull_a = build_permit2_transfer_from_calldata(
-            user,
-            vm_address,
-            amount_a,
-            token_a_address,
-        )
-        pull_b = build_permit2_transfer_from_calldata(
-            user,
-            vm_address,
-            amount_b,
-            token_b_address,
-        )
+        pull_a = Permit2.fns.transferFrom(user, vm_address, amount_a, token_a_address).data
+        pull_b = Permit2.fns.transferFrom(user, vm_address, amount_b, token_b_address).data
         deposits = [ApproveProxyDeposit(token=token_b_address, amount=0)]
 
         via_helper = (
@@ -1129,7 +1115,7 @@ class TestApproveProxyFork:
         )
 
         manual = Program().call_contract(permit2_address, pull_a).pop().call_contract(permit2_address, pull_b).pop()
-        manual.call_contract(proxy_address, build_approve_proxy_execute_calldata(vm_program, deposits)).pop()
+        manual.call_contract(proxy_address, ApproveProxy.fns.execute(vm_program, deposits).data).pop()
         manual = manual.build()
 
         assert via_helper == manual
@@ -1197,12 +1183,12 @@ class TestApproveProxyFork:
             Program()
             .call_contract(
                 permit2_address,
-                build_permit2_permit_calldata(owner, permit_single, signature),
+                Permit2.fns.permit(owner, permit_single, signature).data,
             )
             .pop()
             .call_contract(
                 permit2_address,
-                build_permit2_transfer_from_calldata(owner, vm_address, amount, token_a_address),
+                Permit2.fns.transferFrom(owner, vm_address, amount, token_a_address).data,
             )
             .pop()
             .build()
@@ -1231,7 +1217,7 @@ class TestApproveProxyFork:
 
         vm_program = Program().call_contract(token_a_address, ERC20.fns.transfer(recipient, amount).data).pop().build()
         deposits = [ApproveProxyDeposit(token=token_a_address, amount=amount)]
-        calldata = build_approve_proxy_execute_calldata(vm_program, deposits)
+        calldata = ApproveProxy.fns.execute(vm_program, deposits).data
 
         expected_tx = await proxy.functions.execute(vm_program, [(token_a_address, amount)]).build_transaction(
             {"from": user}

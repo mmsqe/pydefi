@@ -179,19 +179,19 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from eth_abi.abi import encode_with_hooks
+from hexbytes import HexBytes
 
 if TYPE_CHECKING:
     from eth_abi.hooks import EncodingContext
 
 from pydefi.vm.abi import emit_abi_encode, emit_abi_encode_packed
 from pydefi.vm.approve_permit import (
+    ApproveProxy,
     ApproveProxyDeposit,
+    Permit2,
     Permit2AllowanceTransferDetail,
     Permit2PermitRequest,
     Permit2PermitSingle,
-    build_approve_proxy_execute_calldata,
-    build_permit2_permit_calldata,
-    build_permit2_transfer_from_calldata,
 )
 from pydefi.vm.program import (
     OP_JUMPDEST,
@@ -745,7 +745,7 @@ class Program:
         for calldata in permit2_calldatas or []:
             self.call_contract(permit2, calldata, gas=gas, require_success=require_success).pop()
 
-        helper_calldata = build_approve_proxy_execute_calldata(vm_program, list(deposits or []))
+        helper_calldata = ApproveProxy.fns.execute(vm_program, list(deposits or [])).data
         return self.call_contract(
             approve_proxy,
             helper_calldata,
@@ -764,7 +764,7 @@ class Program:
         require_success: bool = True,
     ) -> "Program":
         """High-level helper for Permit2 ``permit(owner, permitSingle, signature)``."""
-        calldata = build_permit2_permit_calldata(owner, permit_single, signature)
+        calldata = Permit2.fns.permit(owner, permit_single, HexBytes(signature)).data
         return self.call_contract(
             permit2,
             calldata,
@@ -784,7 +784,7 @@ class Program:
         require_success: bool = True,
     ) -> "Program":
         """High-level helper for Permit2 ``transferFrom(from,to,amount,token)``."""
-        calldata = build_permit2_transfer_from_calldata(from_addr, to_addr, amount, token)
+        calldata = Permit2.fns.transferFrom(from_addr, to_addr, amount, token).data
         return self.call_contract(
             permit2,
             calldata,
