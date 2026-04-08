@@ -31,10 +31,13 @@ from pydefi.vm.approve_permit import (
     ApproveProxy,
     ApproveProxyDeposit,
     Permit2,
-    Permit2AllowanceTransferDetail,
     Permit2PermitDetails,
     Permit2PermitRequest,
     Permit2PermitSingle,
+    Permit2PermitTransferFrom,
+    Permit2PermitTransferFromRequest,
+    Permit2SignatureTransferDetails,
+    Permit2TokenPermissions,
 )
 from pydefi.vm.program import (
     OP_ADD,
@@ -1190,35 +1193,39 @@ class TestProxyPrimitives:
         )
         assert via_primitive == via_manual
 
-    def test_multiple_permit2_transfer_from_calls_match_manual_sequence(self):
+    def test_permit2_permit_transfer_from_matches_manual(self):
         permit2 = ADDR_A
-        details = [
-            (ADDR_A, ADDR_B, 3, ADDR_A),
-            (ADDR_B, ADDR_A, 4, ADDR_B),
-        ]
+        owner = ADDR_B
+        permit = Permit2PermitTransferFrom(
+            permitted=Permit2TokenPermissions(token=ADDR_A, amount=10**18),
+            nonce=42,
+            deadline=99999,
+        )
+        transfer_details = Permit2SignatureTransferDetails(to=ADDR_B, requestedAmount=5 * 10**17)
+        signature = bytes.fromhex("ab" * 65)
 
-        via_primitive_builder = Program()
-        for from_addr, to_addr, amount, token in details:
-            via_primitive_builder.permit2_transfer_from(
+        via_primitive = (
+            Program()
+            .permit2_permit_transfer_from(
                 permit2,
-                from_addr=from_addr,
-                to_addr=to_addr,
-                amount=amount,
-                token=token,
+                permit=permit,
+                transfer_details=transfer_details,
+                owner=owner,
+                signature=signature,
             )
-        via_primitive = via_primitive_builder.build()
+            .build()
+        )
+        from hexbytes import HexBytes
 
-        via_manual_builder = Program()
-        for from_addr, to_addr, amount, token in details:
-            via_manual_builder.call_contract_abi(
+        via_manual = (
+            Program()
+            .call_contract(
                 permit2,
-                "function transferFrom(address from, address to, uint160 amount, address token)",
-                from_addr,
-                to_addr,
-                amount,
-                token,
-            ).pop()
-        via_manual = via_manual_builder.build()
+                Permit2.fns.permitTransferFrom(permit, transfer_details, owner, HexBytes(signature)).data,
+            )
+            .pop()
+            .build()
+        )
         assert via_primitive == via_manual
 
 
@@ -1264,14 +1271,7 @@ class TestPermit2PullAndExecute:
             sigDeadline=999,
         )
         signature = bytes.fromhex("22" * 65)
-        transfers = [
-            (owner, proxy, 11, ADDR_B),
-            (owner, proxy, 12, ADDR_A),
-        ]
-        permit2_calldatas = [
-            Permit2.fns.transferFrom(from_addr, to_addr, amount, token).data
-            for from_addr, to_addr, amount, token in transfers
-        ]
+        permit2_calldatas = [b"\xaa\xbb", b"\xcc\xdd"]
         vm_program = b"\x60\x03"
 
         via_primitive = (
@@ -1296,38 +1296,39 @@ class TestPermit2PullAndExecute:
             permit_single=permit_single,
             signature=signature,
         )
-        for from_addr, to_addr, amount, token in transfers:
-            manual.permit2_transfer_from(
-                permit2,
-                from_addr=from_addr,
-                to_addr=to_addr,
-                amount=amount,
-                token=token,
-            )
+        for calldata in permit2_calldatas:
+            manual.call_contract(permit2, calldata).pop()
         helper_calldata = ApproveProxy.fns.execute(vm_program, []).data
         manual.call_contract(proxy, helper_calldata).pop()
         assert via_primitive == manual.build()
 
-    def test_permit2_pull_and_execute_transfer_details_input(self):
+    def test_permit2_pull_and_execute_permit_transfer_from_requests(self):
         permit2 = ADDR_A
         proxy = ADDR_B
         owner = ADDR_A
-        permit_single = Permit2PermitSingle(
-            details=Permit2PermitDetails(
-                token=ADDR_B,
-                amount=333,
-                expiration=444,
-                nonce=8,
+        vm_program = b"\x60\x06"
+        requests = [
+            Permit2PermitTransferFromRequest(
+                permit=Permit2PermitTransferFrom(
+                    permitted=Permit2TokenPermissions(token=ADDR_B, amount=10**18),
+                    nonce=1,
+                    deadline=9999,
+                ),
+                transfer_details=Permit2SignatureTransferDetails(to=proxy, requestedAmount=10**18),
+                owner=owner,
+                signature=bytes.fromhex("aa" * 65),
             ),
-            spender=proxy,
-            sigDeadline=1010,
-        )
-        signature = bytes.fromhex("55" * 65)
-        transfer_details = [
-            Permit2AllowanceTransferDetail(from_addr=owner, to=proxy, amount=31, token=ADDR_B),
-            Permit2AllowanceTransferDetail(from_addr=owner, to=proxy, amount=32, token=ADDR_A),
+            Permit2PermitTransferFromRequest(
+                permit=Permit2PermitTransferFrom(
+                    permitted=Permit2TokenPermissions(token=ADDR_A, amount=5 * 10**17),
+                    nonce=2,
+                    deadline=9999,
+                ),
+                transfer_details=Permit2SignatureTransferDetails(to=proxy, requestedAmount=5 * 10**17),
+                owner=owner,
+                signature=bytes.fromhex("bb" * 65),
+            ),
         ]
-        vm_program = b"\x60\x05"
 
         via_primitive = (
             Program()
@@ -1335,29 +1336,19 @@ class TestPermit2PullAndExecute:
                 permit2,
                 proxy,
                 vm_program,
-                permit=Permit2PermitRequest(
-                    owner=owner,
-                    permit_single=permit_single,
-                    signature=signature,
-                ),
-                transfer_details=transfer_details,
+                permit_transfer_from_requests=requests,
             )
             .build()
         )
 
-        manual = Program().permit2_permit(
-            permit2,
-            owner=owner,
-            permit_single=permit_single,
-            signature=signature,
-        )
-        for detail in transfer_details:
-            manual.permit2_transfer_from(
+        manual = Program()
+        for req in requests:
+            manual.permit2_permit_transfer_from(
                 permit2,
-                from_addr=detail.from_addr,
-                to_addr=detail.to,
-                amount=detail.amount,
-                token=detail.token,
+                permit=req.permit,
+                transfer_details=req.transfer_details,
+                owner=req.owner,
+                signature=req.signature,
             )
         helper_calldata = ApproveProxy.fns.execute(vm_program, []).data
         manual.call_contract(proxy, helper_calldata).pop()

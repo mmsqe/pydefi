@@ -189,9 +189,11 @@ from pydefi.vm.approve_permit import (
     ApproveProxy,
     ApproveProxyDeposit,
     Permit2,
-    Permit2AllowanceTransferDetail,
     Permit2PermitRequest,
     Permit2PermitSingle,
+    Permit2PermitTransferFrom,
+    Permit2PermitTransferFromRequest,
+    Permit2SignatureTransferDetails,
 )
 from pydefi.vm.program import (
     OP_JUMPDEST,
@@ -702,20 +704,22 @@ class Program:
         deposits: Sequence[ApproveProxyDeposit] | None = None,
         *,
         permit: Permit2PermitRequest | None = None,
-        transfer_details: Sequence[Permit2AllowanceTransferDetail] | None = None,
+        permit_transfer_from_requests: Sequence[Permit2PermitTransferFromRequest] | None = None,
         permit2_calldatas: Sequence[bytes] | None = None,
         gas: int = 0,
         require_success: bool = True,
     ) -> "Program":
         """High-level primitive: Permit2 pre-calls + ApproveProxy execution call.
 
-        You can provide Permit2 actions in either form:
+        You can provide Permit2 actions in any combination:
 
-        - high-level Permit2 inputs via ``permit`` and/or ``transfer_details``
+        - allowance-based: ``permit`` sets a Permit2 allowance for a spender
+        - signature-based: ``permit_transfer_from_requests`` for one-shot
+          ``permitTransferFrom`` pulls (no prior allowance needed)
         - raw pre-encoded calldata via ``permit2_calldatas``
 
-        Execution order: ``permit`` → ``transfer_details`` → ``permit2_calldatas``
-        → ``ApproveProxy.execute``.
+        Execution order: ``permit`` → ``permit_transfer_from_requests`` →
+        ``permit2_calldatas`` → ``ApproveProxy.execute``.
 
         Each Permit2 call is executed and its CALL success flag is consumed
         automatically. After those pre-calls, this emits a call to
@@ -731,13 +735,13 @@ class Program:
                 require_success=require_success,
             )
 
-        for detail in transfer_details or []:
-            self.permit2_transfer_from(
+        for req in permit_transfer_from_requests or []:
+            self.permit2_permit_transfer_from(
                 permit2,
-                from_addr=detail.from_addr,
-                to_addr=detail.to,
-                amount=detail.amount,
-                token=detail.token,
+                permit=req.permit,
+                transfer_details=req.transfer_details,
+                owner=req.owner,
+                signature=req.signature,
                 gas=gas,
                 require_success=require_success,
             )
@@ -772,19 +776,19 @@ class Program:
             require_success=require_success,
         ).pop()
 
-    def permit2_transfer_from(
+    def permit2_permit_transfer_from(
         self,
         permit2: str,
         *,
-        from_addr: str,
-        to_addr: str,
-        amount: int,
-        token: str,
+        permit: Permit2PermitTransferFrom,
+        transfer_details: Permit2SignatureTransferDetails,
+        owner: str,
+        signature: bytes | str,
         gas: int = 0,
         require_success: bool = True,
     ) -> "Program":
-        """High-level helper for Permit2 ``transferFrom(from,to,amount,token)``."""
-        calldata = Permit2.fns.transferFrom(from_addr, to_addr, amount, token).data
+        """High-level helper for Permit2 ``permitTransferFrom(permit, transferDetails, owner, signature)``."""
+        calldata = Permit2.fns.permitTransferFrom(permit, transfer_details, owner, HexBytes(signature)).data
         return self.call_contract(
             permit2,
             calldata,

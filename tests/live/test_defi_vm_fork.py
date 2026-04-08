@@ -30,7 +30,6 @@ from pydefi.vm.approve_permit import (
     ApproveProxy,
     ApproveProxyDeposit,
     Permit2,
-    Permit2AllowanceTransferDetail,
     Permit2PermitDetails,
     Permit2PermitSingle,
 )
@@ -994,19 +993,9 @@ class TestApproveProxyFork:
             await token_b.functions.balanceOf(recipient).call(),
         )
 
-        transfer_details = [
-            Permit2AllowanceTransferDetail(
-                from_addr=user,
-                to=vm_address,
-                amount=amount_a,
-                token=token_a_address,
-            ),
-            Permit2AllowanceTransferDetail(
-                from_addr=user,
-                to=vm_address,
-                amount=amount_b,
-                token=token_b_address,
-            ),
+        pull_calldatas = [
+            Permit2.fns.transferFrom(user, vm_address, amount_a, token_a_address).data,
+            Permit2.fns.transferFrom(user, vm_address, amount_b, token_b_address).data,
         ]
         deposits = [ApproveProxyDeposit(token=token_a_address, amount=0)]
 
@@ -1017,21 +1006,14 @@ class TestApproveProxyFork:
                 proxy_address,
                 vm_program,
                 deposits,
-                transfer_details=transfer_details,
+                permit2_calldatas=pull_calldatas,
             )
             .build()
         )
 
         manual = Program()
-        for detail in transfer_details:
-            manual.call_contract_abi(
-                permit2_address,
-                "function transferFrom(address from, address to, uint160 amount, address token)",
-                detail.from_addr,
-                detail.to,
-                detail.amount,
-                detail.token,
-            ).pop()
+        for calldata in pull_calldatas:
+            manual.call_contract(permit2_address, calldata).pop()
         manual.call_contract(proxy_address, ApproveProxy.fns.execute(vm_program, deposits).data).pop()
         manual = manual.build()
 
@@ -1137,8 +1119,8 @@ class TestApproveProxyFork:
             before[3] + amount_b,
         )
 
-    async def test_permit2_permit_and_transfer_from_helpers(self, proxy_ctx):
-        """permit2_permit + permit2_transfer_from helpers emit expected call sequence."""
+    async def test_permit2_permit_helper(self, proxy_ctx):
+        """permit2_permit helper emits expected call sequence."""
         vm_address = proxy_ctx["vm_address"]
         permit2_address = proxy_ctx["permit2_address"]
         token_a_address = proxy_ctx["token_a_address"]
@@ -1161,20 +1143,13 @@ class TestApproveProxyFork:
             sigDeadline=sig_deadline,
         )
 
-        via_helpers = (
+        via_helper = (
             Program()
             .permit2_permit(
                 permit2_address,
                 owner=owner,
                 permit_single=permit_single,
                 signature=signature,
-            )
-            .permit2_transfer_from(
-                permit2_address,
-                from_addr=owner,
-                to_addr=vm_address,
-                amount=amount,
-                token=token_a_address,
             )
             .build()
         )
@@ -1186,15 +1161,10 @@ class TestApproveProxyFork:
                 Permit2.fns.permit(owner, permit_single, signature).data,
             )
             .pop()
-            .call_contract(
-                permit2_address,
-                Permit2.fns.transferFrom(owner, vm_address, amount, token_a_address).data,
-            )
-            .pop()
             .build()
         )
 
-        assert via_helpers == manual
+        assert via_helper == manual
 
     async def test_approve_proxy_execute_pulls_from_user_and_transfers(self, proxy_ctx):
         """ApproveProxy pulls from msg.sender and executes VM logic via vm.execute()."""
