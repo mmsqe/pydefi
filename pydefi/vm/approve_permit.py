@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Annotated
 
 from eth_contract import ABIStruct, Contract
+from hexbytes import HexBytes
 
 
 class ApproveProxyDeposit(ABIStruct):
@@ -72,15 +73,6 @@ PERMIT2_ABI = (
 _PERMIT2_TEMPLATE = Contract.from_abi(PERMIT2_ABI)
 
 
-def _normalise_permit2_signature(signature: bytes | str) -> bytes:
-    """Normalise a Permit2 signature to raw bytes."""
-    if isinstance(signature, bytes):
-        return signature
-    if isinstance(signature, str):
-        return bytes.fromhex(signature.removeprefix("0x"))
-    raise TypeError(f"signature must be bytes or hex str, got {type(signature).__name__!r}")
-
-
 def build_approve_proxy_execute_calldata(
     vm_program: bytes,
     deposits: list[ApproveProxyDeposit],
@@ -99,8 +91,7 @@ def build_permit2_permit_calldata(
     signature: bytes | str,
 ) -> bytes:
     """Build calldata for Permit2 ``permit(owner, permitSingle, signature)``."""
-    sig_bytes = _normalise_permit2_signature(signature)
-    return _PERMIT2_TEMPLATE.fns.permit(owner, permit_single, sig_bytes).data
+    return _PERMIT2_TEMPLATE.fns.permit(owner, permit_single, HexBytes(signature)).data
 
 
 def build_permit2_transfer_from_calldata(
