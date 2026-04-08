@@ -189,6 +189,7 @@ from pydefi.vm.approve_permit import (
     Permit2AllowanceTransferDetail,
     Permit2PermitRequest,
     Permit2PermitSingle,
+    build_approve_proxy_execute_calldata,
     build_permit2_permit_calldata,
     build_permit2_transfer_from_calldata,
 )
@@ -699,15 +700,14 @@ class Program:
         permit2_calldatas: Sequence[bytes] | None,
         approve_proxy: str,
         vm_program: bytes,
-        deposits: list[ApproveProxyDeposit],
+        deposits: Sequence[ApproveProxyDeposit] | None = None,
         *,
         permit: Permit2PermitRequest | None = None,
         transfer_details: Sequence[Permit2AllowanceTransferDetail] | None = None,
-        value: int = 0,
         gas: int = 0,
         require_success: bool = True,
     ) -> "Program":
-        """High-level primitive: Permit2 pre-calls + inline VM program execution.
+        """High-level primitive: Permit2 pre-calls + ApproveProxy execution call.
 
         You can provide Permit2 actions in either form:
 
@@ -716,14 +716,8 @@ class Program:
           ``transfer_details``
 
         Each Permit2 call is executed and its CALL success flag is consumed
-        automatically.  After those pre-calls, ``vm_program`` is appended and
-        executed inline by the current VM run.
-
-        Note:
-            ``ApproveProxy.execute`` pulls from ``msg.sender``. When invoked
-            from inside DeFiVM, ``msg.sender`` would be the VM contract rather
-            than the end user, so nested proxy deposits are not supported in
-            this helper.
+        automatically. After those pre-calls, this emits a call to
+        ``ApproveProxy.execute(vm_program, deposits)``.
         """
         if permit is not None:
             self.permit2_permit(
@@ -748,14 +742,14 @@ class Program:
 
         for calldata in permit2_calldatas or []:
             self.call_contract(permit2, calldata, gas=gas, require_success=require_success).pop()
-        if any(dep.amount > 0 for dep in deposits):
-            raise ValueError(
-                "permit2_pull_and_execute: deposits are not supported when called inside DeFiVM; "
-                "ApproveProxy.transferFrom would see msg.sender as the VM"
-            )
-        if value != 0:
-            raise ValueError("permit2_pull_and_execute: value forwarding is not supported for inline vm_program")
-        return self._emit(vm_program)
+
+        helper_calldata = build_approve_proxy_execute_calldata(vm_program, list(deposits or []))
+        return self.call_contract(
+            approve_proxy,
+            helper_calldata,
+            gas=gas,
+            require_success=require_success,
+        ).pop()
 
     def permit2_permit(
         self,

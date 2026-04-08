@@ -27,7 +27,9 @@ from web3.exceptions import ContractLogicError, Web3RPCError
 
 from pydefi.vm import Patch, Program
 from pydefi.vm.approve_permit import (
+    ApproveProxyDeposit,
     Permit2AllowanceTransferDetail,
+    build_approve_proxy_execute_calldata,
     build_permit2_transfer_from_calldata,
 )
 from pydefi.vm.program import (
@@ -1006,17 +1008,18 @@ class TestApproveProxyFork:
         transfer_details = [
             Permit2AllowanceTransferDetail(
                 from_addr=user,
-                to=vm_address,
+                to=proxy_address,
                 amount=amount_a,
                 token=token_a_address,
             ),
             Permit2AllowanceTransferDetail(
                 from_addr=user,
-                to=vm_address,
+                to=proxy_address,
                 amount=amount_b,
                 token=token_b_address,
             ),
         ]
+        deposits = [ApproveProxyDeposit(token=token_a_address, amount=0)]
 
         via_helper = (
             Program()
@@ -1025,7 +1028,7 @@ class TestApproveProxyFork:
                 permit2_calldatas=None,
                 approve_proxy=proxy_address,
                 vm_program=vm_program,
-                deposits=[],
+                deposits=deposits,
                 transfer_details=transfer_details,
             )
             .build()
@@ -1041,7 +1044,8 @@ class TestApproveProxyFork:
                 detail.amount,
                 detail.token,
             ).pop()
-        manual = manual.build() + vm_program
+        manual.call_contract(proxy_address, build_approve_proxy_execute_calldata(vm_program, deposits)).pop()
+        manual = manual.build()
 
         assert via_helper == manual
 
@@ -1108,16 +1112,17 @@ class TestApproveProxyFork:
 
         pull_a = build_permit2_transfer_from_calldata(
             user,
-            vm_address,
+            proxy_address,
             amount_a,
             token_a_address,
         )
         pull_b = build_permit2_transfer_from_calldata(
             user,
-            vm_address,
+            proxy_address,
             amount_b,
             token_b_address,
         )
+        deposits = [ApproveProxyDeposit(token=token_b_address, amount=0)]
 
         via_helper = (
             Program()
@@ -1126,15 +1131,14 @@ class TestApproveProxyFork:
                 permit2_calldatas=[pull_a, pull_b],
                 approve_proxy=proxy_address,
                 vm_program=vm_program,
-                deposits=[],
+                deposits=deposits,
             )
             .build()
         )
 
-        manual = (
-            Program().call_contract(permit2_address, pull_a).pop().call_contract(permit2_address, pull_b).pop().build()
-        )
-        manual = manual + vm_program
+        manual = Program().call_contract(permit2_address, pull_a).pop().call_contract(permit2_address, pull_b).pop()
+        manual.call_contract(proxy_address, build_approve_proxy_execute_calldata(vm_program, deposits)).pop()
+        manual = manual.build()
 
         assert via_helper == manual
 
@@ -1154,6 +1158,43 @@ class TestApproveProxyFork:
             before[2] + amount_a,
             before[3] + amount_b,
         )
+
+    async def test_approve_proxy_execute_pulls_from_user_and_transfers(self, proxy_ctx):
+        """ApproveProxy pulls from msg.sender and executes VM logic via delegatecall."""
+        w3 = proxy_ctx["w3"]
+        proxy = proxy_ctx["proxy"]
+        proxy_address = proxy_ctx["proxy_address"]
+        token_a = proxy_ctx["token_a"]
+        token_a_address = proxy_ctx["token_a_address"]
+        user = proxy_ctx["user"]
+        recipient = proxy_ctx["recipient"]
+
+        amount = 11 * 10**18
+
+        tx = await token_a.functions.approve(proxy_address, amount).transact({"from": user})
+        await w3.eth.get_transaction_receipt(tx)
+
+        user_before = await token_a.functions.balanceOf(user).call()
+        recipient_before = await token_a.functions.balanceOf(recipient).call()
+        proxy_before = await token_a.functions.balanceOf(proxy_address).call()
+
+        vm_program = Program().call_contract(token_a_address, ERC20.fns.transfer(recipient, amount).data).pop().build()
+        deposits = [ApproveProxyDeposit(token=token_a_address, amount=amount)]
+        calldata = build_approve_proxy_execute_calldata(vm_program, deposits)
+
+        expected_tx = await proxy.functions.execute(vm_program, [(token_a_address, amount)]).build_transaction(
+            {"from": user}
+        )
+        tx = await proxy.functions.execute(vm_program, [(token_a_address, amount)]).transact({"from": user})
+        receipt = await w3.eth.get_transaction_receipt(tx)
+        assert receipt["status"] == 1
+
+        assert await token_a.functions.balanceOf(user).call() == user_before - amount
+        assert await token_a.functions.balanceOf(recipient).call() == recipient_before + amount
+        assert await token_a.functions.balanceOf(proxy_address).call() == proxy_before
+
+        # Sanity: proxy calldata builder stays in sync with contract ABI shape.
+        assert calldata == bytes.fromhex(expected_tx["data"].removeprefix("0x"))
 
     async def test_single_deposit_and_transfer(self, proxy_ctx):
         """Proxy deposits one token into DeFiVM; program transfers it to recipient."""
@@ -1279,14 +1320,16 @@ class TestApproveProxyFork:
         assert stored_vm.lower() == vm_address.lower()
 
     async def test_eth_forwarding(self, proxy_ctx):
-        """ETH sent to proxy.execute() is forwarded to DeFiVM."""
+        """ETH sent to proxy.execute() remains on proxy under delegatecall semantics."""
         w3 = proxy_ctx["w3"]
         proxy = proxy_ctx["proxy"]
+        proxy_address = proxy_ctx["proxy_address"]
         vm_address = proxy_ctx["vm_address"]
         user = proxy_ctx["user"]
 
         ETH_VALUE = 10**16  # 0.01 ETH
 
+        proxy_balance_before = await w3.eth.get_balance(proxy_address)
         vm_balance_before = await w3.eth.get_balance(vm_address)
 
         program = push_u256(0) + pop()
@@ -1294,5 +1337,7 @@ class TestApproveProxyFork:
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
+        proxy_balance_after = await w3.eth.get_balance(proxy_address)
         vm_balance_after = await w3.eth.get_balance(vm_address)
-        assert vm_balance_after - vm_balance_before == ETH_VALUE
+        assert proxy_balance_after - proxy_balance_before == ETH_VALUE
+        assert vm_balance_after == vm_balance_before

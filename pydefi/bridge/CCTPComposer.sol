@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "../vm/IDeFiVM.sol";
+
 /**
  * @title CCTPComposer
  * @notice Circle CCTP v2 compose receiver that mints USDC via CCTP v2 and then
@@ -80,15 +82,6 @@ pragma solidity ^0.8.24;
  *
  *   program = store_reg(0) + store_reg(1) + ...
  */
-
-// ---------------------------------------------------------------------------
-// IDeFiVM
-// ---------------------------------------------------------------------------
-
-/// @notice Minimal interface for calling DeFiVM.execute.
-interface IDeFiVM {
-    function execute(bytes calldata program) external payable;
-}
 
 // ---------------------------------------------------------------------------
 // CCTPComposer

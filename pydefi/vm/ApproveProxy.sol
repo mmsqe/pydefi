@@ -1,45 +1,31 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-interface IERC20 {
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-}
-
-interface IDeFiVM {
-    function execute(bytes calldata program) external payable;
-}
-
 /**
  * @title ApproveProxy
- * @notice A proxy entry-point that lets users safely grant ERC-20 token
- *         allowances for DeFiVM programs without the security risks of
- *         approving the permissionless DeFiVM executor directly.
+ * @notice User-facing entrypoint for deposit pull + DeFiVM execution.
  *
  * Problem
  * -------
  * ``DeFiVM.execute()`` is permissionless — any caller can run any program.
- * Approving tokens directly to DeFiVM means *any* ``execute()`` call can
- * drain those approvals.
+ * For calls executed from inside ``DeFiVM``, downstream contracts observe
+ * ``msg.sender == vm``.  That breaks user-origin assumptions for input-pull
+ * patterns that rely on ``transferFrom(msg.sender, ...)``.
  *
  * Solution
  * --------
- * Users approve ERC-20 tokens to *this* proxy and invoke DeFiVM programs
- * through ``ApproveProxy.execute()`` instead of ``DeFiVM.execute()``.  The
- * proxy pulls the declared token deposits from the caller into DeFiVM *before*
- * forwarding the program.  Programs then operate on tokens already held by
- * DeFiVM — no in-program ``transferFrom`` back-channel is required.
- *
- * Because the proxy only calls ``token.transferFrom(msg.sender, vm, amount)``
- * (user → VM, caller-controlled), there is no shared mutable state and no
- * reentrancy risk.
+ * Users approve tokens to this proxy and call ``ApproveProxy.execute()``.
+ * The proxy pulls deposits from ``msg.sender`` into itself and then
+ * DELEGATECALLs into the paired DeFiVM contract using ``execute(bytes)``.
+ * VM bytecode runs in the proxy context, preserving user-origin input pull.
  *
  * Usage
  * -----
  * 1. User: ``token.approve(approveProxy, amount)``  — once per token/session.
- * 2. User: ``approveProxy.execute{value: v}(program, deposits)``
- *           where ``deposits`` lists the tokens and amounts to pull into DeFiVM.
- * 3. DeFiVM program operates on the deposited tokens (e.g. calls
- *    ``token.transfer(recipient, amount)`` from the VM's balance).
+ * 2. User: ``approveProxy.execute{value: v}(program, deposits)`` where
+ *    ``deposits`` lists tokens and amounts to pull from the caller.
+ * 3. Program executes via DELEGATECALL to DeFiVM logic and spends tokens
+ *    held by the proxy during that transaction.
  */
 contract ApproveProxy {
     error DepositFailed();
@@ -48,7 +34,7 @@ contract ApproveProxy {
     address public immutable vm;
 
     /// @notice A single ERC-20 token deposit: token address + amount to pull
-    ///         from the caller into DeFiVM before executing the program.
+    ///         from the caller into proxy before executing the program.
     struct Deposit {
         address token;
         uint256 amount;
@@ -61,26 +47,40 @@ contract ApproveProxy {
     }
 
     /**
-     * @notice Deposit ERC-20 tokens into DeFiVM and then execute a program.
+     * @notice Pull caller deposits into proxy and execute VM program via delegatecall.
      *
      * For each entry in ``deposits``, this function calls
-     * ``token.transferFrom(msg.sender, vm, amount)``, moving the tokens from
-     * the caller directly into the paired DeFiVM contract.  It then forwards
-     * the program (and any ETH) to ``DeFiVM.execute()``.
+     * ``token.transferFrom(msg.sender, address(this), amount)``. It then
+     * delegates ``execute(bytes)`` into the paired DeFiVM contract so VM logic
+     * runs in the proxy context.
      *
-     * @param program  Raw EVM bytecode to execute (forwarded to DeFiVM).
-     * @param deposits List of ERC-20 tokens and amounts to deposit into DeFiVM
-     *                 before program execution.  May be empty.
+     * @param program  Raw VM bytecode to execute.
+     * @param deposits List of ERC-20 tokens and amounts to pull into proxy
+     *                 before program execution. May be empty.
      */
     function execute(bytes calldata program, Deposit[] calldata deposits) external payable {
-        address vmAddr = vm;
-        IDeFiVM _vm = IDeFiVM(vmAddr);
         for (uint256 i = 0; i < deposits.length; i++) {
             uint256 amount = deposits[i].amount;
             if (amount == 0) continue;
-            _safeTransferFrom(deposits[i].token, msg.sender, vmAddr, amount);
+            _safeTransferFrom(deposits[i].token, msg.sender, address(this), amount);
         }
-        _vm.execute{value: msg.value}(program);
+        _delegateToVm(abi.encodeWithSignature("execute(bytes)", program));
+    }
+
+    /// @notice Delegate unknown selectors to VM fallback (e.g. DEX callbacks).
+    fallback() external payable {
+        _delegateToVm(msg.data);
+    }
+
+    receive() external payable {}
+
+    function _delegateToVm(bytes memory data) internal {
+        (bool ok, bytes memory ret) = vm.delegatecall(data);
+        if (!ok) {
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
     }
 
     /**

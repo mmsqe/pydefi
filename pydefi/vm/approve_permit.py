@@ -69,14 +69,6 @@ _PERMIT2_ABI = (
 _PERMIT2_TEMPLATE = Contract.from_abi(_PERMIT2_ABI)
 
 
-def merge_deposits_by_token(deposits: list[ApproveProxyDeposit]) -> list[ApproveProxyDeposit]:
-    """Validate and merge duplicate token entries while preserving order."""
-    merged: dict[str, int] = {}
-    for token, amount in deposits:
-        merged[token] = merged.get(token, 0) + amount
-    return [ApproveProxyDeposit(token=token, amount=amount) for token, amount in merged.items() if amount > 0]
-
-
 def _normalise_permit2_signature(signature: bytes | str) -> bytes:
     """Normalise a Permit2 signature to raw bytes."""
     if isinstance(signature, bytes):
@@ -91,7 +83,11 @@ def build_approve_proxy_execute_calldata(
     deposits: list[ApproveProxyDeposit],
 ) -> bytes:
     """Build calldata for ``ApproveProxy.execute(program, deposits)``."""
-    return _APPROVE_PROXY_TEMPLATE.fns.execute(vm_program, merge_deposits_by_token(deposits)).data
+    merged: dict[str, int] = {}
+    for token, amount in deposits:
+        merged[token] = merged.get(token, 0) + amount
+    compact = [ApproveProxyDeposit(token=token, amount=amount) for token, amount in merged.items() if amount > 0]
+    return _APPROVE_PROXY_TEMPLATE.fns.execute(vm_program, compact).data
 
 
 def build_permit2_permit_calldata(
