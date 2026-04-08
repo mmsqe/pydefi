@@ -1008,13 +1008,13 @@ class TestApproveProxyFork:
         transfer_details = [
             Permit2AllowanceTransferDetail(
                 from_addr=user,
-                to=proxy_address,
+                to=vm_address,
                 amount=amount_a,
                 token=token_a_address,
             ),
             Permit2AllowanceTransferDetail(
                 from_addr=user,
-                to=proxy_address,
+                to=vm_address,
                 amount=amount_b,
                 token=token_b_address,
             ),
@@ -1112,13 +1112,13 @@ class TestApproveProxyFork:
 
         pull_a = build_permit2_transfer_from_calldata(
             user,
-            proxy_address,
+            vm_address,
             amount_a,
             token_a_address,
         )
         pull_b = build_permit2_transfer_from_calldata(
             user,
-            proxy_address,
+            vm_address,
             amount_b,
             token_b_address,
         )
@@ -1160,7 +1160,7 @@ class TestApproveProxyFork:
         )
 
     async def test_approve_proxy_execute_pulls_from_user_and_transfers(self, proxy_ctx):
-        """ApproveProxy pulls from msg.sender and executes VM logic via delegatecall."""
+        """ApproveProxy pulls from msg.sender and executes VM logic via vm.execute()."""
         w3 = proxy_ctx["w3"]
         proxy = proxy_ctx["proxy"]
         proxy_address = proxy_ctx["proxy_address"]
@@ -1195,6 +1195,36 @@ class TestApproveProxyFork:
 
         # Sanity: proxy calldata builder stays in sync with contract ABI shape.
         assert calldata == bytes.fromhex(expected_tx["data"].removeprefix("0x"))
+
+    async def test_cross_user_proxy_approval_spend_reverts(self, proxy_ctx):
+        w3 = proxy_ctx["w3"]
+        proxy = proxy_ctx["proxy"]
+        proxy_address = proxy_ctx["proxy_address"]
+        token_a = proxy_ctx["token_a"]
+        token_a_address = proxy_ctx["token_a_address"]
+        user_a = proxy_ctx["user"]
+        recipient = proxy_ctx["recipient"]
+
+        accounts = await w3.eth.accounts
+        user_b = accounts[3]
+        assert user_b.lower() != user_a.lower()
+
+        amount = 7 * 10**18
+        tx = await token_a.functions.approve(proxy_address, amount).transact({"from": user_a})
+        await w3.eth.get_transaction_receipt(tx)
+
+        user_before = await token_a.functions.balanceOf(user_a).call()
+        recipient_before = await token_a.functions.balanceOf(recipient).call()
+
+        vm_program = (
+            Program().call_contract(token_a_address, ERC20.fns.transferFrom(user_a, recipient, amount).data).pop().build()
+        )
+
+        with pytest.raises((ContractLogicError, Web3RPCError)):
+            await proxy.functions.execute(vm_program, []).transact({"from": user_b})
+
+        assert await token_a.functions.balanceOf(user_a).call() == user_before
+        assert await token_a.functions.balanceOf(recipient).call() == recipient_before
 
     async def test_single_deposit_and_transfer(self, proxy_ctx):
         """Proxy deposits one token into DeFiVM; program transfers it to recipient."""
@@ -1320,7 +1350,7 @@ class TestApproveProxyFork:
         assert stored_vm.lower() == vm_address.lower()
 
     async def test_eth_forwarding(self, proxy_ctx):
-        """ETH sent to proxy.execute() remains on proxy under delegatecall semantics."""
+        """ETH sent to proxy.execute() is forwarded to VM under call semantics."""
         w3 = proxy_ctx["w3"]
         proxy = proxy_ctx["proxy"]
         proxy_address = proxy_ctx["proxy_address"]
@@ -1339,5 +1369,5 @@ class TestApproveProxyFork:
 
         proxy_balance_after = await w3.eth.get_balance(proxy_address)
         vm_balance_after = await w3.eth.get_balance(vm_address)
-        assert proxy_balance_after - proxy_balance_before == ETH_VALUE
-        assert vm_balance_after == vm_balance_before
+        assert proxy_balance_after == proxy_balance_before
+        assert vm_balance_after - vm_balance_before == ETH_VALUE
