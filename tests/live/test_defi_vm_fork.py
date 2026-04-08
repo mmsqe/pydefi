@@ -1017,11 +1017,10 @@ class TestApproveProxyFork:
         via_helper = (
             Program()
             .permit2_pull_and_execute(
-                permit2=permit2_address,
-                permit2_calldatas=None,
-                approve_proxy=proxy_address,
-                vm_program=vm_program,
-                deposits=deposits,
+                permit2_address,
+                proxy_address,
+                vm_program,
+                deposits,
                 transfer_details=transfer_details,
             )
             .build()
@@ -1120,11 +1119,11 @@ class TestApproveProxyFork:
         via_helper = (
             Program()
             .permit2_pull_and_execute(
-                permit2=permit2_address,
+                permit2_address,
+                proxy_address,
+                vm_program,
+                deposits,
                 permit2_calldatas=[pull_a, pull_b],
-                approve_proxy=proxy_address,
-                vm_program=vm_program,
-                deposits=deposits,
             )
             .build()
         )

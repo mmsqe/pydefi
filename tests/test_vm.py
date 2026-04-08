@@ -1269,9 +1269,9 @@ class TestPermit2PullAndExecute:
             Program()
             .permit2_pull_and_execute(
                 permit2,
-                permit2_calldatas,
                 proxy,
                 vm_program,
+                permit2_calldatas=permit2_calldatas,
             )
             .build()
         )
@@ -1312,7 +1312,6 @@ class TestPermit2PullAndExecute:
             Program()
             .permit2_pull_and_execute(
                 permit2,
-                permit2_calldatas,
                 proxy,
                 vm_program,
                 permit=Permit2PermitRequest(
@@ -1320,6 +1319,7 @@ class TestPermit2PullAndExecute:
                     permit_single=permit_single,
                     signature=signature,
                 ),
+                permit2_calldatas=permit2_calldatas,
             )
             .build()
         )
@@ -1367,7 +1367,6 @@ class TestPermit2PullAndExecute:
             Program()
             .permit2_pull_and_execute(
                 permit2,
-                None,
                 proxy,
                 vm_program,
                 permit=Permit2PermitRequest(

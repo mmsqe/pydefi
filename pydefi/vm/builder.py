@@ -697,13 +697,13 @@ class Program:
     def permit2_pull_and_execute(
         self,
         permit2: str,
-        permit2_calldatas: Sequence[bytes] | None,
         approve_proxy: str,
         vm_program: bytes,
         deposits: Sequence[ApproveProxyDeposit] | None = None,
         *,
         permit: Permit2PermitRequest | None = None,
         transfer_details: Sequence[Permit2AllowanceTransferDetail] | None = None,
+        permit2_calldatas: Sequence[bytes] | None = None,
         gas: int = 0,
         require_success: bool = True,
     ) -> "Program":
@@ -711,9 +711,11 @@ class Program:
 
         You can provide Permit2 actions in either form:
 
+        - high-level Permit2 inputs via ``permit`` and/or ``transfer_details``
         - raw pre-encoded calldata via ``permit2_calldatas``
-        - high-level Permit2 inputs via ``permit`` and/or
-          ``transfer_details``
+
+        Execution order: ``permit`` → ``transfer_details`` → ``permit2_calldatas``
+        → ``ApproveProxy.execute``.
 
         Each Permit2 call is executed and its CALL success flag is consumed
         automatically. After those pre-calls, this emits a call to
