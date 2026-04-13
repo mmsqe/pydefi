@@ -24,13 +24,12 @@ from __future__ import annotations
 import struct
 
 import pytest
+from hexbytes import HexBytes
 
-from pydefi.vm import Program
-from pydefi.vm.abi import emit_abi_encode, emit_abi_encode_packed
-from pydefi.vm.approve_permit import (
-    ApproveProxy,
+from pydefi.abi.approve_permit import (
+    APPROVE_PROXY,
+    PERMIT2,
     ApproveProxyDeposit,
-    Permit2,
     Permit2PermitDetails,
     Permit2PermitRequest,
     Permit2PermitSingle,
@@ -39,6 +38,8 @@ from pydefi.vm.approve_permit import (
     Permit2SignatureTransferDetails,
     Permit2TokenPermissions,
 )
+from pydefi.vm import Program
+from pydefi.vm.abi import emit_abi_encode, emit_abi_encode_packed
 from pydefi.vm.program import (
     OP_ADD,
     OP_AND,
@@ -1136,7 +1137,7 @@ class TestProxyPrimitives:
             Program()
             .call_contract(
                 proxy,
-                ApproveProxy.fns.execute(vm_program, deposits).data,
+                APPROVE_PROXY.fns.execute(vm_program, deposits).data,
             )
             .pop()
             .build()
@@ -1215,13 +1216,11 @@ class TestProxyPrimitives:
             )
             .build()
         )
-        from hexbytes import HexBytes
-
         via_manual = (
             Program()
             .call_contract(
                 permit2,
-                Permit2.fns.permitTransferFrom(permit, transfer_details, owner, HexBytes(signature)).data,
+                PERMIT2.fns.permitTransferFrom(permit, transfer_details, owner, HexBytes(signature)).data,
             )
             .pop()
             .build()

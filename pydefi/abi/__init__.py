@@ -5,6 +5,7 @@ Import Contract objects and ABIStruct classes from the sub-modules::
 
     from pydefi.abi.amm import UNISWAP_V2_ROUTER, UNISWAP_V3_ROUTER
     from pydefi.abi.bridge import CCTP_TOKEN_MESSENGER_V2, LAYERZERO_OFT
+    from pydefi.abi.approve_permit import APPROVE_PROXY, PERMIT2
 """
 
 from pydefi.abi.amm import (
@@ -23,6 +24,18 @@ from pydefi.abi.amm import (
     QuoteExactInputSingleParams,
     QuoteExactOutputSingleParams,
 )
+from pydefi.abi.approve_permit import (
+    APPROVE_PROXY,
+    PERMIT2,
+    ApproveProxyDeposit,
+    Permit2PermitDetails,
+    Permit2PermitRequest,
+    Permit2PermitSingle,
+    Permit2PermitTransferFrom,
+    Permit2PermitTransferFromRequest,
+    Permit2SignatureTransferDetails,
+    Permit2TokenPermissions,
+)
 from pydefi.abi.bridge import (
     ACROSS_SPOKE_POOL,
     CCTP_TOKEN_MESSENGER_V2,
@@ -39,6 +52,17 @@ from pydefi.abi.bridge import (
 )
 
 __all__ = [
+    # approve_permit
+    "APPROVE_PROXY",
+    "ApproveProxyDeposit",
+    "PERMIT2",
+    "Permit2PermitDetails",
+    "Permit2PermitRequest",
+    "Permit2PermitSingle",
+    "Permit2PermitTransferFrom",
+    "Permit2PermitTransferFromRequest",
+    "Permit2SignatureTransferDetails",
+    "Permit2TokenPermissions",
     # amm
     "CURVE_POOL",
     "CURVE_REGISTRY",

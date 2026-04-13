@@ -184,15 +184,15 @@ from hexbytes import HexBytes
 if TYPE_CHECKING:
     from eth_abi.hooks import EncodingContext
 
-from pydefi.vm.abi import emit_abi_encode, emit_abi_encode_packed
-from pydefi.vm.approve_permit import (
-    Permit2,
+from pydefi.abi.approve_permit import (
+    PERMIT2,
     Permit2PermitRequest,
     Permit2PermitSingle,
     Permit2PermitTransferFrom,
     Permit2PermitTransferFromRequest,
     Permit2SignatureTransferDetails,
 )
+from pydefi.vm.abi import emit_abi_encode, emit_abi_encode_packed
 from pydefi.vm.program import (
     OP_JUMPDEST,
     add,
@@ -719,7 +719,7 @@ class Program:
 
         Each call's success flag is consumed automatically.  Returns ``self``
         so the caller can chain any subsequent call (e.g.
-        ``ApproveProxy.execute``) independently.
+        ``APPROVE_PROXY.fns.execute(...)``) independently.
         """
         if permit is not None:
             self.permit2_permit(
@@ -758,7 +758,7 @@ class Program:
         require_success: bool = True,
     ) -> "Program":
         """High-level helper for Permit2 ``permit(owner, permitSingle, signature)``."""
-        calldata = Permit2.fns.permit(owner, permit_single, HexBytes(signature)).data
+        calldata = PERMIT2.fns.permit(owner, permit_single, HexBytes(signature)).data
         return self.call_contract(
             permit2,
             calldata,
@@ -778,7 +778,7 @@ class Program:
         require_success: bool = True,
     ) -> "Program":
         """High-level helper for Permit2 ``permitTransferFrom(permit, transferDetails, owner, signature)``."""
-        calldata = Permit2.fns.permitTransferFrom(permit, transfer_details, owner, HexBytes(signature)).data
+        calldata = PERMIT2.fns.permitTransferFrom(permit, transfer_details, owner, HexBytes(signature)).data
         return self.call_contract(
             permit2,
             calldata,

@@ -1,5 +1,5 @@
 """
-Structs and contract template objects for ApproveProxy and Permit2.
+ABI definitions for ApproveProxy and Permit2 flows.
 """
 
 from __future__ import annotations
@@ -75,13 +75,15 @@ class Permit2PermitTransferFromRequest:
     signature: bytes | str
 
 
-_APPROVE_PROXY_ABI = ApproveProxyDeposit.human_readable_abi() + [
-    "function execute(bytes program, ApproveProxyDeposit[] deposits) payable",
-    "function vm() view returns (address)",
-]
-ApproveProxy = Contract.from_abi(_APPROVE_PROXY_ABI)
+APPROVE_PROXY = Contract.from_abi(
+    ApproveProxyDeposit.human_readable_abi()
+    + [
+        "function execute(bytes program, ApproveProxyDeposit[] deposits) payable",
+        "function vm() view returns (address)",
+    ]
+)
 
-_PERMIT2_ABI = (
+PERMIT2 = Contract.from_abi(
     Permit2PermitSingle.human_readable_abi()
     + Permit2PermitTransferFrom.human_readable_abi()
     + Permit2SignatureTransferDetails.human_readable_abi()
@@ -93,4 +95,3 @@ _PERMIT2_ABI = (
         "function permitTransferFrom(Permit2PermitTransferFrom permit, Permit2SignatureTransferDetails transferDetails, address owner, bytes signature)",
     ]
 )
-Permit2 = Contract.from_abi(_PERMIT2_ABI)
