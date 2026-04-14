@@ -221,16 +221,20 @@ class TestRouterLive:
         with pytest.raises(NoRouteFoundError):
             router.find_best_route(amount_in, USDC)
 
-    async def test_route_fee_in_correct_units(self, eth_w3):
-        """SwapStep.fee from router should be in hundredths of a basis-point."""
+    async def test_v2_route_fee_in_correct_units(self, eth_w3):
+        """SwapStep.fee for a V2 pool should be in basis points (base 10000).
+
+        The standard Uniswap V2 pool has fee_bps=30 (0.3%). PoolEdge.fee returns
+        fee_bps directly, so SwapStep.fee is always in bps regardless of protocol.
+        """
         g = await self._build_v2_graph(eth_w3)
         router = Router(g)
         amount_in = TokenAmount.from_human(WETH, "1")
         route = router.find_best_route(amount_in, USDC)
 
-        # Uniswap V2 is 30 bps; in hundredths of a bp that is 3000
+        # V2 fee_bps=30 (0.3%)
         for step in route.steps:
-            assert step.fee == 3000, f"Expected fee=3000 (30 bps in hundredths), got fee={step.fee}"
+            assert step.fee == 30, f"Expected V2 fee=30 (0.3% in bps), got fee={step.fee}"
 
 
 @pytest.mark.live
@@ -283,6 +287,21 @@ class TestRouterV3Live:
         assert 500 * 10**18 < route.amount_out.amount < 10_000 * 10**18, (
             f"WETH→DAI (V3) out of expected range: {route.amount_out.human_amount} DAI"
         )
+
+    async def test_v3_route_fee_in_correct_units(self, eth_w3):
+        """SwapStep.fee for a V3 pool should be in basis points (base 10000).
+
+        fee_tier=500 (0.05%) is stored as fee_bps=5 (fee_tier // 100).
+        PoolEdge.fee returns fee_bps directly, so SwapStep.fee is always in bps.
+        """
+        g = await self._build_v3_graph(eth_w3)
+        router = Router(g)
+        amount_in = TokenAmount.from_human(WETH, "1")
+        route = router.find_best_route(amount_in, USDC)
+
+        # POOL_V3_WETH_USDC_500 has fee_tier=500 (0.05%); fee_bps=5
+        assert len(route.steps) == 1
+        assert route.steps[0].fee == 5, f"Expected V3 fee=5 (0.05% in bps), got fee={route.steps[0].fee}"
 
     async def test_mixed_v2_v3_graph(self, eth_w3):
         """Router should pick the best route across a mixed V2/V3 graph."""
