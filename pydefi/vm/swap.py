@@ -73,7 +73,7 @@ from enum import Enum
 from eth_abi import encode
 from eth_contract.contract import ContractFunction
 
-from pydefi.types import RouteDAG
+from pydefi.types import Address, RouteDAG
 from pydefi.vm.builder import Patch, Program
 from pydefi.vm.program import (
     _SWAP2,
@@ -126,7 +126,7 @@ V2_AMOUNT_OUT_OFFSET: int = 96
 # ---------------------------------------------------------------------------
 
 
-def encode_v3_callback_data(token_in: str) -> bytes:
+def encode_v3_callback_data(token_in: Address) -> bytes:
     """Encode the ``data`` field for a V3-style flash-swap callback.
 
     The DeFiVM fallback handler expects ``abi.encode(address tokenIn)`` in the
@@ -142,7 +142,7 @@ def encode_v3_callback_data(token_in: str) -> bytes:
     return encode(["address"], [token_in])
 
 
-def encode_v2_callback_data(token_in: str, amount_owed: int) -> bytes:
+def encode_v2_callback_data(token_in: Address, amount_owed: int) -> bytes:
     """Encode the ``data`` field for a V2-style flash-swap callback.
 
     The DeFiVM fallback handler expects ``abi.encode(address tokenIn,
@@ -165,11 +165,11 @@ def encode_v2_callback_data(token_in: str, amount_owed: int) -> bytes:
 
 
 def v3_pool_swap_calldata(
-    recipient: str,
+    recipient: Address,
     zero_for_one: bool,
     amount_in: int,
     sqrt_price_limit_x96: int,
-    token_in: str,
+    token_in: Address,
 ) -> bytes:
     """Build calldata for a direct ``pool.swap()`` call (Uniswap V3 pool).
 
@@ -195,7 +195,7 @@ def v3_pool_swap_calldata(
     return _V3_POOL_SWAP_FN(recipient, zero_for_one, amount_in, sqrt_price_limit_x96, callback_data).data
 
 
-def encode_v3_path(tokens: list[str], fees: list[int]) -> bytes:
+def encode_v3_path(tokens: list[Address], fees: list[int]) -> bytes:
     """Encode a V3 multi-hop path as ABI-packed bytes.
 
     Args:
@@ -210,10 +210,10 @@ def encode_v3_path(tokens: list[str], fees: list[int]) -> bytes:
     """
     if len(fees) != len(tokens) - 1:
         raise ValueError(f"encode_v3_path: len(fees) ({len(fees)}) must equal len(tokens)-1 ({len(tokens) - 1})")
-    result = bytes.fromhex(tokens[0].removeprefix("0x").zfill(40))
+    result = tokens[0]
     for fee, token in zip(fees, tokens[1:]):
         result += fee.to_bytes(3, "big")
-        result += bytes.fromhex(token.removeprefix("0x").zfill(40))
+        result += token
     return result
 
 
@@ -278,13 +278,13 @@ class SwapHop:
     """
 
     protocol: SwapProtocol
-    pool: str
-    token_in: str
-    token_out: str
+    pool: Address
+    token_in: Address
+    token_out: Address
     fee: int
     amount_in: int
     amount_out_min: int
-    recipient: str
+    recipient: Address
     zero_for_one: bool
     sqrt_price_limit_x96: int = field(default=0)
 
@@ -754,15 +754,16 @@ def build_split_program(
 # ---------------------------------------------------------------------------
 
 
-def check_min_balance(token: str, account: str, min_amount: int) -> Program:
+def check_min_balance(token: Address, account: Address, min_amount: int) -> Program:
     """Return a Program snippet that reverts if ``balanceOf(token, account) < min_amount``.
 
     Useful as a post-swap safety guard to verify the output landed in the
     expected account.
 
     Args:
-        token: ERC-20 token address.
-        account: Account whose balance to check.
+        token: ERC-20 token address as :class:`~hexbytes.HexBytes` (``Address``).
+        account: Account whose balance to check as :class:`~hexbytes.HexBytes`
+            (``Address``).
         min_amount: Minimum required balance.
 
     Returns:
