@@ -173,7 +173,7 @@ from __future__ import annotations
 
 import struct
 from copy import deepcopy
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from eth_abi.abi import encode_with_hooks
 
@@ -440,6 +440,48 @@ class Program:
         kind = self._venom_plan.get("kind")
         return str(kind) if kind is not None else None
 
+    def _build_venom_plan(self) -> bytes | None:
+        """Compile the pending Venom plan via the Venom backend; return None for unknown kinds."""
+        plan = self._venom_plan
+        if plan is None:
+            return None
+        kind = plan.get("kind")
+        to = cast(Address, plan["to"])
+        calldata = cast(bytes, plan["calldata"])
+        value = cast(int, plan["value"])
+        gas = cast(int, plan["gas"])
+        require_success = cast(bool, plan["require_success"])
+        return_success = not bool(plan.get("drop_result"))
+        if kind == "call_contract":
+            return compile_venom_call_contract_probe(
+                to,
+                calldata,
+                value=value,
+                gas=gas,
+                require_success=require_success,
+                return_success=return_success,
+            )
+        if kind == "call_with_patches":
+            return compile_venom_call_with_patches_probe(
+                to,
+                calldata,
+                patches=cast(list[tuple[int, int]], plan["patches"]),
+                patch_values=cast(list[int], plan["patch_values"]),
+                value=value,
+                gas=gas,
+                require_success=require_success,
+                return_success=return_success,
+            )
+        return None
+
+    def _emit_call_tail(self, to: Address, value: int, gas: int, require_success: bool, drop_result: bool) -> None:
+        self._buf.extend(push_u256(value))
+        self._buf.extend(push_addr(to))
+        self._buf.extend(gas_opcode() if gas == 0 else push_u256(gas))
+        self._buf.extend(call(require_success))
+        if drop_result:
+            self._buf.extend(pop())
+
     def _materialize_plan_to_manual(self) -> None:
         self._materialize_prefix_stack_to_manual()
         if self._venom_plan is None:
@@ -447,29 +489,21 @@ class Program:
         plan = self._venom_plan
         self._venom_plan = None
         kind = plan.get("kind")
+        to = cast(Address, plan["to"])
+        value = cast(int, plan["value"])
+        gas = cast(int, plan["gas"])
+        require_success = cast(bool, plan["require_success"])
+        drop_result = bool(plan.get("drop_result"))
         if kind == "call_contract":
-            to = cast(Address, plan["to"])
             calldata = cast(bytes, plan["calldata"])
-            value = cast(int, plan["value"])
-            gas = cast(int, plan["gas"])
-            require_success = cast(bool, plan["require_success"])
             self._buf.extend(push_u256(0))
             self._buf.extend(push_u256(0))
             self._buf.extend(push_bytes(calldata))
-            self._buf.extend(push_u256(value))
-            self._buf.extend(push_addr(to))
-            self._buf.extend(gas_opcode() if gas == 0 else push_u256(gas))
-            self._buf.extend(call(require_success))
-            if plan.get("drop_result"):
-                self._buf.extend(pop())
+            self._emit_call_tail(to, value, gas, require_success, drop_result)
             return
         if kind == "call_with_patches":
-            to = cast(Address, plan["to"])
             calldata = cast(bytes, plan["calldata"])
             patches = cast(list[tuple[int, int]], plan["patches"])
-            value = cast(int, plan["value"])
-            gas = cast(int, plan["gas"])
-            require_success = cast(bool, plan["require_success"])
             patch_values = plan.get("patch_values")
             if isinstance(patch_values, list):
                 for pv in reversed(patch_values):
@@ -482,12 +516,7 @@ class Program:
                 self._buf.extend(bytes([0x91]))  # SWAP2
                 self._buf.extend(patch_value(offset, size))
             self._buf.extend(bytes([0x90, 0x60, 0x00, 0x90, 0x60, 0x00, 0x92]))
-            self._buf.extend(push_u256(value))
-            self._buf.extend(push_addr(to))
-            self._buf.extend(gas_opcode() if gas == 0 else push_u256(gas))
-            self._buf.extend(call(require_success))
-            if plan.get("drop_result"):
-                self._buf.extend(pop())
+            self._emit_call_tail(to, value, gas, require_success, drop_result)
             return
         raise ValueError(f"unknown venom plan kind: {kind!r}")
 
@@ -1324,40 +1353,9 @@ class Program:
             self._materialize_prefix_stack_to_manual()
 
         if self._venom_enabled and self._venom_plan is not None:
-            plan = self._venom_plan
-            if plan.get("kind") == "call_contract":
-                to = cast(Address, plan["to"])
-                calldata = cast(bytes, plan["calldata"])
-                value = cast(int, plan["value"])
-                gas = cast(int, plan["gas"])
-                require_success = cast(bool, plan["require_success"])
-                return compile_venom_call_contract_probe(
-                    to,
-                    calldata,
-                    value=value,
-                    gas=gas,
-                    require_success=require_success,
-                    return_success=not bool(plan.get("drop_result")),
-                )
-            if plan.get("kind") == "call_with_patches":
-                to = cast(Address, plan["to"])
-                calldata = cast(bytes, plan["calldata"])
-                patches = cast(list[tuple[int, int]], plan["patches"])
-                patch_values = cast(list[int], plan["patch_values"])
-                value = cast(int, plan["value"])
-                gas = cast(int, plan["gas"])
-                require_success = cast(bool, plan["require_success"])
-                return compile_venom_call_with_patches_probe(
-                    to,
-                    calldata,
-                    patches=patches,
-                    patch_values=patch_values,
-                    value=value,
-                    gas=gas,
-                    require_success=require_success,
-                    return_success=not bool(plan.get("drop_result")),
-                )
-
+            result = self._build_venom_plan()
+            if result is not None:
+                return result
             self._materialize_plan_to_manual()
 
         buf = bytearray(self._buf)
@@ -1420,61 +1418,15 @@ def venom_import_error() -> str | None:
     return _VENOM_IMPORT_ERROR
 
 
-def compile_venom_smoke_bytecode() -> bytes:
-    """Compile a minimal Venom IR program to bytecode.
+# ---------------------------------------------------------------------------
+# Venom compilation helpers (private)
+# ---------------------------------------------------------------------------
 
-    This function validates local integration wiring with the Vyper Venom APIs
-    using the documented pipeline:
 
-    IRContext -> run_passes_on -> generate_assembly_experimental -> generate_bytecode.
-    """
+def _require_venom_imports() -> None:
+    """Raise ImportError when Venom is unavailable; assert module globals for the type checker."""
     if not venom_is_available():
         raise ImportError(f"Vyper Venom APIs are unavailable: {venom_import_error()}")
-
-    assert IRContext is not None
-    assert VenomBuilder is not None
-    assert VenomOptimizationFlags is not None
-    assert OptimizationLevel is not None
-    assert run_passes_on is not None
-    assert generate_assembly_experimental is not None
-    assert generate_bytecode is not None
-
-    ctx = IRContext()
-    fn = ctx.create_function("main")
-    ctx.entry_function = fn
-
-    builder = VenomBuilder(ctx, fn)
-    builder.return_(0, 0)
-
-    flags = VenomOptimizationFlags(
-        level=OptimizationLevel.NONE,
-        disable_mem2var=True,
-        disable_load_elimination=True,
-        disable_dead_store_elimination=True,
-    )
-    run_passes_on(ctx, flags, disable_mem_checks=True)
-    asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
-    bytecode, _ = generate_bytecode(asm)
-    return bytecode
-
-
-def compile_venom_push_bytes_probe(data: bytes) -> bytes:
-    """Compile a Venom program that copies *data* from a data section into memory.
-
-    The generated runtime mirrors ``fp_init`` + ``push_bytes`` semantics:
-    - free-memory pointer defaults to ``0x280`` when ``mem[0x40] == 0``,
-    - payload is copied with ``dloadbytes`` (lowered to ``CODECOPY``),
-    - ``mem[0x40]`` advances by padded length.
-
-    The program returns the first 32-byte word at the copied destination,
-    which allows execution-time verification that CODECOPY placed data
-    correctly in memory.
-    """
-    if not venom_is_available():
-        raise ImportError(f"Vyper Venom APIs are unavailable: {venom_import_error()}")
-    if len(data) > 0xFFFF:
-        raise ValueError(f"push_bytes: data too large ({len(data)} bytes, max 65535)")
-
     assert IRContext is not None
     assert IRLabel is not None
     assert VenomBuilder is not None
@@ -1484,49 +1436,38 @@ def compile_venom_push_bytes_probe(data: bytes) -> bytes:
     assert generate_assembly_experimental is not None
     assert generate_bytecode is not None
 
-    blen = len(data)
-    blen_padded = (blen + 31) & ~31
-    payload = data.ljust(blen_padded, b"\x00") if blen_padded > blen else data
 
-    ctx = IRContext()
-    data_label = IRLabel("pydefi_payload", is_symbol=True)
-    ctx.append_data_section(data_label)
-    ctx.append_data_item(payload)
+def _pad32(data: bytes) -> bytes:
+    """Return *data* zero-padded to the next 32-byte boundary."""
+    return data.ljust((len(data) + 31) & ~31, b"\x00")
 
-    fn = ctx.create_function("main")
-    ctx.entry_function = fn
-    builder = VenomBuilder(ctx, fn)
 
-    # fp_init(): fp | (0x280 * iszero(fp))
-    fp = builder.mload(0x40)
-    default_fp = builder.mul(builder.iszero(fp), 0x280)
-    base_fp = builder.or_(fp, default_fp)
-
-    # Copy payload from readonly data segment into memory[base_fp..].
-    # Use offset(0, data_label) + codecopy instead of dloadbytes to avoid the
-    # LowerDloadPass code_end bug: dloadbytes emits CODECOPY with src=code_end,
-    # but code_end in the assembler equals total bytecode length (code+data),
-    # not the actual data section start address.
-    data_src = builder.offset(0, data_label)
-    builder.codecopy(base_fp, data_src, blen_padded)
-
-    # Advance free-memory pointer.
-    builder.mstore(0x40, builder.add(base_fp, blen_padded))
-
-    # Return first copied word for easy runtime verification.
-    builder.mstore(0, builder.mload(base_fp))
-    builder.return_(0, 32)
-
-    flags = VenomOptimizationFlags(
-        level=OptimizationLevel.NONE,
+def _compile_venom_ctx(ctx: IRContext) -> bytes:  # type: ignore[name-defined]
+    """Run the standard Venom pipeline on *ctx* and return the compiled bytecode."""
+    flags = VenomOptimizationFlags(  # type: ignore[call-arg]
+        level=OptimizationLevel.NONE,  # type: ignore[attr-defined]
         disable_mem2var=True,
         disable_load_elimination=True,
         disable_dead_store_elimination=True,
     )
-    run_passes_on(ctx, flags, disable_mem_checks=True)
-    asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
-    bytecode, _ = generate_bytecode(asm)
+    run_passes_on(ctx, flags, disable_mem_checks=True)  # type: ignore[misc]
+    asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)  # type: ignore[misc,attr-defined]
+    bytecode, _ = generate_bytecode(asm)  # type: ignore[misc]
     return bytecode
+
+
+def _venom_alloc_and_copy(builder: VenomBuilder, label: IRLabel, blen_padded: int) -> Any:  # type: ignore[name-defined]
+    """Emit fp_init + CODECOPY from *label* into memory[base_fp..+blen_padded], advance FP.
+
+    Returns the ``base_fp`` SSA value for use in subsequent builder instructions.
+    """
+    fp = builder.mload(0x40)
+    default_fp = builder.mul(builder.iszero(fp), 0x280)
+    base_fp = builder.or_(fp, default_fp)
+    data_src = builder.offset(0, label)
+    builder.codecopy(base_fp, data_src, blen_padded)
+    builder.mstore(0x40, builder.add(base_fp, blen_padded))
+    return base_fp
 
 
 def compile_venom_call_contract_probe(
@@ -1544,8 +1485,7 @@ def compile_venom_call_contract_probe(
     memory via ``dloadbytes`` before CALL. The runtime returns the CALL success
     flag as a 32-byte word.
     """
-    if not venom_is_available():
-        raise ImportError(f"Vyper Venom APIs are unavailable: {venom_import_error()}")
+    _require_venom_imports()
     if len(to) != 20:
         raise ValueError(f"call_contract_probe: bad address length: {to!r}")
     if value < 0:
@@ -1555,37 +1495,19 @@ def compile_venom_call_contract_probe(
     if len(calldata) > 0xFFFF:
         raise ValueError(f"call_contract_probe: calldata too large ({len(calldata)} bytes, max 65535)")
 
-    assert IRContext is not None
-    assert IRLabel is not None
-    assert VenomBuilder is not None
-    assert VenomOptimizationFlags is not None
-    assert OptimizationLevel is not None
-    assert run_passes_on is not None
-    assert generate_assembly_experimental is not None
-    assert generate_bytecode is not None
-
     blen = len(calldata)
     blen_padded = (blen + 31) & ~31
-    payload = calldata.ljust(blen_padded, b"\x00") if blen_padded > blen else calldata
 
-    ctx = IRContext()
-    call_payload_label = IRLabel("pydefi_call_payload", is_symbol=True)
+    ctx = IRContext()  # type: ignore[operator]
+    call_payload_label = IRLabel("pydefi_call_payload", is_symbol=True)  # type: ignore[operator]
     ctx.append_data_section(call_payload_label)
-    ctx.append_data_item(payload)
+    ctx.append_data_item(_pad32(calldata))
 
     fn = ctx.create_function("main")
     ctx.entry_function = fn
-    builder = VenomBuilder(ctx, fn)
+    builder = VenomBuilder(ctx, fn)  # type: ignore[operator]
 
-    # fp_init(): fp | (0x280 * iszero(fp))
-    fp = builder.mload(0x40)
-    default_fp = builder.mul(builder.iszero(fp), 0x280)
-    base_fp = builder.or_(fp, default_fp)
-
-    # Copy calldata template from readonly data section via offset+codecopy.
-    data_src = builder.offset(0, call_payload_label)
-    builder.codecopy(base_fp, data_src, blen_padded)
-    builder.mstore(0x40, builder.add(base_fp, blen_padded))
+    base_fp = _venom_alloc_and_copy(builder, call_payload_label, blen_padded)
 
     gas_operand = builder.gas() if gas == 0 else gas
     to_int = int.from_bytes(bytes(to), "big")
@@ -1599,16 +1521,7 @@ def compile_venom_call_contract_probe(
     else:
         builder.return_(0, 0)
 
-    flags = VenomOptimizationFlags(
-        level=OptimizationLevel.NONE,
-        disable_mem2var=True,
-        disable_load_elimination=True,
-        disable_dead_store_elimination=True,
-    )
-    run_passes_on(ctx, flags, disable_mem_checks=True)
-    asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
-    bytecode, _ = generate_bytecode(asm)
-    return bytecode
+    return _compile_venom_ctx(ctx)
 
 
 def compile_venom_call_with_patches_probe(
@@ -1629,8 +1542,7 @@ def compile_venom_call_with_patches_probe(
 
     ``mstore_ptr = argsOffset + (offset + size - 32)``
     """
-    if not venom_is_available():
-        raise ImportError(f"Vyper Venom APIs are unavailable: {venom_import_error()}")
+    _require_venom_imports()
     if len(to) != 20:
         raise ValueError(f"call_with_patches_probe: bad address length: {to!r}")
     if len(patches) != len(patch_values):
@@ -1659,41 +1571,22 @@ def compile_venom_call_with_patches_probe(
             )
         normalized_offsets.append(mstore_off)
 
-    assert IRContext is not None
-    assert IRLabel is not None
-    assert VenomBuilder is not None
-    assert VenomOptimizationFlags is not None
-    assert OptimizationLevel is not None
-    assert run_passes_on is not None
-    assert generate_assembly_experimental is not None
-    assert generate_bytecode is not None
-
     blen = len(calldata)
     blen_padded = (blen + 31) & ~31
-    payload = calldata.ljust(blen_padded, b"\x00") if blen_padded > blen else calldata
 
-    ctx = IRContext()
-    patches_payload_label = IRLabel("pydefi_patches_payload", is_symbol=True)
+    ctx = IRContext()  # type: ignore[operator]
+    patches_payload_label = IRLabel("pydefi_patches_payload", is_symbol=True)  # type: ignore[operator]
     ctx.append_data_section(patches_payload_label)
-    ctx.append_data_item(payload)
+    ctx.append_data_item(_pad32(calldata))
 
     fn = ctx.create_function("main")
     ctx.entry_function = fn
-    builder = VenomBuilder(ctx, fn)
+    builder = VenomBuilder(ctx, fn)  # type: ignore[operator]
 
-    # fp_init(): fp | (0x280 * iszero(fp))
-    fp = builder.mload(0x40)
-    default_fp = builder.mul(builder.iszero(fp), 0x280)
-    base_fp = builder.or_(fp, default_fp)
+    base_fp = _venom_alloc_and_copy(builder, patches_payload_label, blen_padded)
 
-    # Copy calldata template via offset+codecopy and apply patches in order.
-    data_src = builder.offset(0, patches_payload_label)
-    builder.codecopy(base_fp, data_src, blen_padded)
     for mstore_off, pv in zip(normalized_offsets, patch_values):
-        patch_ptr = builder.add(base_fp, mstore_off)
-        builder.mstore(patch_ptr, pv)
-
-    builder.mstore(0x40, builder.add(base_fp, blen_padded))
+        builder.mstore(builder.add(base_fp, mstore_off), pv)
 
     gas_operand = builder.gas() if gas == 0 else gas
     to_int = int.from_bytes(bytes(to), "big")
@@ -1707,13 +1600,4 @@ def compile_venom_call_with_patches_probe(
     else:
         builder.return_(0, 0)
 
-    flags = VenomOptimizationFlags(
-        level=OptimizationLevel.NONE,
-        disable_mem2var=True,
-        disable_load_elimination=True,
-        disable_dead_store_elimination=True,
-    )
-    run_passes_on(ctx, flags, disable_mem_checks=True)
-    asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
-    bytecode, _ = generate_bytecode(asm)
-    return bytecode
+    return _compile_venom_ctx(ctx)

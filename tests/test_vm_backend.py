@@ -4,12 +4,16 @@ from hexbytes import HexBytes
 from pydefi.types import RouteDAG, Token
 from pydefi.vm import build_execution_program_for_dag, build_quote_program_for_dag
 from pydefi.vm.builder import (
+    IRContext,
+    IRLabel,
     Patch,
     Program,
+    VenomBuilder,
+    _compile_venom_ctx,
+    _pad32,
+    _venom_alloc_and_copy,
     compile_venom_call_contract_probe,
     compile_venom_call_with_patches_probe,
-    compile_venom_push_bytes_probe,
-    compile_venom_smoke_bytecode,
     venom_is_available,
 )
 from pydefi.vm.program import add, pop
@@ -41,27 +45,36 @@ def test_backend_parity_push_bytes_length_semantics():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_smoke_bytecode():
-    bytecode = compile_venom_smoke_bytecode()
-    assert isinstance(bytecode, bytes)
-    assert len(bytecode) > 0
+def _push_bytes_probe(data: bytes) -> bytes:
+    """Local test helper: compile a Venom program that copies *data* into memory
+    and returns the first 32-byte word, for CODECOPY correctness verification."""
+    blen_padded = (len(data) + 31) & ~31
+    ctx = IRContext()  # type: ignore[operator]
+    label = IRLabel("pydefi_payload", is_symbol=True)  # type: ignore[operator]
+    ctx.append_data_section(label)
+    ctx.append_data_item(_pad32(data))
+    fn = ctx.create_function("main")
+    ctx.entry_function = fn
+    builder = VenomBuilder(ctx, fn)  # type: ignore[operator]
+    # Use offset+codecopy (not dloadbytes) to avoid the LowerDloadPass code_end bug.
+    base_fp = _venom_alloc_and_copy(builder, label, blen_padded)
+    builder.mstore(0, builder.mload(base_fp))
+    builder.return_(0, 32)
+    return _compile_venom_ctx(ctx)
 
 
 @pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_push_bytes_probe_copies_data_into_memory():
+def test_push_bytes_probe_copies_data_into_memory():
     payload = b"\xde\xad\xbe\xef"
-    bytecode = compile_venom_push_bytes_probe(payload)
-    result = mini_evm(bytecode)
+    result = mini_evm(_push_bytes_probe(payload))
     assert not result.is_error, f"venom push-bytes probe reverted: {result.output.hex()}"
-    expected = int.from_bytes(payload.ljust(32, b"\x00"), "big")
-    assert int.from_bytes(result.output, "big") == expected
+    assert int.from_bytes(result.output, "big") == int.from_bytes(payload.ljust(32, b"\x00"), "big")
 
 
 @pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_push_bytes_probe_embeds_data_section():
+def test_push_bytes_probe_embeds_data_section():
     payload = b"hello venom"
-    bytecode = compile_venom_push_bytes_probe(payload)
+    bytecode = _push_bytes_probe(payload)
     assert bytecode.endswith(payload.ljust(((len(payload) + 31) & ~31), b"\x00"))
 
 
