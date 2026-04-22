@@ -17,7 +17,7 @@ from pydefi.vm.builder import (
     compile_venom_two_data_sections_probe,
     venom_is_available,
 )
-from pydefi.vm.program import add, pop, push_u256
+from pydefi.vm.program import add, pop, push_u256, swap
 from tests.conftest import RETURN_TOP, mini_evm
 
 # ---------------------------------------------------------------------------
@@ -232,7 +232,8 @@ def test_compile_venom_patch_preview_probe_matches_manual_for_patched_word():
         .push_u256(patch_values[0])
         .push_bytes(template)
         .patch_bytes_from_stack([(4, 32), (36, 20)])
-        ._emit(pop())  # drop argsLen
+        ._emit(swap())  # bring argsLen to TOS
+        ._emit(pop())  # drop argsLen; leaves argsOffset on TOS
         ._emit(push_u256(4))
         ._emit(add())
         ._emit(bytes([0x51]))  # MLOAD at argsOffset+4
@@ -400,6 +401,10 @@ def test_venom_program_no_plan_for_mismatched_stack_literal_patch_case():
     if not venom_is_available():
         pytest.skip("Venom backend unavailable")
 
-    program.push_u256(1).push_u256(2).call_with_patches(HexBytes("0x" + "91" * 20), b"\xaa\xbb", [(0, 1)])
+    # 2 stack values pushed but only 1 patch → mismatch, Venom plan not set.
+    # Use a valid patch descriptor (offset=28, size=4 → mstore_off=0) so the
+    # manual fallback path doesn't raise on the negative-mstore-target check.
+    calldata = b"\xaa\xbb\xcc\xdd" + b"\x00" * 28  # 32-byte calldata
+    program.push_u256(1).push_u256(2).call_with_patches(HexBytes("0x" + "91" * 20), calldata, [(28, 4)])
     assert program.has_pending_venom_plan is False
     assert program.pending_venom_plan_kind is None

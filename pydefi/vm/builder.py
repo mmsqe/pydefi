@@ -492,6 +492,8 @@ class Program:
 
         Raises :exc:`ValueError` if the label has already been defined.
         """
+        if self._venom_enabled and self._venom_prefix_stack:
+            self._materialize_prefix_stack_to_manual()
         if name in self._labels:
             raise ValueError(f"Program: duplicate label {name!r}")
         self._labels[name] = len(self._buf)
@@ -555,6 +557,10 @@ class Program:
         """
         if len(data) > 0xFFFF:
             raise ValueError(f"push_bytes: data too large ({len(data)} bytes, max 65535)")
+        # Flush any pending Venom state so the data section + CODECOPY sequence
+        # is emitted in the correct order (after any preceding pushes).
+        if self._venom_enabled and (self._venom_prefix_stack or self._venom_plan is not None):
+            self._materialize_plan_to_manual()
         blen = len(data)
         blen_padded = (blen + 31) & ~31
 
@@ -644,6 +650,8 @@ class Program:
         """
         if isinstance(target, int):
             return self._emit(jump(target))
+        if self._venom_enabled and self._venom_prefix_stack:
+            self._materialize_prefix_stack_to_manual()
         self._buf.append(0x61)  # PUSH2
         self._fixups.append((len(self._buf), target))
         self._buf.extend(b"\x00\x00")  # 2-byte placeholder
@@ -659,6 +667,8 @@ class Program:
         """
         if isinstance(target, int):
             return self._emit(jumpi(target))
+        if self._venom_enabled and self._venom_prefix_stack:
+            self._materialize_prefix_stack_to_manual()
         self._buf.append(0x61)  # PUSH2
         self._fixups.append((len(self._buf), target))
         self._buf.extend(b"\x00\x00")  # 2-byte placeholder
@@ -1223,6 +1233,13 @@ class Program:
         Returns:
             ``self`` for chaining.
         """
+        # Materialize any pending Venom state (prefix-stack pushes and/or a
+        # pending call plan) to _buf before merging.  self must flush first so
+        # bytes stay in order; other is flushed so its _buf is complete before copy.
+        if self._venom_enabled and (self._venom_prefix_stack or self._venom_plan is not None):
+            self._materialize_plan_to_manual()
+        if other._venom_enabled and (other._venom_prefix_stack or other._venom_plan is not None):
+            other._materialize_plan_to_manual()
         # Pre-validate label collisions before mutating internal state to
         # avoid leaving this Program instance in a partially-updated state.
         for name in other._labels:
@@ -1247,6 +1264,11 @@ class Program:
 
         Raises :exc:`ValueError` on duplicate label names.
         """
+        # Materialize self's pending Venom state before copying.
+        # Materialization is idempotent: it moves speculative state (prefix
+        # stack / plan) into _buf; the resulting bytecode is identical.
+        if self._venom_enabled and (self._venom_prefix_stack or self._venom_plan is not None):
+            self._materialize_plan_to_manual()
         result = Program()
         result._buf.extend(self._buf)
         result._labels.update(self._labels)
@@ -1372,7 +1394,11 @@ class Program:
 
     def __len__(self) -> int:
         """Return the current (unresolved) byte length of the program."""
-        return len(self._buf)
+        if not self._venom_prefix_stack:
+            return len(self._buf)
+        # Prefix-stack entries are pending push_u256/push_addr bytes not yet in _buf.
+        prefix_len = sum(33 if kind == "u256" else 21 for kind, _ in self._venom_prefix_stack)
+        return len(self._buf) + prefix_len
 
     def __repr__(self) -> str:
         return f"Program(len={len(self._buf)}, labels={list(self._labels)!r})"
@@ -1414,8 +1440,13 @@ def compile_venom_smoke_bytecode() -> bytes:
     builder = VenomBuilder(ctx, fn)
     builder.return_(0, 0)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
@@ -1466,7 +1497,12 @@ def compile_venom_push_bytes_probe(data: bytes) -> bytes:
     base_fp = builder.or_(fp, default_fp)
 
     # Copy payload from readonly data segment into memory[base_fp..].
-    builder.dloadbytes(base_fp, 0, blen_padded)
+    # Use offset(0, data_label) + codecopy instead of dloadbytes to avoid the
+    # LowerDloadPass code_end bug: dloadbytes emits CODECOPY with src=code_end,
+    # but code_end in the assembler equals total bytecode length (code+data),
+    # not the actual data section start address.
+    data_src = builder.offset(0, data_label)
+    builder.codecopy(base_fp, data_src, blen_padded)
 
     # Advance free-memory pointer.
     builder.mstore(0x40, builder.add(base_fp, blen_padded))
@@ -1475,8 +1511,13 @@ def compile_venom_push_bytes_probe(data: bytes) -> bytes:
     builder.mstore(0, builder.mload(base_fp))
     builder.return_(0, 32)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
@@ -1522,8 +1563,13 @@ def compile_venom_label_jump_probe(*, take_then_branch: bool) -> bytes:
     builder.mstore(0, 2)
     builder.return_(0, 32)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
@@ -1558,8 +1604,13 @@ def compile_venom_two_data_sections_probe(data_a: bytes, data_b: bytes) -> bytes
     builder = VenomBuilder(ctx, fn)
     builder.return_(0, 0)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
@@ -1593,9 +1644,11 @@ def compile_venom_memory_progression_probe(data_a: bytes, data_b: bytes) -> byte
     payload_b = data_b.ljust(len_b_padded, b"\x00") if len_b_padded > len(data_b) else data_b
 
     ctx = IRContext()
-    ctx.append_data_section(IRLabel("pydefi_mem_a", is_symbol=True))
+    mem_a_label = IRLabel("pydefi_mem_a", is_symbol=True)
+    ctx.append_data_section(mem_a_label)
     ctx.append_data_item(payload_a)
-    ctx.append_data_section(IRLabel("pydefi_mem_b", is_symbol=True))
+    mem_b_label = IRLabel("pydefi_mem_b", is_symbol=True)
+    ctx.append_data_section(mem_b_label)
     ctx.append_data_item(payload_b)
 
     fn = ctx.create_function("main")
@@ -1607,13 +1660,15 @@ def compile_venom_memory_progression_probe(data_a: bytes, data_b: bytes) -> byte
     default_fp = builder.mul(builder.iszero(fp0), 0x280)
     base_fp = builder.or_(fp0, default_fp)
 
-    # Allocation 1
-    builder.dloadbytes(base_fp, 0, len_a_padded)
+    # Allocation 1: copy data_a via its label address.
+    data_src_a = builder.offset(0, mem_a_label)
+    builder.codecopy(base_fp, data_src_a, len_a_padded)
     fp1 = builder.add(base_fp, len_a_padded)
     builder.mstore(0x40, fp1)
 
-    # Allocation 2
-    builder.dloadbytes(fp1, len_a_padded, len_b_padded)
+    # Allocation 2: copy data_b via its own label address.
+    data_src_b = builder.offset(0, mem_b_label)
+    builder.codecopy(fp1, data_src_b, len_b_padded)
     fp2 = builder.add(fp1, len_b_padded)
     builder.mstore(0x40, fp2)
 
@@ -1621,8 +1676,13 @@ def compile_venom_memory_progression_probe(data_a: bytes, data_b: bytes) -> byte
     builder.mstore(0, builder.mload(0x40))
     builder.return_(0, 32)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
@@ -1668,7 +1728,8 @@ def compile_venom_call_contract_probe(
     payload = calldata.ljust(blen_padded, b"\x00") if blen_padded > blen else calldata
 
     ctx = IRContext()
-    ctx.append_data_section(IRLabel("pydefi_call_payload", is_symbol=True))
+    call_payload_label = IRLabel("pydefi_call_payload", is_symbol=True)
+    ctx.append_data_section(call_payload_label)
     ctx.append_data_item(payload)
 
     fn = ctx.create_function("main")
@@ -1680,8 +1741,9 @@ def compile_venom_call_contract_probe(
     default_fp = builder.mul(builder.iszero(fp), 0x280)
     base_fp = builder.or_(fp, default_fp)
 
-    # Copy calldata template from readonly data section.
-    builder.dloadbytes(base_fp, 0, blen_padded)
+    # Copy calldata template from readonly data section via offset+codecopy.
+    data_src = builder.offset(0, call_payload_label)
+    builder.codecopy(base_fp, data_src, blen_padded)
     builder.mstore(0x40, builder.add(base_fp, blen_padded))
 
     gas_operand = builder.gas() if gas == 0 else gas
@@ -1696,8 +1758,13 @@ def compile_venom_call_contract_probe(
     else:
         builder.return_(0, 0)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
@@ -1755,7 +1822,8 @@ def compile_venom_call_with_patch_probe(
     payload = calldata.ljust(blen_padded, b"\x00") if blen_padded > blen else calldata
 
     ctx = IRContext()
-    ctx.append_data_section(IRLabel("pydefi_patch_payload", is_symbol=True))
+    patch_payload_label = IRLabel("pydefi_patch_payload", is_symbol=True)
+    ctx.append_data_section(patch_payload_label)
     ctx.append_data_item(payload)
 
     fn = ctx.create_function("main")
@@ -1767,8 +1835,9 @@ def compile_venom_call_with_patch_probe(
     default_fp = builder.mul(builder.iszero(fp), 0x280)
     base_fp = builder.or_(fp, default_fp)
 
-    # Copy calldata template and patch in memory.
-    builder.dloadbytes(base_fp, 0, blen_padded)
+    # Copy calldata template via offset+codecopy.
+    data_src = builder.offset(0, patch_payload_label)
+    builder.codecopy(base_fp, data_src, blen_padded)
     patch_ptr = builder.add(base_fp, mstore_off)
     builder.mstore(patch_ptr, patch_value)
     builder.mstore(0x40, builder.add(base_fp, blen_padded))
@@ -1782,8 +1851,13 @@ def compile_venom_call_with_patch_probe(
     builder.mstore(0, success)
     builder.return_(0, 32)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
@@ -1851,7 +1925,8 @@ def compile_venom_call_with_patches_probe(
     payload = calldata.ljust(blen_padded, b"\x00") if blen_padded > blen else calldata
 
     ctx = IRContext()
-    ctx.append_data_section(IRLabel("pydefi_patches_payload", is_symbol=True))
+    patches_payload_label = IRLabel("pydefi_patches_payload", is_symbol=True)
+    ctx.append_data_section(patches_payload_label)
     ctx.append_data_item(payload)
 
     fn = ctx.create_function("main")
@@ -1863,8 +1938,9 @@ def compile_venom_call_with_patches_probe(
     default_fp = builder.mul(builder.iszero(fp), 0x280)
     base_fp = builder.or_(fp, default_fp)
 
-    # Copy calldata template and apply patches in order.
-    builder.dloadbytes(base_fp, 0, blen_padded)
+    # Copy calldata template via offset+codecopy and apply patches in order.
+    data_src = builder.offset(0, patches_payload_label)
+    builder.codecopy(base_fp, data_src, blen_padded)
     for mstore_off, pv in zip(normalized_offsets, patch_values):
         patch_ptr = builder.add(base_fp, mstore_off)
         builder.mstore(patch_ptr, pv)
@@ -1883,8 +1959,13 @@ def compile_venom_call_with_patches_probe(
     else:
         builder.return_(0, 0)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
@@ -1942,7 +2023,8 @@ def compile_venom_patch_preview_probe(
     payload = calldata.ljust(blen_padded, b"\x00") if blen_padded > blen else calldata
 
     ctx = IRContext()
-    ctx.append_data_section(IRLabel("pydefi_patch_preview", is_symbol=True))
+    patch_preview_label = IRLabel("pydefi_patch_preview", is_symbol=True)
+    ctx.append_data_section(patch_preview_label)
     ctx.append_data_item(payload)
 
     fn = ctx.create_function("main")
@@ -1954,7 +2036,9 @@ def compile_venom_patch_preview_probe(
     default_fp = builder.mul(builder.iszero(fp), 0x280)
     base_fp = builder.or_(fp, default_fp)
 
-    builder.dloadbytes(base_fp, 0, blen_padded)
+    # Use offset + codecopy instead of dloadbytes (same fix as push_bytes probe).
+    data_src = builder.offset(0, patch_preview_label)
+    builder.codecopy(base_fp, data_src, blen_padded)
     for mstore_off, pv in zip(normalized_offsets, patch_values):
         patch_ptr = builder.add(base_fp, mstore_off)
         builder.mstore(patch_ptr, pv)
@@ -1964,8 +2048,13 @@ def compile_venom_patch_preview_probe(
     builder.mstore(0, builder.mload(word_ptr))
     builder.return_(0, 32)
 
-    flags = VenomOptimizationFlags(level=OptimizationLevel.NONE)
-    run_passes_on(ctx, flags, disable_mem_checks=False)
+    flags = VenomOptimizationFlags(
+        level=OptimizationLevel.NONE,
+        disable_mem2var=True,
+        disable_load_elimination=True,
+        disable_dead_store_elimination=True,
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)
     bytecode, _ = generate_bytecode(asm)
     return bytecode
