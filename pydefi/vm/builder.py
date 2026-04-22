@@ -1393,6 +1393,13 @@ class Program:
 
     def __len__(self) -> int:
         """Return the current (unresolved) byte length of the program."""
+        if self._venom_enabled and self._venom_plan is not None:
+            # Keep __len__ side-effect free: materialize a snapshot, not self.
+            # _materialize_plan_to_manual also flushes _venom_prefix_stack, so
+            # this branch covers both fields even if they were set simultaneously.
+            snap = Program._snapshot(self)
+            snap._materialize_plan_to_manual()
+            return len(snap._buf)
         if not self._venom_prefix_stack:
             return len(self._buf)
         # Prefix-stack entries are pending push_u256/push_addr bytes not yet in _buf.

@@ -219,6 +219,25 @@ class TestProgramChaining:
         p = Program().push_u256(0).push_addr(ADDR_A)
         assert len(p) == len(push_u256(0) + push_addr(ADDR_A))
 
+    def test_len_pending_venom_plan_is_nonzero_and_pure(self):
+        if not venom_is_available():
+            pytest.skip("Venom backend unavailable")
+
+        p = Program.create().call_contract(ADDR_A, b"\x12\x34")
+        assert p.has_pending_venom_plan is True
+        assert p.pending_venom_plan_kind == "call_contract"
+
+        n = len(p)
+        # __len__ materializes via the manual fallback, so its result may differ
+        # from bytes(p) which goes through the Venom compiler.  Assert only that
+        # the length is nonzero and matches the manual-materialization path.
+        snap = Program._snapshot(p)
+        snap._materialize_plan_to_manual()
+        assert n == len(snap._buf)
+        assert n > 0
+        assert p.has_pending_venom_plan is True
+        assert p.pending_venom_plan_kind == "call_contract"
+
     def test_bytes_builtin(self):
         p = Program().push_u256(99)
         assert bytes(p) == push_u256(99)
