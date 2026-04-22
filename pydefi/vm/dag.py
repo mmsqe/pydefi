@@ -205,8 +205,8 @@ def _build_split_frame(
             ._emit(swap())
             ._emit(div())
         )
-    segments.extend(build_leg_actions(leg.actions))
-    segments.append(Program.create()._emit(add()))
+        segments.extend(build_leg_actions(leg.actions))
+        segments.append(Program.create()._emit(add()))
 
     segments.append(Program.create()._emit(swap())._emit(pop()))
     return segments
