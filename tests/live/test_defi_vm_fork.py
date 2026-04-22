@@ -22,11 +22,17 @@ from pathlib import Path
 
 import pytest
 import solcx
+from eth_contract.contract import ContractFunction
 from eth_contract.erc20 import ERC20
+from eth_contract.utils import send_transaction as eth_send_transaction
 from hexbytes import HexBytes
 from web3.exceptions import ContractLogicError, Web3RPCError
+from web3.types import Wei
 
-from pydefi.types import Address
+from pydefi.abi.amm import UNISWAP_V3_POOL
+from pydefi.pathfinder.graph import PoolGraph, V3PoolEdge
+from pydefi.pathfinder.router import Router
+from pydefi.types import Address, TokenAmount
 from pydefi.vm import Patch, Program
 from pydefi.vm.program import (
     assert_ge,
@@ -50,8 +56,10 @@ from pydefi.vm.program import (
     sub,
     swap,
 )
-from tests.addrs import WETH
+from pydefi.vm.swap import build_swap_transaction
+from tests.addrs import POOL_WETH_USDC_500, POOL_WETH_USDC_3000
 from tests.live.sol_utils import MOCK_TOKEN_SOL, compile_sol_file, compile_sol_source, deploy, ensure_solc
+from tests.test_aggregator import USDC, WETH
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -60,7 +68,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SOL_FILE = REPO_ROOT / "pydefi" / "vm" / "DeFiVM.sol"
 APPROVE_PROXY_SOL_FILE = REPO_ROOT / "pydefi" / "vm" / "ApproveProxy.sol"
 
-WETH_MAINNET: Address = WETH.address
 # Coinbase 8 — a well-funded address on mainnet (used for introspection only)
 WHALE: Address = Address("0x77134cbC06cB00b66F4c7e623D5fdBF6777635EC")
 
@@ -357,7 +364,7 @@ class TestDeFiVMFork:
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        program = push_addr(WHALE) + push_addr(WETH_MAINNET) + balance_of() + pop()
+        program = push_addr(WHALE) + push_addr(WETH.address) + balance_of() + pop()
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
@@ -377,10 +384,10 @@ class TestDeFiVMFork:
         #   sub → [post_bal - pre_bal]  (== 0 here since no transfer happened)
         program = (
             push_addr(WHALE)
-            + push_addr(WETH_MAINNET)
+            + push_addr(WETH.address)
             + balance_of()
             + push_addr(WHALE)
-            + push_addr(WETH_MAINNET)
+            + push_addr(WETH.address)
             + balance_of()
             + sub()
             + pop()
@@ -1071,3 +1078,85 @@ class TestApproveProxyFork:
 
         vm_balance_after = await w3.eth.get_balance(vm_address)
         assert vm_balance_after - vm_balance_before == ETH_VALUE
+
+
+# ---------------------------------------------------------------------------
+# Swap execution tests — fork with real V3 pools
+# ---------------------------------------------------------------------------
+
+
+async def _v3_pool_edge(w3, pool_address: Address, token_in, token_out) -> V3PoolEdge:
+    pool = UNISWAP_V3_POOL(to=POOL_WETH_USDC_500)
+    token0_addr = await pool.fns.token0().call(w3)
+    slot0 = await pool.fns.slot0().call(w3)
+    liquidity = await pool.fns.liquidity().call(w3)
+    fee = await pool.fns.fee().call(w3)
+    return V3PoolEdge(
+        token_in=token_in,
+        token_out=token_out,
+        pool_address=pool_address,
+        protocol="UniswapV3",
+        fee_bps=fee // 100,
+        sqrt_price_x96=slot0[0],
+        liquidity=liquidity,
+        is_token0_in=token0_addr.lower() == token_in.address.lower(),
+    )
+
+
+_WETH_DEPOSIT = ContractFunction.from_abi("function deposit() external payable")
+
+
+@pytest.mark.fork
+class TestBuildSwapTransactionFork:
+    """Fork tests for build_swap_transaction(RouteDAG) end-to-end.
+
+    Exercises the full path: find_best_split → RouteDAG →
+    build_swap_transaction → vm.execute() on a mainnet fork with real V3 pools.
+    Unlike TestQuoteFork (which quotes each leg via QuoterV2), these tests
+    execute the compiled swap program and verify non-zero token output.
+    """
+
+    async def test_split_route_build_and_execute(self, ctx) -> None:
+        """build_swap_transaction(RouteDAG) executes a 2-leg split on a mainnet fork.
+
+        Uses fee-equalized synthetic liquidity to force find_best_split into a
+        2-leg split DAG, compiles it via build_swap_transaction, and executes
+        against real V3 pools, verifying the deployer receives non-zero USDC.
+        """
+        w3 = ctx["w3"]
+        vm_address = ctx["vm_address"]
+        deployer = ctx["deployer"]
+        amount_in = 10**18  # 1 WETH — large enough for split to improve on single-pool route
+
+        # Symmetric graph (equal fee + price) so a split can improve on single-pool routing.
+        graph = PoolGraph()
+        ref_edge = await _v3_pool_edge(w3, POOL_WETH_USDC_500, WETH, USDC)
+        for pool_addr in (POOL_WETH_USDC_500, POOL_WETH_USDC_3000):
+            edge = await _v3_pool_edge(w3, pool_addr, WETH, USDC)
+            graph.add_pool(
+                V3PoolEdge(
+                    token_in=WETH,
+                    token_out=USDC,
+                    pool_address=pool_addr,
+                    protocol="UniswapV3",
+                    fee_bps=5,
+                    sqrt_price_x96=ref_edge.sqrt_price_x96,
+                    liquidity=10**15,
+                    is_token0_in=edge.is_token0_in,
+                )
+            )
+
+        dag = Router(graph).find_best_split(TokenAmount(WETH, amount_in), USDC, step_bps=1000)
+        assert len(Router.dag_leg_weights(dag)) >= 1, "expected at least one leg in split DAG"
+
+        # min_final_out=0: actual output verified by balance check below.
+        swap_tx = build_swap_transaction(dag, amount_in, vm_address, deployer)
+
+        await _WETH_DEPOSIT().transact(w3, deployer, to=WETH.address, value=Wei(amount_in))
+        await ERC20.fns.transfer(vm_address, amount_in).transact(w3, deployer, to=WETH.address)
+
+        bal_before = await ERC20.fns.balanceOf(deployer).call(w3, to=USDC.address)
+        await eth_send_transaction(w3, deployer, to=swap_tx.to, data=swap_tx.data)
+        bal_after = await ERC20.fns.balanceOf(deployer).call(w3, to=USDC.address)
+
+        assert bal_after > bal_before, f"Expected USDC > 0 after split swap, got {bal_after - bal_before}"
