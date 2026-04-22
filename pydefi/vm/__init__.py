@@ -122,6 +122,7 @@ from pydefi.vm.swap import (
     encode_v2_callback_data,
     encode_v3_callback_data,
     encode_v3_path,
+    swap_route_to_hops,
     v3_pool_swap_calldata,
 )
 
@@ -214,5 +215,6 @@ __all__ = [
     "encode_v2_callback_data",
     "encode_v3_callback_data",
     "encode_v3_path",
+    "swap_route_to_hops",
     "v3_pool_swap_calldata",
 ]
