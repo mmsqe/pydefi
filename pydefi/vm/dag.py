@@ -25,13 +25,16 @@ another:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
-from pydefi.types import RouteAction, RouteDAG, RouteSplit, RouteSwap
+from pydefi.types import ZERO_ADDRESS, Address, RouteAction, RouteDAG, RouteSplit, RouteSwap, SwapProtocol
 from pydefi.vm.builder import Program
-from pydefi.vm.program import add, assert_ge, assert_le, div, dup, dup2, mul, pop, push_u256, swap
+from pydefi.vm.program import add, assert_ge, assert_le, div, dup, dup2, mul, pop, push_u256, return_tos, swap
 from pydefi.vm.swap import (
     _build_route_swap_segment,
+    _build_v2_quote_segment,
+    _build_v3_quote_segment,
+    _swap_hop_from_route_swap,
 )
 
 _BPS_DENOMINATOR = 10_000
@@ -61,17 +64,42 @@ def build_quote_program_for_dag(
     dag: RouteDAG,
     *,
     amount_in: int,
-    vm_address: str,
     min_final_out: int = 0,
+    quoter_address: str | None = None,
 ) -> Program:
-    """Build a quote/simulation program from a :class:`RouteDAG`."""
-    return _build_program_for_dag(
-        dag,
-        amount_in=amount_in,
-        vm_address=vm_address,
-        terminal_recipient=vm_address,
-        min_final_out=min_final_out,
-    )
+    """Build a quote/simulation program from a :class:`RouteDAG`.
+
+    Produces a view-only DeFiVM program safe for ``eth_call`` — no tokens are
+    transferred.  V2 hops compute ``amountOut`` from ``pair.getReserves()``
+    on-stack; V3 hops call ``quoter.quoteExactInput``.  The program ends with
+    ``return_tos`` so the caller reads the final ``amountOut`` from returndata.
+
+    Args:
+        dag: Route DAG to simulate.
+        amount_in: Input amount for the first hop.
+        min_final_out: If > 0, revert if ``amountOut < min_final_out``.
+        quoter_address: Uniswap V3-compatible quoter address.  Required when
+            the DAG contains V3 hops; ignored for V2-only routes.
+    """
+    payload = dag.to_dict()
+    actions = payload["actions"]
+    if not actions:
+        raise ValueError("build_quote_program_for_dag: route DAG must contain at least one action")
+
+    segments: list[Program] = [Program()._emit(push_u256(amount_in))]
+    segments.extend(_build_dag_quote_actions(actions, quoter_address=quoter_address))
+
+    if min_final_out > 0:
+        segments.append(
+            Program()
+            ._emit(dup())
+            ._emit(push_u256(min_final_out))
+            ._emit(swap())
+            ._emit(assert_ge("slippage: out too low"))
+        )
+
+    segments.append(Program()._emit(return_tos()))
+    return Program.compose(segments)
 
 
 def _build_program_for_dag(
@@ -121,17 +149,18 @@ def _build_dag_actions(
             segments.append(
                 _build_route_swap_segment(
                     action,
-                    recipient=action_recipient,
+                    recipient=Address(action_recipient),
                 )
             )
             continue
 
         if isinstance(action, RouteSplit):
             segments.extend(
-                _build_route_split_segment(
+                _build_split_frame(
                     action,
-                    vm_address=vm_address,
-                    terminal_recipient=action_recipient,
+                    lambda acts, r=action_recipient: _build_dag_actions(
+                        acts, vm_address=vm_address, terminal_recipient=r
+                    ),
                 )
             )
             continue
@@ -141,20 +170,20 @@ def _build_dag_actions(
     return segments
 
 
-def _build_route_split_segment(
+def _build_split_frame(
     split: RouteSplit,
-    *,
-    vm_address: str,
-    terminal_recipient: str,
+    build_leg_actions: Callable[[Sequence[RouteAction]], list[Program]],
 ) -> list[Program]:
+    """Emit split-frame bytecode, delegating leg action building to a callback.
+
+    Stack convention on entry/exit:
+    - entry: ``[... , total_in]``
+    - exit:  ``[... , total_out]``
+    """
     if len(split.legs) == 1:
         # Fast path: full-allocation single leg does not need split-frame
         # bookkeeping; emit leg actions directly.
-        return _build_dag_actions(
-            split.legs[0].actions,
-            vm_address=vm_address,
-            terminal_recipient=terminal_recipient,
-        )
+        return build_leg_actions(split.legs[0].actions)
 
     # Runtime guard: for each leg we compute total_in * fraction_bps / 10_000.
     # Enforce `total_in <= floor((2**256-1)/10_000)` before any multiplication.
@@ -176,14 +205,38 @@ def _build_route_split_segment(
             ._emit(swap())
             ._emit(div())
         )
-        segments.extend(
-            _build_dag_actions(
-                leg.actions,
-                vm_address=vm_address,
-                terminal_recipient=terminal_recipient,
-            )
-        )
+        segments.extend(build_leg_actions(leg.actions))
         segments.append(Program()._emit(add()))
 
     segments.append(Program()._emit(swap())._emit(pop()))
+    return segments
+
+
+def _build_dag_quote_actions(
+    actions: Sequence[RouteAction],
+    *,
+    quoter_address: str | None,
+) -> list[Program]:
+    segments: list[Program] = []
+    for action in actions:
+        if isinstance(action, RouteSwap):
+            hop = _swap_hop_from_route_swap(action, recipient=ZERO_ADDRESS)
+            if hop.protocol == SwapProtocol.UNISWAP_V3:
+                if quoter_address is None:
+                    raise ValueError("build_quote_program_for_dag: quoter_address required for V3 hops")
+                segments.append(_build_v3_quote_segment(hop, quoter_address))
+            else:
+                segments.append(_build_v2_quote_segment(hop))
+            continue
+
+        if isinstance(action, RouteSplit):
+            segments.extend(
+                _build_split_frame(
+                    action,
+                    lambda acts, q=quoter_address: _build_dag_quote_actions(acts, quoter_address=q),
+                )
+            )
+            continue
+
+        raise ValueError(f"build_quote_program_for_dag: unsupported route action {type(action)!r}")
     return segments
