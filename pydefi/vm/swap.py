@@ -239,7 +239,7 @@ def _build_v3_pool_swap_segment(hop: SwapHop) -> Program:
         sqrt_price_limit_x96 = _SQRT_PRICE_MIN if hop.zero_for_one else _SQRT_PRICE_MAX
     callback_data = encode_v3_callback_data(hop.token_in)
 
-    prog = Program()
+    prog = Program.create()
     prog.call_contract_abi(
         hop.pool,
         "function swap(address recipient, bool zeroForOne,"
@@ -272,7 +272,7 @@ def _build_v2_compute_out_segment(hop: SwapHop, fee_num: int) -> Program:
     entirely on-stack.  Callers that need to preserve ``amount_in`` should
     ``dup()`` it before calling this segment.
     """
-    prog = Program()
+    prog = Program.create()
     prog.call_contract_abi(hop.pool, "getReserves()").pop()
     if hop.zero_for_one:
         prog._emit(ret_u256(0))
