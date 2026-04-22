@@ -773,9 +773,12 @@ class TestDeFiVMFork:
     async def test_call_contract_abi_patch_single_uint256(self, ctx):
         """call_contract_abi with a single Patch arg auto-detects the calldata offset.
 
-        Stores the input value (7) in register 0, then calls double(7) via the
-        high-level ABI builder with a Patch sourced from register 0.  Verifies
-        the on-chain result equals 14.
+        Pushes the patch value (7) before the call so Patch() picks it up from the
+        stack, then calls double(7) via the high-level ABI builder.  Verifies the
+        on-chain result equals 14.
+
+        All operations are in a single Program so the CODECOPY data section remains
+        at the very end of the built bytecode.
         """
         w3 = ctx["w3"]
         vm = ctx["vm"]
@@ -783,21 +786,21 @@ class TestDeFiVMFork:
         adapter = ctx["adapter_address"]
 
         program = (
-            push_u256(7)
-            + Program()
+            Program()
+            ._emit(push_u256(7))  # patch value consumed by Patch()
             .call_contract_abi(
                 adapter,
                 "function double(uint256 x) external pure returns (uint256)",
                 Patch(),
             )
             .pop()
+            ._emit(push_u256(14))
+            ._emit(ret_u256(0))
+            ._emit(assert_ge("result below 14"))
+            ._emit(push_u256(14))
+            ._emit(ret_u256(0))
+            ._emit(assert_le("result above 14"))
             .build()
-            + push_u256(14)
-            + ret_u256(0)
-            + assert_ge("result below 14")
-            + push_u256(14)
-            + ret_u256(0)
-            + assert_le("result above 14")
         )
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
@@ -806,9 +809,12 @@ class TestDeFiVMFork:
     async def test_call_contract_abi_patch_two_uint256_args(self, ctx):
         """call_contract_abi with two Patch args patches both calldata slots.
 
-        Stores 11 in register 0 and 6 in register 1, then calls addInputs(11, 6)
-        via the high-level ABI builder with both args as Patch instances.
-        Verifies the on-chain result equals 17.
+        Pushes 11 then 6 (so 6 is TOS = first patch, 11 is second patch), then
+        calls addInputs(6, 11) via the high-level ABI builder.  Verifies the
+        on-chain result equals 17.
+
+        All operations are in a single Program so the CODECOPY data section remains
+        at the very end of the built bytecode.
         """
         w3 = ctx["w3"]
         vm = ctx["vm"]
@@ -816,9 +822,9 @@ class TestDeFiVMFork:
         adapter = ctx["adapter_address"]
 
         program = (
-            push_u256(11)
-            + push_u256(6)
-            + Program()
+            Program()
+            ._emit(push_u256(11))  # second patch value (deepest)
+            ._emit(push_u256(6))  # first patch value (TOS)
             .call_contract_abi(
                 adapter,
                 "function addInputs(uint256 a, uint256 b) external pure returns (uint256)",
@@ -826,13 +832,13 @@ class TestDeFiVMFork:
                 Patch(),
             )
             .pop()
+            ._emit(push_u256(17))
+            ._emit(ret_u256(0))
+            ._emit(assert_ge("result below 17"))
+            ._emit(push_u256(17))
+            ._emit(ret_u256(0))
+            ._emit(assert_le("result above 17"))
             .build()
-            + push_u256(17)
-            + ret_u256(0)
-            + assert_ge("result below 17")
-            + push_u256(17)
-            + ret_u256(0)
-            + assert_le("result above 17")
         )
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
@@ -841,8 +847,11 @@ class TestDeFiVMFork:
     async def test_call_contract_abi_patch_chained(self, ctx):
         """Chain two calls: first via static call_contract_abi, second with a Patch.
 
-        double(5) → 10 stored in register 0, then double(10) via call_contract_abi
-        with Patch().  Verifies the final result equals 20.
+        double(5) → 10 pushed onto stack via ret_u256, then double(10) via
+        call_contract_abi with Patch().  Verifies the final result equals 20.
+
+        All operations are in a single Program so both CODECOPY data sections
+        are appended consecutively at the very end of the built bytecode.
         """
         w3 = ctx["w3"]
         vm = ctx["vm"]
@@ -852,19 +861,22 @@ class TestDeFiVMFork:
         double_sig = "function double(uint256 x) external pure returns (uint256)"
 
         program = (
-            # Call 1: double(5) → result in retdata
-            Program().call_contract_abi(adapter, double_sig, 5).pop().build()
-            # Store result from retdata into register 0
-            + ret_u256(0)
-            # Call 2: double(reg0) using Patch
-            + Program().call_contract_abi(adapter, double_sig, Patch()).pop().build()
+            Program()
+            # Call 1: double(5) → retdata = 10
+            .call_contract_abi(adapter, double_sig, 5)
+            .pop()
+            ._emit(ret_u256(0))  # push 10 from retdata (patch value for call 2)
+            # Call 2: double(10) using Patch — 10 is at TOS
+            .call_contract_abi(adapter, double_sig, Patch())
+            .pop()
             # Verify result == 20
-            + push_u256(20)
-            + ret_u256(0)
-            + assert_ge("result below 20")
-            + push_u256(20)
-            + ret_u256(0)
-            + assert_le("result above 20")
+            ._emit(push_u256(20))
+            ._emit(ret_u256(0))
+            ._emit(assert_ge("result below 20"))
+            ._emit(push_u256(20))
+            ._emit(ret_u256(0))
+            ._emit(assert_le("result above 20"))
+            .build()
         )
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)

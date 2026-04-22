@@ -35,6 +35,7 @@ from pydefi.vm import Patch, Program, emit_abi_encode, emit_abi_encode_packed
 from pydefi.vm.program import (
     OP_ADD,
     OP_AND,
+    OP_CODECOPY,
     OP_DIV,
     OP_EQ,
     OP_GT,
@@ -120,8 +121,15 @@ class TestProgramInstructionEmission:
         assert Program().push_addr(ADDR_A).build() == push_addr(ADDR_A)
 
     def test_push_bytes(self):
+        # Program.push_bytes uses CODECOPY + a data section rather than inline PUSH32/MSTORE.
         data = b"\xde\xad\xbe\xef"
-        assert Program().push_bytes(data).build() == push_bytes(data)
+        bytecode = Program().push_bytes(data).build()
+        # The data section (zero-padded to 32 bytes) is appended at the end.
+        data_padded = data.ljust(32, b"\x00")
+        assert bytecode.endswith(data_padded)
+        # The code section contains a CODECOPY opcode.
+        code_section = bytecode[: len(bytecode) - len(data_padded)]
+        assert OP_CODECOPY in code_section
 
     def test_dup(self):
         assert Program().dup().build() == dup()
@@ -286,15 +294,19 @@ class TestProgramLabels:
 
 class TestCallContractHelper:
     def test_call_contract_matches_manual_sequence(self):
+        # Program.call_contract should produce identical bytecode to building the same
+        # sequence manually using the functional push_bytes (PUSH32/MSTORE chain).
         calldata = bytes.fromhex("a9059cbb" + "00" * 12 + "bb" * 20 + "00" * 31 + "64")
         expected = (
-            push_u256(0)
-            + push_u256(0)
-            + push_bytes(calldata)
-            + push_u256(0)
-            + push_addr(ADDR_A)
-            + gas_opcode()
-            + call(require_success=True)
+            Program()
+            ._emit(push_u256(0))
+            ._emit(push_u256(0))
+            ._emit(push_bytes(calldata))
+            ._emit(push_u256(0))
+            ._emit(push_addr(ADDR_A))
+            ._emit(gas_opcode())
+            ._emit(call(require_success=True))
+            .build()
         )
         actual = Program().call_contract(ADDR_A, calldata).build()
         assert actual == expected
@@ -302,13 +314,15 @@ class TestCallContractHelper:
     def test_call_contract_with_value_and_gas(self):
         calldata = b"\x12\x34\x56\x78"
         expected = (
-            push_u256(0)
-            + push_u256(0)
-            + push_bytes(calldata)
-            + push_u256(10**18)
-            + push_addr(ADDR_B)
-            + push_u256(50000)
-            + call(require_success=True)
+            Program()
+            ._emit(push_u256(0))
+            ._emit(push_u256(0))
+            ._emit(push_bytes(calldata))
+            ._emit(push_u256(10**18))
+            ._emit(push_addr(ADDR_B))
+            ._emit(push_u256(50000))
+            ._emit(call(require_success=True))
+            .build()
         )
         actual = Program().call_contract(ADDR_B, calldata, value=10**18, gas=50000).build()
         assert actual == expected
@@ -316,21 +330,28 @@ class TestCallContractHelper:
     def test_call_contract_no_require_success(self):
         calldata = b"\xab\xcd"
         expected = (
-            push_u256(0)
-            + push_u256(0)
-            + push_bytes(calldata)
-            + push_u256(0)
-            + push_addr(ADDR_A)
-            + gas_opcode()
-            + call(require_success=False)
+            Program()
+            ._emit(push_u256(0))
+            ._emit(push_u256(0))
+            ._emit(push_bytes(calldata))
+            ._emit(push_u256(0))
+            ._emit(push_addr(ADDR_A))
+            ._emit(gas_opcode())
+            ._emit(call(require_success=False))
+            .build()
         )
         actual = Program().call_contract(ADDR_A, calldata, require_success=False).build()
         assert actual == expected
 
     def test_call_contract_push_bytes_opcode(self):
-        # push_bytes embeds calldata as PUSH32 immediates; verify data is present
+        # call_contract uses the functional push_bytes (PUSH32/MSTORE); selector bytes
+        # are embedded inline in the bytecode.
         bytecode = Program().call_contract(ADDR_A, b"\x00").build()
-        assert b"\x00" * 32 in bytecode  # zero-padded chunk embedded via PUSH32
+        assert OP_CODECOPY not in bytecode
+        assert (
+            b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            in bytecode
+        )
 
     def test_call_contract_address_embedded(self):
         # The address should be present in the bytecode
@@ -459,7 +480,7 @@ class TestIntegration:
             .build()
         )
         assert len(bytecode) > 0
-        # Contains calldata bytes (selectors embedded via PUSH32 in push_bytes)
+        # Data sections (calldata bytes) are appended after the code section
 
 
 # ---------------------------------------------------------------------------
@@ -614,15 +635,17 @@ class TestCallWithPatches:
     _ROTATE_ARG = bytes([0x90, 0x91])
 
     def test_no_patches(self):
-        """With an empty patches list the bytecode is push_bytes + ret_frame + call."""
+        """With an empty patches list the bytecode is push_bytes (PUSH32/MSTORE) + ret_frame + call."""
         cd = self._template()
         expected = (
-            push_bytes(cd)
-            + self._RET_FRAME
-            + push_u256(0)  # value
-            + push_addr(ADDR_A)
-            + gas_opcode()
-            + call(True)
+            Program()
+            ._emit(push_bytes(cd))
+            ._emit(self._RET_FRAME)
+            ._emit(push_u256(0))  # value
+            ._emit(push_addr(ADDR_A))
+            ._emit(gas_opcode())
+            ._emit(call(True))
+            .build()
         )
         actual = Program().call_with_patches(ADDR_A, cd, []).build()
         assert actual == expected
@@ -631,14 +654,16 @@ class TestCallWithPatches:
         """Single patch: SWAP1+SWAP2+patch_value(4, 32), value consumed from stack."""
         cd = self._template()
         expected = (
-            push_bytes(cd)
-            + self._ROTATE_ARG
-            + patch_value(4, 32)
-            + self._RET_FRAME
-            + push_u256(0)  # value
-            + push_addr(ADDR_A)
-            + gas_opcode()
-            + call(True)
+            Program()
+            ._emit(push_bytes(cd))
+            ._emit(self._ROTATE_ARG)
+            ._emit(patch_value(4, 32))
+            ._emit(self._RET_FRAME)
+            ._emit(push_u256(0))  # value
+            ._emit(push_addr(ADDR_A))
+            ._emit(gas_opcode())
+            ._emit(call(True))
+            .build()
         )
         actual = Program().call_with_patches(ADDR_A, cd, [(4, 32)]).build()
         assert actual == expected
@@ -647,14 +672,16 @@ class TestCallWithPatches:
         """addr-size patch: SWAP1+SWAP2+patch_value(16, 20)."""
         cd = self._template()
         expected = (
-            push_bytes(cd)
-            + self._ROTATE_ARG
-            + patch_value(16, 20)
-            + self._RET_FRAME
-            + push_u256(0)
-            + push_addr(ADDR_A)
-            + gas_opcode()
-            + call(True)
+            Program()
+            ._emit(push_bytes(cd))
+            ._emit(self._ROTATE_ARG)
+            ._emit(patch_value(16, 20))
+            ._emit(self._RET_FRAME)
+            ._emit(push_u256(0))
+            ._emit(push_addr(ADDR_A))
+            ._emit(gas_opcode())
+            ._emit(call(True))
+            .build()
         )
         actual = Program().call_with_patches(ADDR_A, cd, [(16, 20)]).build()
         assert actual == expected
@@ -663,16 +690,18 @@ class TestCallWithPatches:
         """Multiple patches consume stack values in order."""
         cd = self._template()
         expected = (
-            push_bytes(cd)
-            + self._ROTATE_ARG
-            + patch_value(4, 32)
-            + self._ROTATE_ARG
-            + patch_value(4 + 32 + 12, 20)
-            + self._RET_FRAME
-            + push_u256(0)  # value
-            + push_addr(ADDR_A)
-            + gas_opcode()
-            + call(True)
+            Program()
+            ._emit(push_bytes(cd))
+            ._emit(self._ROTATE_ARG)
+            ._emit(patch_value(4, 32))
+            ._emit(self._ROTATE_ARG)
+            ._emit(patch_value(4 + 32 + 12, 20))
+            ._emit(self._RET_FRAME)
+            ._emit(push_u256(0))  # value
+            ._emit(push_addr(ADDR_A))
+            ._emit(gas_opcode())
+            ._emit(call(True))
+            .build()
         )
         actual = (
             Program()
@@ -692,14 +721,16 @@ class TestCallWithPatches:
         """value and gas parameters are reflected in CALL prologue."""
         cd = self._template()
         expected = (
-            push_bytes(cd)
-            + self._ROTATE_ARG
-            + patch_value(4, 32)
-            + self._RET_FRAME
-            + push_u256(10**18)  # value
-            + push_addr(ADDR_A)
-            + push_u256(50_000)  # gas
-            + call(True)
+            Program()
+            ._emit(push_bytes(cd))
+            ._emit(self._ROTATE_ARG)
+            ._emit(patch_value(4, 32))
+            ._emit(self._RET_FRAME)
+            ._emit(push_u256(10**18))  # value
+            ._emit(push_addr(ADDR_A))
+            ._emit(push_u256(50_000))  # gas
+            ._emit(call(True))
+            .build()
         )
         actual = Program().call_with_patches(ADDR_A, cd, [(4, 32)], value=10**18, gas=50_000).build()
         assert actual == expected
@@ -708,14 +739,16 @@ class TestCallWithPatches:
         """require_success=False emits CALL without the success-check block."""
         cd = self._template()
         expected = (
-            push_bytes(cd)
-            + self._ROTATE_ARG
-            + patch_value(4, 32)
-            + self._RET_FRAME
-            + push_u256(0)
-            + push_addr(ADDR_A)
-            + gas_opcode()
-            + call(False)
+            Program()
+            ._emit(push_bytes(cd))
+            ._emit(self._ROTATE_ARG)
+            ._emit(patch_value(4, 32))
+            ._emit(self._RET_FRAME)
+            ._emit(push_u256(0))
+            ._emit(push_addr(ADDR_A))
+            ._emit(gas_opcode())
+            ._emit(call(False))
+            .build()
         )
         actual = Program().call_with_patches(ADDR_A, cd, [(4, 32)], require_success=False).build()
         assert actual == expected
@@ -740,7 +773,7 @@ class TestCallWithPatches:
         combined = step1 + step2
         bytecode = combined.build()
         assert len(bytecode) > 0
-        assert bytes(cd[:4]) in bytecode  # selector embedded via PUSH32 in push_bytes
+        assert bytes(cd[:4]) in bytecode  # selector bytes embedded inline via PUSH32/MSTORE
 
     def test_dup_n_range(self):
         """dup_n emits the correct DUP opcode for each valid depth."""
@@ -774,16 +807,25 @@ class TestPatchBytesFromStack:
         assert p.build() == before
 
     def test_single_patch_bytecode(self):
-        """Verify the exact bytecode for a single patch."""
+        """Verify the exact bytecode for a single patch (using CODECOPY-based push_bytes)."""
         cd = self._template()
-        expected = push_bytes(cd) + self._ROTATE_ARG + patch_value(4, 32)
+        # Build expected using Program so the data section is correctly placed at the end.
+        expected = Program().push_bytes(cd)._emit(self._ROTATE_ARG)._emit(patch_value(4, 32)).build()
         actual = Program().push_bytes(cd).patch_bytes_from_stack([(4, 32)]).build()
         assert actual == expected
 
     def test_two_patches_bytecode(self):
         """Two patches each emit SWAP1+SWAP2+patch_value."""
         cd = self._template()
-        expected = push_bytes(cd) + self._ROTATE_ARG + patch_value(4, 32) + self._ROTATE_ARG + patch_value(36, 20)
+        expected = (
+            Program()
+            .push_bytes(cd)
+            ._emit(self._ROTATE_ARG)
+            ._emit(patch_value(4, 32))
+            ._emit(self._ROTATE_ARG)
+            ._emit(patch_value(36, 20))
+            .build()
+        )
         actual = Program().push_bytes(cd).patch_bytes_from_stack([(4, 32), (36, 20)]).build()
         assert actual == expected
 
@@ -896,7 +938,7 @@ class TestSplitSwapComposition:
 
     def test_split_swap_starts_with_push_bytes(self):
         bytecode = self._build_split_swap(60, 100)
-        # push_bytes embeds calldata as PUSH32 immediates; selector bytes must appear
+        # selector bytes appear in the data section appended after the code
         assert bytes(self._SWAP01[:4]) in bytecode
 
     def test_split_swap_contains_mul_and_div(self):
@@ -1024,9 +1066,9 @@ class TestCallContractAbi:
         assert via_abi == via_manual
 
     def test_selector_in_bytecode(self):
-        """The ERC-20 transfer selector 0xa9059cbb appears inside the built bytecode."""
+        """The ERC-20 transfer selector 0xa9059cbb appears in the built bytecode."""
         bytecode = Program().call_contract_abi(ADDR_A, "transfer(address,uint256)", ADDR_B, 1000).pop().build()
-        # The selector bytes should be somewhere inside the push_bytes payload
+        # The selector bytes appear in the data section appended after the code section.
         assert bytes.fromhex("a9059cbb") in bytecode
 
     def test_chaining(self):
@@ -1195,9 +1237,8 @@ class TestPatch:
         bytecode = Program().load_reg(0).call_contract_abi(ADDR_A, sig, [p, 999_999_999_999]).build()
         assert len(bytecode) > 0
         assert load_reg(0) in bytecode
-        # 999_999_999_999 = 0xe8d4a50fff; push_bytes splits into 32-byte chunks so
-        # the 5 significant bytes (0xe8 + 0xd4a50fff) may span a chunk boundary —
-        # check the last 4 bytes (0xd4a50fff) which are contiguous within one chunk.
+        # 999_999_999_999 = 0xe8d4a50fff; it's ABI-encoded as a 32-byte word in the
+        # data section — the last 4 bytes (0xd4a50fff) are contiguous and appear there.
         assert bytes.fromhex("d4a50fff") in bytecode
 
     def test_patch_in_nested_tuple(self):
@@ -1217,9 +1258,8 @@ class TestPatch:
         bytecode = Program().load_reg(1).call_contract_abi(ADDR_A, sig, (p, 999_999_999_999)).build()
         assert len(bytecode) > 0
         assert load_reg(1) in bytecode
-        # The static value must be baked in; push_bytes splits into 32-byte chunks
-        # so the 5 significant bytes of 999_999_999_999 (0xe8 + 0xd4a50fff) may span
-        # a boundary — check the last 4 bytes (0xd4a50fff) which are contiguous.
+        # The static value is baked into the data section — the last 4 bytes of
+        # 999_999_999_999 (0xd4a50fff) appear contiguously in the ABI-encoded word.
         assert bytes.fromhex("d4a50fff") in bytecode
 
 
@@ -1977,6 +2017,65 @@ class TestMiniEVM:
         result = self._run_int(code)
         expected = int.from_bytes(data[:32].ljust(32, b"\x00"), "big")
         assert result == expected
+
+    # ------------------------------------------------------------------
+    # Program.push_bytes (CODECOPY-based)
+    # ------------------------------------------------------------------
+
+    def test_program_push_bytes_length(self):
+        # Program.push_bytes uses CODECOPY + data section.
+        # All post-push code must be part of the same Program so the data section
+        # stays at the end of the built bytecode.
+        data = b"hello world"
+        code = Program().push_bytes(data)._emit(pop())._emit(RETURN_TOP).build()
+        assert self._run_int(code) == len(data)
+
+    def test_program_push_bytes_offset_is_free_memory_pointer(self):
+        # argsOffset should be the free-memory pointer (0x280 on first use).
+        data = b"hello world"
+        code = Program().push_bytes(data)._emit(swap())._emit(pop())._emit(RETURN_TOP).build()
+        assert self._run_int(code) == 0x280
+
+    def test_program_push_bytes_data_written_to_memory(self):
+        # CODECOPY places the data at argsOffset; read it back via MLOAD.
+        data = b"\xde\xad\xbe\xef" + b"\x00" * 28
+        code = (
+            Program()
+            .push_bytes(data)
+            ._emit(swap())  # [argsLen, argsOffset=0x280]
+            ._emit(pop())  # [argsOffset=0x280]
+            ._emit(bytes([0x51]))  # MLOAD  → 32 bytes at mem[0x280]
+            ._emit(RETURN_TOP)
+            .build()
+        )
+        result = self._run_int(code)
+        expected = int.from_bytes(data[:32].ljust(32, b"\x00"), "big")
+        assert result == expected
+
+    def test_program_push_bytes_large_data(self):
+        # A 256-byte payload: verify argsLen is reported correctly.
+        data = bytes(range(256))  # 0x00..0xff
+        len_code = Program().push_bytes(data)._emit(pop())._emit(RETURN_TOP).build()
+        assert self._run_int(len_code) == 256
+
+    def test_program_push_bytes_multiple_sections(self):
+        # Two sequential push_bytes calls allocate memory consecutively.
+        data1 = b"AAAA" + b"\x00" * 28
+        data2 = b"BBBB" + b"\x00" * 28
+        # After two push_bytes: stack (bottom to top) = [off1, len1, off2, len2]
+        # Second allocation is at 0x280 + 32 = 0x2A0.
+        code = (
+            Program()
+            .push_bytes(data1)
+            .push_bytes(data2)
+            ._emit(swap())  # [len2, off2, off1, len1]
+            ._emit(pop())  # [off2, off1, len1]
+            ._emit(bytes([0x51]))  # MLOAD mem[off2=0x2A0]
+            ._emit(RETURN_TOP)
+            .build()
+        )
+        expected = int.from_bytes(data2[:32], "big")
+        assert self._run_int(code) == expected
 
     # ------------------------------------------------------------------
     # self_addr
