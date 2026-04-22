@@ -172,6 +172,7 @@ two separate destinations using arithmetic and composition::
 from __future__ import annotations
 
 import struct
+from copy import deepcopy
 from typing import TYPE_CHECKING, cast
 
 from eth_abi.abi import encode_with_hooks
@@ -376,6 +377,20 @@ class Program:
             self._materialize_plan_to_manual()
         self._buf.extend(data)
         return self
+
+    @classmethod
+    def _snapshot(cls, source: "Program") -> "Program":
+        """Return a detached copy of *source* that shares no mutable state."""
+        snap = cls()
+        snap._buf.extend(source._buf)
+        snap._labels.update(source._labels)
+        snap._fixups.extend(source._fixups)
+        snap._data_sections.extend(source._data_sections)
+        snap._data_fixups.extend(source._data_fixups)
+        snap._venom_enabled = source._venom_enabled
+        snap._venom_plan = deepcopy(source._venom_plan)
+        snap._venom_prefix_stack = list(source._venom_prefix_stack)
+        return snap
 
     def _is_pristine(self) -> bool:
         return (
@@ -1229,27 +1244,27 @@ class Program:
         Returns:
             ``self`` for chaining.
         """
-        # Materialize any pending Venom state (prefix-stack pushes and/or a
-        # pending call plan) to _buf before merging.  self must flush first so
-        # bytes stay in order; other is flushed so its _buf is complete before copy.
+        # Flush self's pending Venom state into _buf first so bytes stay in order.
         if self._venom_enabled and (self._venom_prefix_stack or self._venom_plan is not None):
             self._materialize_plan_to_manual()
-        if other._venom_enabled and (other._venom_prefix_stack or other._venom_plan is not None):
-            other._materialize_plan_to_manual()
+        # Snapshot other so extend() never mutates its argument.
+        src = Program._snapshot(other)
+        if src._venom_enabled and (src._venom_prefix_stack or src._venom_plan is not None):
+            src._materialize_plan_to_manual()
         # Pre-validate label collisions before mutating internal state to
         # avoid leaving this Program instance in a partially-updated state.
-        for name in other._labels:
+        for name in src._labels:
             if name in self._labels:
                 raise ValueError(f"Program: duplicate label {name!r} during extend")
         buf_offset = len(self._buf)
         ds_offset = len(self._data_sections)
-        self._buf.extend(other._buf)
-        for name, pos in other._labels.items():
+        self._buf.extend(src._buf)
+        for name, pos in src._labels.items():
             self._labels[name] = pos + buf_offset
-        for fixup_off, name in other._fixups:
+        for fixup_off, name in src._fixups:
             self._fixups.append((fixup_off + buf_offset, name))
-        self._data_sections.extend(other._data_sections)
-        for fixup_pos, ds_idx in other._data_fixups:
+        self._data_sections.extend(src._data_sections)
+        for fixup_pos, ds_idx in src._data_fixups:
             self._data_fixups.append((fixup_pos + buf_offset, ds_idx + ds_offset))
         return self
 
@@ -1260,19 +1275,7 @@ class Program:
 
         Raises :exc:`ValueError` on duplicate label names.
         """
-        # Materialize self's pending Venom state before copying.
-        # Materialization is idempotent: it moves speculative state (prefix
-        # stack / plan) into _buf; the resulting bytecode is identical.
-        if self._venom_enabled and (self._venom_prefix_stack or self._venom_plan is not None):
-            self._materialize_plan_to_manual()
-        result = Program()
-        result._buf.extend(self._buf)
-        result._labels.update(self._labels)
-        result._fixups.extend(self._fixups)
-        result._data_sections.extend(self._data_sections)
-        result._data_fixups.extend(self._data_fixups)
-        result.extend(other)
-        return result
+        return Program._snapshot(self).extend(other)
 
     def __iadd__(self, other: "Program") -> "Program":
         """Extend this program in-place (``self += other``)."""

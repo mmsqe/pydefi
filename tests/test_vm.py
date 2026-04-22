@@ -618,6 +618,25 @@ class TestProgramComposition:
         assert p1.build() == push_u256(7)
         assert p2.build() == push_u256(8)
 
+    def test_add_does_not_mutate_pending_venom_plans(self):
+        if not venom_is_available():
+            pytest.skip("Venom backend unavailable")
+
+        p1 = Program.create().call_contract(ADDR_A, b"\x12\x34")
+        p2 = Program.create().call_contract(ADDR_B, b"\xaa")
+
+        assert p1.has_pending_venom_plan is True
+        assert p1.pending_venom_plan_kind == "call_contract"
+        assert p2.has_pending_venom_plan is True
+        assert p2.pending_venom_plan_kind == "call_contract"
+
+        _ = p1 + p2
+
+        assert p1.has_pending_venom_plan is True
+        assert p1.pending_venom_plan_kind == "call_contract"
+        assert p2.has_pending_venom_plan is True
+        assert p2.pending_venom_plan_kind == "call_contract"
+
 
 # ---------------------------------------------------------------------------
 # Program: call_with_patches (stack-based calldata surgery)
