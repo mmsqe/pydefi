@@ -67,6 +67,7 @@ OP_JUMPDEST: int = 0x5B  # JUMPDEST — marks a valid jump target
 OP_RETURNDATACOPY: int = 0x3E  # RETURNDATACOPY — copy returndata into memory
 OP_STATICCALL: int = 0xFA  # STATICCALL — used by balance_of() ERC-20 path
 OP_REVERT: int = 0xFD  # REVERT
+OP_CODECOPY: int = 0x39  # CODECOPY — copy bytecode slice into memory
 
 # ---------------------------------------------------------------------------
 # Private module-level opcode aliases (used only inside multi-opcode helpers)
@@ -74,6 +75,7 @@ OP_REVERT: int = 0xFD  # REVERT
 
 _PUSH1: int = 0x60  # PUSH1 — followed by one immediate byte
 _PUSH2: int = 0x61  # PUSH2 — followed by two immediate bytes (= OP_JUMP first byte)
+_PUSH4: int = 0x63  # PUSH4 — followed by four immediate bytes
 _PC: int = 0x58  # PC — push current program counter
 _JUMP: int = 0x56  # JUMP raw opcode (inside multi-opcode sequences)
 _JUMPI: int = 0x57  # JUMPI raw opcode
@@ -85,6 +87,23 @@ _DUP6: int = 0x85  # DUP6
 _SWAP2: int = 0x91  # SWAP2
 _SWAP3: int = 0x92  # SWAP3
 _OP_RETURN: int = 0xF3  # RETURN — end execution and return data from memory
+
+
+# ---------------------------------------------------------------------------
+# Shared helper
+# ---------------------------------------------------------------------------
+
+
+def _push_imm(v: int) -> bytes:
+    """Return the smallest PUSH opcode sequence for a non-negative integer *v*."""
+    if v <= 0xFF:
+        return bytes([_PUSH1, v])
+    elif v <= 0xFFFF:
+        return bytes([_PUSH2, v >> 8, v & 0xFF])
+    else:
+        n = (v.bit_length() + 7) // 8
+        return bytes([0x5F + n]) + v.to_bytes(n, "big")
+
 
 # ---------------------------------------------------------------------------
 # Stack instructions
@@ -152,16 +171,6 @@ def push_bytes(data: bytes) -> bytes:
         raise ValueError(f"push_bytes: data too large ({len(data)} bytes, max 65535)")
     blen = len(data)
     blen_padded = (blen + 31) & ~31
-
-    def _push_imm(v: int) -> bytes:
-        """Smallest PUSH opcode for non-negative integer *v* (1–3 bytes)."""
-        if v <= 0xFF:
-            return bytes([_PUSH1, v])  # PUSH1
-        elif v <= 0xFFFF:
-            return bytes([_PUSH2, v >> 8, v & 0xFF])  # PUSH2
-        else:
-            n = (v.bit_length() + 7) // 8
-            return bytes([0x5F + n]) + v.to_bytes(n, "big")
 
     # Build the output in a list of chunks to avoid O(n²) bytes concatenation.
     parts: list[bytes] = []
