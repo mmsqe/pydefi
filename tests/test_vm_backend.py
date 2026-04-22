@@ -15,79 +15,35 @@ from pydefi.vm.builder import (
     compile_venom_push_bytes_probe,
     compile_venom_smoke_bytecode,
     compile_venom_two_data_sections_probe,
-    create_program,
     venom_is_available,
 )
 from pydefi.vm.program import add, pop, push_u256
 from tests.conftest import RETURN_TOP, mini_evm
 
-
-def test_create_program_defaults_to_venom_backend_when_available():
-    program = create_program()
-    assert type(program) is Program
-
-
-def test_program_create_defaults_to_venom_backend_when_available():
-    program = Program.create()
-    assert type(program) is Program
-
-
-def test_create_program_unknown_backend_raises():
-    with pytest.raises(TypeError, match="backend"):
-        create_program(backend="does-not-exist")
-
-
-def test_program_create_unknown_backend_raises():
-    with pytest.raises(TypeError, match="backend"):
-        Program.create(backend="does-not-exist")
-
-
-def test_create_program_venom_falls_back_when_unavailable_only_if_not_required():
-    program = create_program(require_venom=False)
-    assert isinstance(program, Program)
-
-
-def test_create_program_manual_backend_is_rejected():
-    with pytest.raises(TypeError, match="backend"):
-        create_program(backend="manual")
-
-
-def test_program_create_manual_backend_is_rejected():
-    with pytest.raises(TypeError, match="backend"):
-        Program.create(backend="manual")
-
-
-def test_create_program_default_selection_uses_venom_when_available():
-    program = create_program()
-    assert type(program) is Program
-
-
-def test_program_create_default_selection_uses_venom_when_available():
-    program = Program.create()
-    assert type(program) is Program
+# ---------------------------------------------------------------------------
+# Basic factory / execution smoke tests
+# ---------------------------------------------------------------------------
 
 
 def test_backend_parity_addition_program():
-    program = Program.create(require_venom=False)
-    bytecode = program.push_u256(3).push_u256(5)._emit(add()).build()
+    bytecode = Program().push_u256(3).push_u256(5)._emit(add()).build()
     result = mini_evm(bytecode + RETURN_TOP)
-    assert not result.is_error, "venom backend add program reverted"
+    assert not result.is_error
     assert int.from_bytes(result.output, "big") == 8
 
 
 def test_backend_parity_push_bytes_length_semantics():
     payload = b"abcdef"
-    program = Program.create(require_venom=False)
-    bytecode = program.push_bytes(payload)._emit(pop())._emit(RETURN_TOP).build()
+    bytecode = Program().push_bytes(payload)._emit(pop())._emit(RETURN_TOP).build()
     result = mini_evm(bytecode)
-    assert not result.is_error, "venom backend push_bytes length probe reverted"
+    assert not result.is_error
     assert int.from_bytes(result.output, "big") == len(payload)
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_create_program_venom_returns_venom_program_when_available():
-    program = create_program(require_venom=True)
-    assert type(program) is Program
+# ---------------------------------------------------------------------------
+# Venom compilation pipeline probes
+# (skipped when Vyper is not installed)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
@@ -152,7 +108,6 @@ def test_compile_venom_memory_progression_probe_returns_expected_free_ptr():
 
 @pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_compile_venom_call_contract_probe_returns_success_flag():
-    # CALL to an EOA/non-contract with value=0 should succeed and return 1.
     target = HexBytes("0x" + "99" * 20)
     bytecode = compile_venom_call_contract_probe(target, b"\x12\x34\x56\x78")
     result = mini_evm(bytecode)
@@ -299,6 +254,11 @@ def test_compile_venom_patch_preview_probe_matches_manual_for_patched_word():
     assert int.from_bytes(venom_result.output, "big") == int.from_bytes(manual_result.output, "big")
 
 
+# ---------------------------------------------------------------------------
+# DAG program builder
+# ---------------------------------------------------------------------------
+
+
 def _mk_test_dag() -> RouteDAG:
     token_in = Token(chain_id=1, address=HexBytes("0x" + "11" * 20), symbol="TKA", decimals=18)
     token_out = Token(chain_id=1, address=HexBytes("0x" + "22" * 20), symbol="TKB", decimals=18)
@@ -335,180 +295,56 @@ def test_build_quote_program_for_dag_uses_backend_selection():
     assert type(program) is Program
 
 
-def test_backend_parity_call_contract_bytecode():
-    target = HexBytes("0x" + "77" * 20)
-    calldata = b"\x12\x34\x56\x78"
-
-    manual = Program().call_contract(target, calldata).build()
-    venom = Program.create(require_venom=False).call_contract(target, calldata).build()
-    if venom_is_available():
-        manual_result = mini_evm(manual + RETURN_TOP)
-        venom_result = mini_evm(venom + RETURN_TOP)
-        assert not manual_result.is_error
-        assert not venom_result.is_error
-        assert int.from_bytes(venom_result.output, "big") == int.from_bytes(manual_result.output, "big")
-    else:
-        assert venom == manual
+# ---------------------------------------------------------------------------
+# Program EVM behavior: call_contract and call_with_patches
+# ---------------------------------------------------------------------------
 
 
-def test_backend_parity_call_with_patches_bytecode():
-    target = HexBytes("0x" + "88" * 20)
-    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
-    patches = [(4, 32)]
-
-    manual = Program().call_with_patches(target, template, patches).build()
-    venom = Program.create(require_venom=False).call_with_patches(target, template, patches).build()
-    assert venom == manual
-
-
-def test_venom_program_call_with_patches_empty_uses_behavior_parity():
-    target = HexBytes("0x" + "8a" * 20)
-    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
-
-    manual = Program().call_with_patches(target, template, []).build()
-    venom = Program.create(require_venom=False).call_with_patches(target, template, []).build()
-
-    if venom_is_available():
-        manual_result = mini_evm(manual + RETURN_TOP)
-        venom_result = mini_evm(venom + RETURN_TOP)
-        assert not manual_result.is_error
-        assert not venom_result.is_error
-        assert int.from_bytes(venom_result.output, "big") == int.from_bytes(manual_result.output, "big")
-    else:
-        assert venom == manual
-
-
-def test_venom_program_call_with_patches_stack_literal_case_behavior_parity():
-    target = HexBytes("0x" + "8b" * 20)
-    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
-
-    venom = Program.create(require_venom=False).push_u256(123).call_with_patches(target, template, [(4, 32)]).build()
-    manual = Program().push_u256(123).call_with_patches(target, template, [(4, 32)]).build()
-    if venom_is_available():
-        manual_result = mini_evm(manual + RETURN_TOP)
-        venom_result = mini_evm(venom + RETURN_TOP)
-        assert not manual_result.is_error
-        assert not venom_result.is_error
-        assert int.from_bytes(venom_result.output, "big") == int.from_bytes(manual_result.output, "big")
-    else:
-        assert venom == manual
-
-
-def test_venom_program_call_with_patches_non_literal_stack_case_falls_back_to_manual():
-    target = HexBytes("0x" + "8e" * 20)
-    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
-
-    venom = (
-        Program.create(require_venom=False)
-        .call_contract(target, b"\x12\x34")
-        .ret_u256(0)
-        .call_with_patches(target, template, [(4, 32)])
-        .build()
-    )
-    manual = (
-        Program().call_contract(target, b"\x12\x34").ret_u256(0).call_with_patches(target, template, [(4, 32)]).build()
-    )
-    assert venom == manual
-
-
-def test_venom_program_call_with_patches_empty_then_pop_behavior_parity():
-    target = HexBytes("0x" + "8c" * 20)
-    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
-
-    manual = Program().call_with_patches(target, template, []).pop().build()
-    venom = Program.create(require_venom=False).call_with_patches(target, template, []).pop().build()
-
-    if venom_is_available():
-        manual_result = mini_evm(manual)
-        venom_result = mini_evm(venom)
-        assert not manual_result.is_error
-        assert not venom_result.is_error
-        assert venom_result.output == manual_result.output
-    else:
-        assert venom == manual
-
-
-def test_venom_program_call_then_pop_then_mutate_falls_back_to_manual():
-    target = HexBytes("0x" + "8d" * 20)
-    calldata = b"\x12\x34"
-
-    venom = Program.create(require_venom=False).call_contract(target, calldata).pop().push_u256(1).build()
-    manual = Program().call_contract(target, calldata).pop().push_u256(1).build()
-    assert venom == manual
-
-
-def test_venom_program_call_contract_falls_back_to_manual_when_mutated():
-    target = HexBytes("0x" + "7a" * 20)
-    calldata = b"\x12\x34\x56\x78"
-
-    venom = Program.create(require_venom=False).call_contract(target, calldata).pop().build()
-    manual = Program().call_contract(target, calldata).pop().build()
-    assert venom == manual
-
-
-def test_venom_program_call_contract_then_pop_behavior_parity():
+def test_call_contract_then_pop_evm_behavior():
     target = HexBytes("0x" + "7b" * 20)
     calldata = b"\x12\x34\x56\x78"
-
-    manual = Program().call_contract(target, calldata).pop().build()
-    venom = Program.create(require_venom=False).call_contract(target, calldata).pop().build()
-
-    if venom_is_available():
-        manual_result = mini_evm(manual)
-        venom_result = mini_evm(venom)
-        assert not manual_result.is_error
-        assert not venom_result.is_error
-        assert venom_result.output == manual_result.output
-    else:
-        assert venom == manual
+    result = mini_evm(Program().call_contract(target, calldata).pop().build())
+    assert not result.is_error
+    assert result.output == b""
 
 
-def test_venom_program_call_contract_abi_no_patch_behavior_parity():
+def test_call_with_patches_empty_then_pop_evm_behavior():
+    target = HexBytes("0x" + "8c" * 20)
+    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
+    result = mini_evm(Program().call_with_patches(target, template, []).pop().build())
+    assert not result.is_error
+    assert result.output == b""
+
+
+def test_call_with_patches_stack_literal_evm_behavior():
+    target = HexBytes("0x" + "8b" * 20)
+    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
+    result = mini_evm(Program().push_u256(123).call_with_patches(target, template, [(4, 32)])._emit(RETURN_TOP).build())
+    assert not result.is_error
+
+
+def test_call_contract_abi_no_patch_evm_behavior():
     target = HexBytes("0x" + "9a" * 20)
-
-    manual = Program().call_contract_abi(target, "function ping() external").build()
-    venom = Program.create(require_venom=False).call_contract_abi(target, "function ping() external").build()
-
-    if venom_is_available():
-        manual_result = mini_evm(manual + RETURN_TOP)
-        venom_result = mini_evm(venom + RETURN_TOP)
-        assert not manual_result.is_error
-        assert not venom_result.is_error
-        assert int.from_bytes(venom_result.output, "big") == int.from_bytes(manual_result.output, "big")
-    else:
-        assert venom == manual
+    result = mini_evm(Program().call_contract_abi(target, "function ping() external").build() + RETURN_TOP)
+    assert not result.is_error
 
 
-def test_venom_program_call_contract_abi_patch_case_behavior_parity():
+def test_call_contract_abi_patch_evm_behavior():
     target = HexBytes("0x" + "9b" * 20)
-
-    venom = (
-        Program.create(require_venom=False)
-        .push_u256(123)
-        .call_contract_abi(target, "function set(uint256 value) external", Patch())
-        .build()
+    result = mini_evm(
+        Program().push_u256(123).call_contract_abi(target, "function set(uint256 value) external", Patch()).build()
+        + RETURN_TOP
     )
-    manual = Program().push_u256(123).call_contract_abi(target, "function set(uint256 value) external", Patch()).build()
-    if venom_is_available():
-        manual_result = mini_evm(manual + RETURN_TOP)
-        venom_result = mini_evm(venom + RETURN_TOP)
-        assert not manual_result.is_error
-        assert not venom_result.is_error
-        assert int.from_bytes(venom_result.output, "big") == int.from_bytes(manual_result.output, "big")
-    else:
-        assert venom == manual
+    assert not result.is_error
 
 
-def test_venom_program_call_contract_abi_no_patch_falls_back_when_mutated():
-    target = HexBytes("0x" + "9c" * 20)
-
-    venom = Program.create(require_venom=False).call_contract_abi(target, "function ping() external").pop().build()
-    manual = Program().call_contract_abi(target, "function ping() external").pop().build()
-    assert venom == manual
+# ---------------------------------------------------------------------------
+# Venom plan state introspection
+# ---------------------------------------------------------------------------
 
 
 def test_venom_program_plan_state_for_call_contract():
-    program = Program.create(require_venom=False)
+    program = Program.create()
     if not venom_is_available():
         pytest.skip("Venom backend unavailable")
 
@@ -521,7 +357,7 @@ def test_venom_program_plan_state_for_call_contract():
 
 
 def test_venom_program_plan_clears_when_mutated_after_call_contract():
-    program = Program.create(require_venom=False)
+    program = Program.create()
     if not venom_is_available():
         pytest.skip("Venom backend unavailable")
 
@@ -540,7 +376,7 @@ def test_venom_program_plan_clears_when_mutated_after_call_contract():
 
 
 def test_venom_program_plan_state_for_empty_call_with_patches():
-    program = Program.create(require_venom=False)
+    program = Program.create()
     if not venom_is_available():
         pytest.skip("Venom backend unavailable")
 
@@ -550,7 +386,7 @@ def test_venom_program_plan_state_for_empty_call_with_patches():
 
 
 def test_venom_program_plan_for_stack_literal_patch_case():
-    program = Program.create(require_venom=False)
+    program = Program.create()
     if not venom_is_available():
         pytest.skip("Venom backend unavailable")
 
@@ -560,7 +396,7 @@ def test_venom_program_plan_for_stack_literal_patch_case():
 
 
 def test_venom_program_no_plan_for_mismatched_stack_literal_patch_case():
-    program = Program.create(require_venom=False)
+    program = Program.create()
     if not venom_is_available():
         pytest.skip("Venom backend unavailable")
 

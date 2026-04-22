@@ -32,6 +32,11 @@ from eth_utils import keccak
 
 from pydefi.types import Address
 from pydefi.vm import Patch, Program, emit_abi_encode, emit_abi_encode_packed
+from pydefi.vm.builder import (
+    compile_venom_call_contract_probe,
+    compile_venom_call_with_patches_probe,
+    venom_is_available,
+)
 from pydefi.vm.program import (
     OP_ADD,
     OP_AND,
@@ -294,64 +299,73 @@ class TestProgramLabels:
 
 class TestCallContractHelper:
     def test_call_contract_matches_manual_sequence(self):
-        # Program.call_contract should produce identical bytecode to building the same
-        # sequence manually using the functional push_bytes (PUSH32/MSTORE chain).
         calldata = bytes.fromhex("a9059cbb" + "00" * 12 + "bb" * 20 + "00" * 31 + "64")
-        expected = (
-            Program()
-            ._emit(push_u256(0))
-            ._emit(push_u256(0))
-            ._emit(push_bytes(calldata))
-            ._emit(push_u256(0))
-            ._emit(push_addr(ADDR_A))
-            ._emit(gas_opcode())
-            ._emit(call(require_success=True))
-            .build()
-        )
+        if venom_is_available():
+            expected = compile_venom_call_contract_probe(ADDR_A, calldata, require_success=True)
+        else:
+            expected = (
+                Program()
+                ._emit(push_u256(0))
+                ._emit(push_u256(0))
+                ._emit(push_bytes(calldata))
+                ._emit(push_u256(0))
+                ._emit(push_addr(ADDR_A))
+                ._emit(gas_opcode())
+                ._emit(call(require_success=True))
+                .build()
+            )
         actual = Program().call_contract(ADDR_A, calldata).build()
         assert actual == expected
 
     def test_call_contract_with_value_and_gas(self):
         calldata = b"\x12\x34\x56\x78"
-        expected = (
-            Program()
-            ._emit(push_u256(0))
-            ._emit(push_u256(0))
-            ._emit(push_bytes(calldata))
-            ._emit(push_u256(10**18))
-            ._emit(push_addr(ADDR_B))
-            ._emit(push_u256(50000))
-            ._emit(call(require_success=True))
-            .build()
-        )
+        if venom_is_available():
+            expected = compile_venom_call_contract_probe(
+                ADDR_B, calldata, value=10**18, gas=50000, require_success=True
+            )
+        else:
+            expected = (
+                Program()
+                ._emit(push_u256(0))
+                ._emit(push_u256(0))
+                ._emit(push_bytes(calldata))
+                ._emit(push_u256(10**18))
+                ._emit(push_addr(ADDR_B))
+                ._emit(push_u256(50000))
+                ._emit(call(require_success=True))
+                .build()
+            )
         actual = Program().call_contract(ADDR_B, calldata, value=10**18, gas=50000).build()
         assert actual == expected
 
     def test_call_contract_no_require_success(self):
         calldata = b"\xab\xcd"
-        expected = (
-            Program()
-            ._emit(push_u256(0))
-            ._emit(push_u256(0))
-            ._emit(push_bytes(calldata))
-            ._emit(push_u256(0))
-            ._emit(push_addr(ADDR_A))
-            ._emit(gas_opcode())
-            ._emit(call(require_success=False))
-            .build()
-        )
+        if venom_is_available():
+            expected = compile_venom_call_contract_probe(ADDR_A, calldata, require_success=False)
+        else:
+            expected = (
+                Program()
+                ._emit(push_u256(0))
+                ._emit(push_u256(0))
+                ._emit(push_bytes(calldata))
+                ._emit(push_u256(0))
+                ._emit(push_addr(ADDR_A))
+                ._emit(gas_opcode())
+                ._emit(call(require_success=False))
+                .build()
+            )
         actual = Program().call_contract(ADDR_A, calldata, require_success=False).build()
         assert actual == expected
 
     def test_call_contract_push_bytes_opcode(self):
-        # call_contract uses the functional push_bytes (PUSH32/MSTORE); selector bytes
-        # are embedded inline in the bytecode.
         bytecode = Program().call_contract(ADDR_A, b"\x00").build()
-        assert OP_CODECOPY not in bytecode
-        assert (
-            b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-            in bytecode
-        )
+        if venom_is_available():
+            # Venom path stores calldata in a data section and copies it via CODECOPY.
+            assert OP_CODECOPY in bytecode
+        else:
+            # Manual path embeds calldata inline via PUSH32/MSTORE.
+            assert OP_CODECOPY not in bytecode
+            assert b"\x00" * 32 in bytecode
 
     def test_call_contract_address_embedded(self):
         # The address should be present in the bytecode
@@ -635,18 +649,23 @@ class TestCallWithPatches:
     _ROTATE_ARG = bytes([0x90, 0x91])
 
     def test_no_patches(self):
-        """With an empty patches list the bytecode is push_bytes (PUSH32/MSTORE) + ret_frame + call."""
+        """With an empty patches list the program issues a CALL with the full calldata template."""
         cd = self._template()
-        expected = (
-            Program()
-            ._emit(push_bytes(cd))
-            ._emit(self._RET_FRAME)
-            ._emit(push_u256(0))  # value
-            ._emit(push_addr(ADDR_A))
-            ._emit(gas_opcode())
-            ._emit(call(True))
-            .build()
-        )
+        if venom_is_available():
+            expected = compile_venom_call_with_patches_probe(
+                ADDR_A, cd, patches=[], patch_values=[], require_success=True, return_success=True
+            )
+        else:
+            expected = (
+                Program()
+                ._emit(push_bytes(cd))
+                ._emit(self._RET_FRAME)
+                ._emit(push_u256(0))  # value
+                ._emit(push_addr(ADDR_A))
+                ._emit(gas_opcode())
+                ._emit(call(True))
+                .build()
+            )
         actual = Program().call_with_patches(ADDR_A, cd, []).build()
         assert actual == expected
 

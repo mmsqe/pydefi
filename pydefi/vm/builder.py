@@ -350,9 +350,7 @@ class Program:
     Call :meth:`build` at the end to obtain the final ``bytes`` bytecode.
     """
 
-    def __init__(self, *, require_venom: bool = False) -> None:
-        if require_venom and not venom_is_available():
-            raise ImportError(f"Vyper Venom APIs are unavailable: {venom_import_error()}")
+    def __init__(self) -> None:
         self._buf: bytearray = bytearray()
         self._labels: dict[str, int] = {}
         self._fixups: list[tuple[int, str]] = []  # (u16 offset in _buf, label name)
@@ -363,13 +361,13 @@ class Program:
         self._venom_prefix_stack: list[tuple[str, int]] = []
 
     @classmethod
-    def create(cls, *, require_venom: bool = False) -> "Program":
+    def create(cls) -> "Program":
         """Create a program builder via factory semantics.
 
         The VM builder uses a single Program type; Venom planning is enabled
         automatically when local Vyper Venom APIs are importable.
         """
-        return create_program(require_venom=require_venom)
+        return create_program()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1973,11 +1971,11 @@ def compile_venom_patch_preview_probe(
     return bytecode
 
 
-def create_program(*, require_venom: bool = False) -> Program:
+def create_program() -> Program:
     """Create a VM program builder instance.
 
     The VM builder surface now exposes a single Program type. Venom planning
     is used opportunistically when available; the same Program instance
     materializes to manual bytecode when Venom is unavailable.
     """
-    return Program(require_venom=require_venom)
+    return Program()

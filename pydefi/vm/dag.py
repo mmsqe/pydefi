@@ -115,7 +115,7 @@ def _build_program_for_dag(
     if not actions:
         raise ValueError("build_program_for_dag: route DAG must contain at least one action")
 
-    segments: list[Program] = [Program.create()._emit(push_u256(amount_in))]
+    segments: list[Program] = [Program()._emit(push_u256(amount_in))]
     segments.extend(
         _build_dag_actions(
             actions,
@@ -126,14 +126,14 @@ def _build_program_for_dag(
 
     if min_final_out > 0:
         segments.append(
-            Program.create()
+            Program()
             ._emit(dup())
             ._emit(push_u256(min_final_out))
             ._emit(swap())
             ._emit(assert_ge("slippage: out too low"))
         )
 
-    return type(segments[0]).compose(segments)
+    return Program.compose(segments)
 
 
 def _build_dag_actions(
@@ -188,7 +188,7 @@ def _build_split_frame(
     # Runtime guard: for each leg we compute total_in * fraction_bps / 10_000.
     # Enforce `total_in <= floor((2**256-1)/10_000)` before any multiplication.
     segments: list[Program] = [
-        Program.create()
+        Program()
         ._emit(dup())
         ._emit(push_u256(_MAX_TOTAL_IN_FOR_SPLIT))
         ._emit(swap())
@@ -197,7 +197,7 @@ def _build_split_frame(
     ]
     for leg in split.legs:
         segments.append(
-            Program.create()
+            Program()
             ._emit(dup2())  # duplicate split frame total_in (2nd item in [.., total_in, accum])
             ._emit(push_u256(leg.fraction_bps))
             ._emit(mul())
@@ -206,9 +206,9 @@ def _build_split_frame(
             ._emit(div())
         )
         segments.extend(build_leg_actions(leg.actions))
-        segments.append(Program.create()._emit(add()))
+        segments.append(Program()._emit(add()))
 
-    segments.append(Program.create()._emit(swap())._emit(pop()))
+    segments.append(Program()._emit(swap())._emit(pop()))
     return segments
 
 
