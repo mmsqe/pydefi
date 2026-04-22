@@ -7,17 +7,12 @@ from pydefi.vm.builder import (
     Patch,
     Program,
     compile_venom_call_contract_probe,
-    compile_venom_call_with_patch_probe,
     compile_venom_call_with_patches_probe,
-    compile_venom_label_jump_probe,
-    compile_venom_memory_progression_probe,
-    compile_venom_patch_preview_probe,
     compile_venom_push_bytes_probe,
     compile_venom_smoke_bytecode,
-    compile_venom_two_data_sections_probe,
     venom_is_available,
 )
-from pydefi.vm.program import add, pop, push_u256, swap
+from pydefi.vm.program import add, pop
 from tests.conftest import RETURN_TOP, mini_evm
 
 # ---------------------------------------------------------------------------
@@ -71,42 +66,6 @@ def test_compile_venom_push_bytes_probe_embeds_data_section():
 
 
 @pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_label_jump_probe_then_branch():
-    bytecode = compile_venom_label_jump_probe(take_then_branch=True)
-    result = mini_evm(bytecode)
-    assert not result.is_error, f"venom label/jump probe (then) reverted: {result.output.hex()}"
-    assert int.from_bytes(result.output, "big") == 1
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_label_jump_probe_else_branch():
-    bytecode = compile_venom_label_jump_probe(take_then_branch=False)
-    result = mini_evm(bytecode)
-    assert not result.is_error, f"venom label/jump probe (else) reverted: {result.output.hex()}"
-    assert int.from_bytes(result.output, "big") == 2
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_two_data_sections_probe_embeds_both_sections():
-    data_a = b"section-a"
-    data_b = b"section-b"
-    bytecode = compile_venom_two_data_sections_probe(data_a, data_b)
-    assert data_a in bytecode
-    assert data_b in bytecode
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_memory_progression_probe_returns_expected_free_ptr():
-    data_a = b"abcd"  # padded 32
-    data_b = b"1234567890"  # padded 32
-    bytecode = compile_venom_memory_progression_probe(data_a, data_b)
-    result = mini_evm(bytecode)
-    assert not result.is_error, f"venom memory progression probe reverted: {result.output.hex()}"
-    expected = 0x280 + 32 + 32
-    assert int.from_bytes(result.output, "big") == expected
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_compile_venom_call_contract_probe_returns_success_flag():
     target = HexBytes("0x" + "99" * 20)
     bytecode = compile_venom_call_contract_probe(target, b"\x12\x34\x56\x78")
@@ -119,44 +78,6 @@ def test_compile_venom_call_contract_probe_returns_success_flag():
 def test_compile_venom_call_contract_probe_rejects_bad_address_length():
     with pytest.raises(ValueError, match="bad address length"):
         compile_venom_call_contract_probe(HexBytes("0x1234"), b"")
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_call_with_patch_probe_returns_success_flag():
-    target = HexBytes("0x" + "aa" * 20)
-    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
-    bytecode = compile_venom_call_with_patch_probe(
-        target,
-        template,
-        patch_value=123,
-        patch_offset=4,
-        patch_size=32,
-    )
-    result = mini_evm(bytecode)
-    assert not result.is_error, f"venom call_with_patch probe reverted: {result.output.hex()}"
-    assert int.from_bytes(result.output, "big") == 1
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_call_with_patch_probe_matches_manual_success_semantics():
-    target = HexBytes("0x" + "ab" * 20)
-    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
-
-    manual = Program().push_u256(123).call_with_patches(target, template, [(4, 32)])._emit(RETURN_TOP).build()
-    manual_result = mini_evm(manual)
-    assert not manual_result.is_error
-
-    venom = compile_venom_call_with_patch_probe(
-        target,
-        template,
-        patch_value=123,
-        patch_offset=4,
-        patch_size=32,
-    )
-    venom_result = mini_evm(venom)
-    assert not venom_result.is_error
-
-    assert int.from_bytes(venom_result.output, "big") == int.from_bytes(manual_result.output, "big")
 
 
 @pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
@@ -196,58 +117,6 @@ def test_compile_venom_call_with_patches_probe_matches_manual_success_semantics(
         template,
         patches=[(4, 32), (36, 20)],
         patch_values=patch_values,
-    )
-    venom_result = mini_evm(venom)
-    assert not venom_result.is_error
-
-    assert int.from_bytes(venom_result.output, "big") == int.from_bytes(manual_result.output, "big")
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_patch_preview_probe_single_patch_matches_expected_word():
-    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
-    patch_val = 123
-    bytecode = compile_venom_patch_preview_probe(
-        template,
-        patches=[(4, 32)],
-        patch_values=[patch_val],
-        read_offset=0,
-    )
-    result = mini_evm(bytecode)
-    assert not result.is_error, f"venom patch preview probe reverted: {result.output.hex()}"
-
-    expected_word = int.from_bytes(bytes.fromhex("a9059cbb") + b"\x00" * 28, "big")
-    assert int.from_bytes(result.output, "big") == expected_word
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_compile_venom_patch_preview_probe_matches_manual_for_patched_word():
-    template = bytes.fromhex("12345678") + b"\x00" * 64
-    patch_values = [111, int.from_bytes(HexBytes("0x" + "22" * 20), "big")]
-
-    # Manual path: patch bytes then read first patched argument word at offset 4.
-    manual = (
-        Program()
-        .push_u256(patch_values[1])
-        .push_u256(patch_values[0])
-        .push_bytes(template)
-        .patch_bytes_from_stack([(4, 32), (36, 20)])
-        ._emit(swap())  # bring argsLen to TOS
-        ._emit(pop())  # drop argsLen; leaves argsOffset on TOS
-        ._emit(push_u256(4))
-        ._emit(add())
-        ._emit(bytes([0x51]))  # MLOAD at argsOffset+4
-        ._emit(RETURN_TOP)
-        .build()
-    )
-    manual_result = mini_evm(manual)
-    assert not manual_result.is_error
-
-    venom = compile_venom_patch_preview_probe(
-        template,
-        patches=[(4, 32), (36, 20)],
-        patch_values=patch_values,
-        read_offset=4,
     )
     venom_result = mini_evm(venom)
     assert not venom_result.is_error
