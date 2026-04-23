@@ -357,9 +357,7 @@ class Program:
         self._fixups: list[tuple[int, str]] = []  # (u16 offset in _buf, label name)
         self._data_sections: list[bytes] = []  # raw data appended after code at build time
         self._data_fixups: list[tuple[int, int]] = []  # (u32 offset in _buf, data_section_index)
-        self._venom_enabled = venom_is_available()
         self._venom_plan: dict[str, object] | None = None
-        self._venom_prefix_stack: list[tuple[str, int]] = []
 
     @classmethod
     def create(cls) -> "Program":
@@ -371,9 +369,7 @@ class Program:
     # ------------------------------------------------------------------
 
     def _emit(self, data: bytes) -> "Program":
-        if self._venom_enabled and self._venom_prefix_stack:
-            self._materialize_prefix_stack_to_manual()
-        if self._venom_enabled and self._venom_plan is not None:
+        if self._venom_plan is not None:
             self._materialize_plan_to_manual()
         self._buf.extend(data)
         return self
@@ -387,9 +383,7 @@ class Program:
         snap._fixups.extend(source._fixups)
         snap._data_sections.extend(source._data_sections)
         snap._data_fixups.extend(source._data_fixups)
-        snap._venom_enabled = source._venom_enabled
         snap._venom_plan = deepcopy(source._venom_plan)
-        snap._venom_prefix_stack = list(source._venom_prefix_stack)
         return snap
 
     def _is_pristine(self) -> bool:
@@ -400,32 +394,6 @@ class Program:
             and not self._data_sections
             and not self._data_fixups
         )
-
-    def _materialize_prefix_stack_to_manual(self) -> None:
-        if not self._venom_prefix_stack:
-            return
-        for kind, value in self._venom_prefix_stack:
-            if kind == "u256":
-                self._buf.extend(push_u256(value))
-            elif kind == "addr":
-                self._buf.extend(push_addr(HexBytes(value.to_bytes(20, "big"))))
-            else:
-                raise ValueError(f"unknown venom prefix stack kind: {kind!r}")
-        self._venom_prefix_stack.clear()
-
-    def _consume_prefix_patch_values(self, patch_count: int) -> list[int] | None:
-        if patch_count < 0:
-            return None
-        if patch_count == 0:
-            if self._venom_prefix_stack:
-                return None
-            return []
-        if len(self._venom_prefix_stack) != patch_count:
-            return None
-        vals = [v for _k, v in self._venom_prefix_stack]
-        self._venom_prefix_stack.clear()
-        vals.reverse()  # TOS-first patch order
-        return vals
 
     @property
     def has_pending_venom_plan(self) -> bool:
@@ -483,7 +451,6 @@ class Program:
             self._buf.extend(pop())
 
     def _materialize_plan_to_manual(self) -> None:
-        self._materialize_prefix_stack_to_manual()
         if self._venom_plan is None:
             return
         plan = self._venom_plan
@@ -532,8 +499,6 @@ class Program:
 
         Raises :exc:`ValueError` if the label has already been defined.
         """
-        if self._venom_enabled and self._venom_prefix_stack:
-            self._materialize_prefix_stack_to_manual()
         if name in self._labels:
             raise ValueError(f"Program: duplicate label {name!r}")
         self._labels[name] = len(self._buf)
@@ -548,22 +513,16 @@ class Program:
         """Emit PUSH_U256."""
         if n < 0:
             raise ValueError(f"push_u256: value must be non-negative, got {n}")
-        if self._venom_enabled and self._venom_plan is not None:
+        if self._venom_plan is not None:
             self._materialize_plan_to_manual()
-        if self._venom_enabled and self._is_pristine():
-            self._venom_prefix_stack.append(("u256", n))
-            return self
         return self._emit(push_u256(n))
 
     def push_addr(self, a: Address) -> "Program":
         """Emit PUSH_ADDR."""
         if len(a) != 20:
             raise ValueError(f"push_addr: bad address length: {a!r}")
-        if self._venom_enabled and self._venom_plan is not None:
+        if self._venom_plan is not None:
             self._materialize_plan_to_manual()
-        if self._venom_enabled and self._is_pristine():
-            self._venom_prefix_stack.append(("addr", int.from_bytes(bytes(a), "big")))
-            return self
         return self._emit(push_addr(a))
 
     def push_bytes(self, data: bytes) -> "Program":
@@ -599,7 +558,7 @@ class Program:
             raise ValueError(f"push_bytes: data too large ({len(data)} bytes, max 65535)")
         # Flush any pending Venom state so the data section + CODECOPY sequence
         # is emitted in the correct order (after any preceding pushes).
-        if self._venom_enabled and (self._venom_prefix_stack or self._venom_plan is not None):
+        if self._venom_plan is not None:
             self._materialize_plan_to_manual()
         blen = len(data)
         blen_padded = (blen + 31) & ~31
@@ -654,19 +613,11 @@ class Program:
 
     def pop(self) -> "Program":
         """Emit POP."""
-        if (
-            self._venom_enabled
-            and self._venom_plan is not None
-            and self._venom_plan.get("kind")
-            in {
-                "call_contract",
-                "call_with_patches",
-            }
-        ):
+        if self._venom_plan is not None and self._venom_plan.get("kind") in {
+            "call_contract",
+            "call_with_patches",
+        }:
             self._venom_plan["drop_result"] = True
-            return self
-        if self._venom_enabled and self._venom_prefix_stack and self._is_pristine():
-            self._venom_prefix_stack.pop()
             return self
         return self._emit(pop())
 
@@ -690,8 +641,6 @@ class Program:
         """
         if isinstance(target, int):
             return self._emit(jump(target))
-        if self._venom_enabled and self._venom_prefix_stack:
-            self._materialize_prefix_stack_to_manual()
         self._buf.append(0x61)  # PUSH2
         self._fixups.append((len(self._buf), target))
         self._buf.extend(b"\x00\x00")  # 2-byte placeholder
@@ -707,8 +656,6 @@ class Program:
         """
         if isinstance(target, int):
             return self._emit(jumpi(target))
-        if self._venom_enabled and self._venom_prefix_stack:
-            self._materialize_prefix_stack_to_manual()
         self._buf.append(0x61)  # PUSH2
         self._fixups.append((len(self._buf), target))
         self._buf.extend(b"\x00\x00")  # 2-byte placeholder
@@ -988,7 +935,7 @@ class Program:
         Returns:
             ``self`` for chaining.
         """
-        if self._venom_enabled and self._venom_plan is None and self._is_pristine() and not self._venom_prefix_stack:
+        if self._venom_plan is None and self._is_pristine():
             self._venom_plan = {
                 "kind": "call_contract",
                 "to": to,
@@ -1000,12 +947,12 @@ class Program:
             }
             return self
 
-        if self._venom_enabled and self._venom_plan is not None:
+        if self._venom_plan is not None:
             self._materialize_plan_to_manual()
         return (
             self._emit(push_u256(0))  # retSize
             ._emit(push_u256(0))  # retOffset
-            ._emit(push_bytes(calldata))  # argsOffset (TOS), argsLen
+            .push_bytes(calldata)  # argsOffset (TOS), argsLen — CODECOPY via Program.push_bytes
             ._emit(push_u256(value))
             ._emit(push_addr(to))
             ._emit(gas_opcode() if gas == 0 else push_u256(gas))
@@ -1202,37 +1149,26 @@ class Program:
         Raises:
             ValueError: If any patch *size* is not in the range ``(0, 32]``.
         """
-        if self._venom_enabled and self._venom_plan is None and self._is_pristine():
-            patch_values = self._consume_prefix_patch_values(len(patches))
-            if patch_values is not None:
-                for _offset, size in patches:
-                    if not (0 < size <= 32):
-                        raise ValueError(
-                            f"call_with_patches: patch size {size!r} not supported; expected 0 < size <= 32"
-                        )
-                if any(v < 0 for v in patch_values):
-                    raise ValueError("call_with_patches: patch values must be non-negative")
-                self._venom_plan = {
-                    "kind": "call_with_patches",
-                    "to": to,
-                    "calldata": bytes(calldata),
-                    "patches": list(patches),
-                    "patch_values": list(patch_values),
-                    "value": value,
-                    "gas": gas,
-                    "require_success": require_success,
-                    "drop_result": False,
-                }
-                return self
+        if self._venom_plan is None and self._is_pristine() and not patches:
+            self._venom_plan = {
+                "kind": "call_with_patches",
+                "to": to,
+                "calldata": bytes(calldata),
+                "patches": [],
+                "patch_values": [],
+                "value": value,
+                "gas": gas,
+                "require_success": require_success,
+                "drop_result": False,
+            }
+            return self
 
-        if self._venom_enabled and self._venom_prefix_stack:
-            self._materialize_prefix_stack_to_manual()
-        if self._venom_enabled and self._venom_plan is not None:
+        if self._venom_plan is not None:
             self._materialize_plan_to_manual()
 
         # Push calldata buffer; patch values remain below it on the stack.
         # Stack: [argsOffset(TOS), argsLen(2nd), val1(3rd), …, valN(2+N)]
-        self._emit(push_bytes(calldata))  # PUSH32/MSTORE chain (works in interpreter calldata context)
+        self.push_bytes(calldata)  # CODECOPY via Program.push_bytes
 
         # Apply all patches, consuming each stack value directly (no DUP needed).
         self.patch_bytes_from_stack(patches)
@@ -1274,11 +1210,11 @@ class Program:
             ``self`` for chaining.
         """
         # Flush self's pending Venom state into _buf first so bytes stay in order.
-        if self._venom_enabled and (self._venom_prefix_stack or self._venom_plan is not None):
+        if self._venom_plan is not None:
             self._materialize_plan_to_manual()
         # Snapshot other so extend() never mutates its argument.
         src = Program._snapshot(other)
-        if src._venom_enabled and (src._venom_prefix_stack or src._venom_plan is not None):
+        if src._venom_plan is not None:
             src._materialize_plan_to_manual()
         # Pre-validate label collisions before mutating internal state to
         # avoid leaving this Program instance in a partially-updated state.
@@ -1349,14 +1285,12 @@ class Program:
         Raises :exc:`ValueError` if any label referenced in a jump has not
         been defined, or if a label's target offset does not fit in 16 bits.
         """
-        if self._venom_enabled and self._venom_prefix_stack:
-            self._materialize_prefix_stack_to_manual()
-
-        if self._venom_enabled and self._venom_plan is not None:
+        if self._venom_plan is not None:
             result = self._build_venom_plan()
-            if result is not None:
-                return result
-            self._materialize_plan_to_manual()
+            assert result is not None, (
+                "unknown _venom_plan kind; only call_contract and call_with_patches are supported"
+            )
+            return result
 
         buf = bytearray(self._buf)
         for fixup_offset, name in self._fixups:
@@ -1391,18 +1325,11 @@ class Program:
 
     def __len__(self) -> int:
         """Return the current (unresolved) byte length of the program."""
-        if self._venom_enabled and self._venom_plan is not None:
-            # Keep __len__ side-effect free: materialize a snapshot, not self.
-            # _materialize_plan_to_manual also flushes _venom_prefix_stack, so
-            # this branch covers both fields even if they were set simultaneously.
+        if self._venom_plan is not None:
             snap = Program._snapshot(self)
             snap._materialize_plan_to_manual()
             return len(snap._buf)
-        if not self._venom_prefix_stack:
-            return len(self._buf)
-        # Prefix-stack entries are pending push_u256/push_addr bytes not yet in _buf.
-        prefix_len = sum(33 if kind == "u256" else 21 for kind, _ in self._venom_prefix_stack)
-        return len(self._buf) + prefix_len
+        return len(self._buf)
 
     def __repr__(self) -> str:
         return f"Program(len={len(self._buf)}, labels={list(self._labels)!r})"

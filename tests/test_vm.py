@@ -696,7 +696,7 @@ class TestCallWithPatches:
         else:
             expected = (
                 Program()
-                ._emit(push_bytes(cd))
+                .push_bytes(cd)
                 ._emit(self._RET_FRAME)
                 ._emit(push_u256(0))  # value
                 ._emit(push_addr(ADDR_A))
@@ -712,7 +712,7 @@ class TestCallWithPatches:
         cd = self._template()
         expected = (
             Program()
-            ._emit(push_bytes(cd))
+            .push_bytes(cd)
             ._emit(self._ROTATE_ARG)
             ._emit(patch_value(4, 32))
             ._emit(self._RET_FRAME)
@@ -730,7 +730,7 @@ class TestCallWithPatches:
         cd = self._template()
         expected = (
             Program()
-            ._emit(push_bytes(cd))
+            .push_bytes(cd)
             ._emit(self._ROTATE_ARG)
             ._emit(patch_value(16, 20))
             ._emit(self._RET_FRAME)
@@ -748,7 +748,7 @@ class TestCallWithPatches:
         cd = self._template()
         expected = (
             Program()
-            ._emit(push_bytes(cd))
+            .push_bytes(cd)
             ._emit(self._ROTATE_ARG)
             ._emit(patch_value(4, 32))
             ._emit(self._ROTATE_ARG)
@@ -779,7 +779,7 @@ class TestCallWithPatches:
         cd = self._template()
         expected = (
             Program()
-            ._emit(push_bytes(cd))
+            .push_bytes(cd)
             ._emit(self._ROTATE_ARG)
             ._emit(patch_value(4, 32))
             ._emit(self._RET_FRAME)
@@ -797,7 +797,7 @@ class TestCallWithPatches:
         cd = self._template()
         expected = (
             Program()
-            ._emit(push_bytes(cd))
+            .push_bytes(cd)
             ._emit(self._ROTATE_ARG)
             ._emit(patch_value(4, 32))
             ._emit(self._RET_FRAME)
@@ -830,7 +830,7 @@ class TestCallWithPatches:
         combined = step1 + step2
         bytecode = combined.build()
         assert len(bytecode) > 0
-        assert bytes(cd[:4]) in bytecode  # selector bytes embedded inline via PUSH32/MSTORE
+        assert bytes(cd[:4]) in bytecode  # selector bytes present in CODECOPY data section
 
     def test_dup_n_range(self):
         """dup_n emits the correct DUP opcode for each valid depth."""
