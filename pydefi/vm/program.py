@@ -472,6 +472,30 @@ def self_addr() -> bytes:
 # ---------------------------------------------------------------------------
 
 
+#: 11-byte PC-relative revert block executed after CALL when require_success=True.
+#: Stack on entry: [success]
+#:   DUP1 PC PUSH1 9 ADD JUMPI    → jump to JUMPDEST if success≠0
+#:   PUSH1 0 DUP1 REVERT          ← taken when success=0
+#:   JUMPDEST                     ← success=1 lands here; [success] remains
+#: PC is at byte 1; JUMPDEST is at byte 10; distance = 9.  Position-independent so
+#: the block stays correct after any program composition shifts its absolute offset.
+REQUIRE_SUCCESS_BLOCK: bytes = bytes(
+    [
+        OP_DUP,  # DUP1          byte 0
+        _PC,  # PC            byte 1
+        _PUSH1,
+        9,  # PUSH1 9       bytes 2-3
+        OP_ADD,  # ADD           byte 4
+        _JUMPI,  # JUMPI         byte 5
+        _PUSH1,
+        0x00,  # PUSH1 0       bytes 6-7
+        OP_DUP,  # DUP1          byte 8
+        OP_REVERT,  # REVERT        byte 9
+        OP_JUMPDEST,  # JUMPDEST      byte 10
+    ]
+)
+
+
 def call(require_success: bool = True) -> bytes:
     """Emit EVM CALL with optional PC-relative revert on failure.
 
@@ -482,24 +506,7 @@ def call(require_success: bool = True) -> bytes:
     """
     if not require_success:
         return bytes([OP_CALL])
-    # CALL DUP1 PC PUSH1 9 ADD JUMPI PUSH1 0 DUP1 REVERT JUMPDEST
-    # PC at byte 2; JUMPDEST at byte 11; distance = 9
-    return bytes(
-        [
-            OP_CALL,  # CALL          byte 0
-            OP_DUP,  # DUP1          byte 1
-            _PC,  # PC            byte 2  (= instr_start + 2)
-            _PUSH1,
-            9,  # PUSH1 9       bytes 3-4
-            OP_ADD,  # ADD           byte 5
-            _JUMPI,  # JUMPI         byte 6
-            _PUSH1,
-            0x00,  # PUSH1 0       bytes 7-8
-            OP_DUP,  # DUP1          byte 9
-            OP_REVERT,  # REVERT        byte 10
-            OP_JUMPDEST,  # JUMPDEST      byte 11
-        ]
-    )
+    return bytes([OP_CALL]) + REQUIRE_SUCCESS_BLOCK
 
 
 # ---------------------------------------------------------------------------

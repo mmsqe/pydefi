@@ -195,6 +195,7 @@ from pydefi.vm.program import (
     _PUSH4,
     OP_CODECOPY,
     OP_JUMPDEST,
+    REQUIRE_SUCCESS_BLOCK,
     _push_imm,
     add,
     assert_ge,
@@ -324,6 +325,53 @@ def _collect_patches(arg: object, patches: list["Patch"]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Built bytecode wrapper — refuses concat for programs with data sections
+# ---------------------------------------------------------------------------
+
+
+class _BuiltBytecode(bytes):
+    """A :class:`bytes` subclass returned by :meth:`Program.build` when the
+    program contains data sections.
+
+    Refuses concatenation with ``+`` so the data-section offsets baked into
+    ``CODECOPY`` cannot be silently invalidated by:
+
+    - Prepending bytes (shifts the data sections to a higher absolute offset
+      while ``CODECOPY`` still targets the original offset).
+    - Appending another built program with its own data sections (shifts the
+      second program's data sections so its ``CODECOPY`` targets the wrong
+      bytes).
+    - Appending raw bytes after the data sections (offsets remain valid but
+      the appended code is unreachable — execution halts at the ``STOP``
+      sentinel inserted by :meth:`Program.build` before the data sections).
+
+    All three cases are real footguns; raise rather than choose silently.
+    Programs without data sections are returned as plain :class:`bytes` and
+    behave normally.
+
+    To compose programs that contain data sections, use :class:`Program`-level
+    composition (:meth:`Program.extend`, ``prog_a + prog_b``,
+    :meth:`Program.compose`) and call :meth:`Program.build` once on the
+    merged program.
+    """
+
+    __slots__ = ()
+
+    _CONCAT_ERROR = (
+        "Cannot concatenate a built Program containing data sections with `+`. "
+        "Splicing would invalidate the CODECOPY data-section offsets baked in by build(). "
+        "Compose at the Program level instead — Program.extend, prog_a + prog_b, or "
+        "Program.compose — and call .build() once on the merged Program."
+    )
+
+    def __add__(self, _other: object) -> bytes:  # type: ignore[override]
+        raise TypeError(self._CONCAT_ERROR)
+
+    def __radd__(self, _other: object) -> bytes:
+        raise TypeError(self._CONCAT_ERROR)
+
+
+# ---------------------------------------------------------------------------
 # Program builder
 # ---------------------------------------------------------------------------
 
@@ -341,11 +389,6 @@ class Program:
         self._fixups: list[tuple[int, str]] = []  # (u16 offset in _buf, label name)
         self._data_sections: list[bytes] = []  # raw data appended after code at build time
         self._data_fixups: list[tuple[int, int]] = []  # (u32 offset in _buf, data_section_index)
-
-    @classmethod
-    def create(cls) -> "Program":
-        """Create a program builder (equivalent to ``Program()``)."""
-        return cls()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -815,31 +858,9 @@ class Program:
         self._buf.extend(code_frag)
         self._data_fixups.append((base + fixup_pos, ds_index))
         if require_success:
-            # Inline revert-on-failure (11 bytes, PC-relative jump).
-            # Mirrors the pattern used by program.call() so the check stays correct
-            # after Program.compose() shifts code offsets.
-            # Stack entering check: [success]
-            #   DUP1 PC PUSH1 9 ADD JUMPI → jump to JUMPDEST if success≠0
-            #   PUSH1 0 DUP1 REVERT       ← taken when success=0
-            #   JUMPDEST                  ← success=1 lands here; [success] remains
-            # PC is at byte 1; JUMPDEST is at byte 10; distance = 9.
-            self._buf.extend(
-                bytes(
-                    [
-                        0x80,  # DUP1
-                        0x58,  # PC
-                        0x60,
-                        0x09,  # PUSH1 9
-                        0x01,  # ADD  → PC+9 = abs position of JUMPDEST
-                        0x57,  # JUMPI  (jump if success≠0)
-                        0x60,
-                        0x00,  # PUSH1 0
-                        0x80,  # DUP1
-                        0xFD,  # REVERT
-                        0x5B,  # JUMPDEST
-                    ]
-                )
-            )
+            # Append the same PC-relative revert block used by program.call(require_success=True).
+            # PC-relative so the check stays correct after Program.compose() shifts code offsets.
+            self._buf.extend(REQUIRE_SUCCESS_BLOCK)
         return self
 
     def call_contract_abi(
@@ -1147,6 +1168,19 @@ class Program:
         total code length is known and patched into the 4-byte placeholder
         emitted by :meth:`push_bytes`.
 
+        When the program contains data sections, the returned object is a
+        :class:`_BuiltBytecode` (a :class:`bytes` subclass) that **refuses
+        concatenation with** ``+`` — splicing would shift CODECOPY source
+        offsets and silently corrupt the program.  Compose at the
+        :class:`Program` level instead (:meth:`extend`, ``prog_a + prog_b``,
+        :meth:`compose`) before calling :meth:`build`::
+
+            combined = (prog_a + prog_b).build()         # ✓ correct
+            combined = prog_a.build() + prog_b.build()   # ✗ raises TypeError
+
+        For programs without data sections, the result is plain :class:`bytes`
+        and concatenation is unrestricted.
+
         Raises :exc:`ValueError` if any label referenced in a jump has not
         been defined, or if a label's target offset does not fit in 16 bits.
         """
@@ -1162,19 +1196,23 @@ class Program:
         # after the code section, with sections laid out consecutively.
         # A STOP (0x00) byte is inserted before data so execution never falls
         # into raw calldata bytes if the program has no explicit terminator.
-        if self._data_fixups:
-            buf.append(0x00)  # STOP
-            code_end = len(buf)
-            section_starts: list[int] = []
-            pos = code_end
-            for ds in self._data_sections:
-                section_starts.append(pos)
-                pos += len(ds)
-            for fixup_pos, ds_idx in self._data_fixups:
-                struct.pack_into(">I", buf, fixup_pos, section_starts[ds_idx])
-            for ds in self._data_sections:
-                buf.extend(ds)
-        return bytes(buf)
+        if not self._data_fixups:
+            return bytes(buf)
+        buf.append(0x00)  # STOP
+        code_end = len(buf)
+        section_starts: list[int] = []
+        pos = code_end
+        for ds in self._data_sections:
+            section_starts.append(pos)
+            pos += len(ds)
+        for fixup_pos, ds_idx in self._data_fixups:
+            struct.pack_into(">I", buf, fixup_pos, section_starts[ds_idx])
+        for ds in self._data_sections:
+            buf.extend(ds)
+        # Wrap in _BuiltBytecode so any `+` concatenation raises and forces the
+        # user to compose at the Program level (which correctly recomputes the
+        # baked-in CODECOPY data-section offsets).
+        return _BuiltBytecode(bytes(buf))
 
     # ------------------------------------------------------------------
     # Dunder helpers
@@ -1239,64 +1277,74 @@ def _venom_alloc_copy_fragment(builder: VenomBuilder, blen_padded: int) -> Any:
 
 
 def _extract_fragment_and_fixup(code_bytes: bytes) -> tuple[bytearray, int]:
-    """Strip the trailing MSTORE+RETURN sequence from Venom output and locate the CODECOPY placeholder.
+    """Truncate Venom output after CALL and zero the CODECOPY sentinel placeholder.
 
-    The fragment is compiled with ``require_success=False``, so Venom terminates with:
+    Walks the bytecode opcode-by-opcode (correctly skipping ``PUSH<n>``
+    immediates) to locate two positions:
 
-        mstore(0, success)   →  PUSH0 MSTORE  or  PUSH1 0x00 MSTORE
-        return_(0, 32)       →  PUSH1 0x20 PUSH0 RETURN  or  PUSH1 0x20 PUSH1 0x00 RETURN
+    1. The unique ``CALL`` instruction — the fragment is truncated at
+       ``call_pos + 1`` so the EVM success flag is left on the stack.
+       Everything Venom appends afterwards (``mstore(0, success)``,
+       ``return_(0, 32)``, fallback revert block) is discarded.
+    2. The ``PUSH4`` / ``PUSH32`` whose immediate matches
+       ``_FRAGMENT_DATA_SRC_PLACEHOLDER`` — the 4-byte payload is zeroed so
+       ``Program._data_fixups`` can patch the actual data-section offset at
+       build() time.
 
-    Stripping this suffix leaves ``CALL`` as the last instruction, so the EVM
-    success flag stays on the stack after the fragment executes.
-
-    The placeholder ``_FRAGMENT_DATA_SRC_PLACEHOLDER`` (0xDEADBEEF) is located as
-    either PUSH4 (0x63) or PUSH32 (0x7f) immediate, replaced with ``\\x00\\x00\\x00\\x00``
-    so ``Program._data_fixups`` can patch the actual data-section offset at build() time.
+    Opcode walking — rather than naive byte search or hand-coded suffix
+    patterns — avoids false matches inside ``PUSH`` literals (the target
+    address may contain 0xF1, the calldata may contain 0xDEADBEEF) and
+    tolerates Venom layout changes in the trailing epilogue.
 
     Returns:
         (code_frag, fixup_pos) where fixup_pos is the byte index of the 4-byte
         placeholder within code_frag (already zeroed).
 
     Raises:
-        RuntimeError: If the expected suffix or sentinel placeholder is not found.
+        RuntimeError: If CALL or the sentinel placeholder is not found, or if
+            the sentinel appears after CALL (would indicate a layout we don't
+            understand).
     """
-    buf = bytearray(code_bytes)
-    # Venom always appends a fallback revert block (JUMPDEST PUSH0 DUP1 REVERT = 5B 5F 80 FD)
-    # after RETURN, even when require_success is not used.  Strip the full trailing sequence:
-    #   mstore(0, success)  +  return_(0, 32)  +  fallback-revert-block
-    # Venom may emit PUSH0 (0x5F) or PUSH1 0x00 (0x60 0x00) for zero operands.
-    _REVERT_TAIL = bytes([0x5B, 0x5F, 0x80, 0xFD])  # JUMPDEST PUSH0 DUP1 REVERT
-    _RETURN_SUFFIXES = (
-        bytes([0x5F, 0x52, 0x60, 0x20, 0x5F, 0xF3]) + _REVERT_TAIL,  # PUSH0 MSTORE PUSH1 32 PUSH0 RETURN
-        bytes([0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3])
-        + _REVERT_TAIL,  # PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
-        bytes([0x5F, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3]) + _REVERT_TAIL,  # PUSH0 MSTORE PUSH1 32 PUSH1 0 RETURN
-        bytes([0x60, 0x00, 0x52, 0x60, 0x20, 0x5F, 0xF3]) + _REVERT_TAIL,  # PUSH1 0 MSTORE PUSH1 32 PUSH0 RETURN
-    )
-    code = bytes(buf)
-    stripped = False
-    for suffix in _RETURN_SUFFIXES:
-        if code.endswith(suffix):
-            buf = buf[: -len(suffix)]
-            stripped = True
-            break
-    if not stripped:
-        raise RuntimeError(f"_extract_fragment_and_fixup: unrecognised MSTORE+RETURN suffix: {code[-8:].hex()}")
-    # Find and zero the CODECOPY sentinel placeholder.
-    ph_bytes = _FRAGMENT_DATA_SRC_PLACEHOLDER.to_bytes(4, "big")  # DE AD BE EF
-    push4_pat = bytes([0x63]) + ph_bytes
-    idx = bytes(buf).find(push4_pat)
-    if idx != -1:
-        fixup_pos = idx + 1
-        buf[fixup_pos : fixup_pos + 4] = b"\x00\x00\x00\x00"
-        return buf, fixup_pos
-    push32_pat = bytes([0x7F]) + bytes(28) + ph_bytes
-    idx = bytes(buf).find(push32_pat)
-    if idx != -1:
-        fixup_pos = idx + 29
-        buf[fixup_pos : fixup_pos + 4] = b"\x00\x00\x00\x00"
-        return buf, fixup_pos
-    raise RuntimeError(f"_extract_fragment_and_fixup: CODECOPY placeholder 0x{ph_bytes.hex()} not found in fragment")
+    OP_CALL = 0xF1
+    OP_PUSH4 = 0x63
+    OP_PUSH32 = 0x7F
+    sentinel = _FRAGMENT_DATA_SRC_PLACEHOLDER.to_bytes(4, "big")
+
+    call_pos = -1
+    fixup_pos = -1
+    n = len(code_bytes)
+    i = 0
+    while i < n:
+        op = code_bytes[i]
+        if op == OP_CALL:
+            call_pos = i
+            i += 1
+        elif 0x60 <= op <= 0x7F:  # PUSH1..PUSH32
+            imm = op - 0x5F
+            if op == OP_PUSH4 and code_bytes[i + 1 : i + 5] == sentinel:
+                fixup_pos = i + 1
+            elif (
+                op == OP_PUSH32 and code_bytes[i + 1 : i + 29] == bytes(28) and code_bytes[i + 29 : i + 33] == sentinel
+            ):
+                fixup_pos = i + 29
+            i += 1 + imm
+        else:
+            i += 1
+
+    if call_pos < 0:
+        raise RuntimeError("_extract_fragment_and_fixup: CALL opcode not found in fragment")
+    if fixup_pos < 0:
+        raise RuntimeError(
+            f"_extract_fragment_and_fixup: CODECOPY placeholder 0x{sentinel.hex()} not found in fragment"
+        )
+    if fixup_pos > call_pos:
+        raise RuntimeError(
+            f"_extract_fragment_and_fixup: sentinel at byte {fixup_pos} appears after CALL at byte {call_pos}"
+        )
+
+    buf = bytearray(code_bytes[: call_pos + 1])
+    buf[fixup_pos : fixup_pos + 4] = b"\x00\x00\x00\x00"
+    return buf, fixup_pos
 
 
 def compile_venom_call_contract_fragment(
@@ -1325,6 +1373,12 @@ def compile_venom_call_contract_fragment(
         (code_frag, fixup_pos): code_frag ends at CALL with success on EVM stack;
         fixup_pos is the byte index of the 4-byte placeholder for the data section offset.
     """
+    if len(to) != 20:
+        raise ValueError(f"bad address length: {to!r}")
+    if value < 0:
+        raise ValueError(f"value must be non-negative, got {value}")
+    if gas < 0:
+        raise ValueError(f"gas must be non-negative, got {gas}")
     blen = len(calldata)
     blen_padded = (blen + 31) & ~31
     ctx = IRContext()  # type: ignore[operator]

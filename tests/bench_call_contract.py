@@ -1,8 +1,7 @@
 """Benchmark: PUSH32/MSTORE calldata encoding vs Venom CODECOPY data-section path.
 
 Compares gas and bytecode size for ``call_contract`` across a range of calldata
-sizes (4 – 2048 bytes).  When Venom is unavailable both paths fall back to the
-same PUSH32/MSTORE chain so the comparison degenerates to equal cost.
+sizes (4 – 2048 bytes).
 
 Run with:
     python3 tests/bench_call_contract.py
@@ -46,16 +45,10 @@ def _old(calldata: bytes) -> bytes:
 def _new(calldata: bytes) -> bytes:
     """CODECOPY data-section path (Venom builder, matches Solidity pattern).
 
-    When Venom is available, ``Program().call_contract()`` compiles via the
-    Venom IR pipeline and stores calldata in a readonly data section, loading
-    it at runtime with a single CODECOPY instruction before the CALL.
-    When Venom is unavailable the program falls back to the same PUSH32/MSTORE
-    path as ``_old`` so the comparison is still valid (both have identical cost).
+    ``Program().call_contract()`` compiles via the Venom IR pipeline and stores
+    calldata in a readonly data section, loading it at runtime with a single
+    CODECOPY instruction before the CALL.
     """
-    # .pop() after call_contract: when a Venom plan is pending it sets
-    # drop_result=True (compile_venom_call_contract_probe return_success=False →
-    # return(0,0)), matching the STOP semantics of _old().  When there is no
-    # Venom plan it emits a literal POP, identical to _old().
     return Program().call_contract(_TARGET, calldata, require_success=False).pop().build()
 
 

@@ -215,7 +215,7 @@ class TestProgramChaining:
         assert len(p) == len(push_u256(0) + push_addr(ADDR_A))
 
     def test_len_call_contract_is_nonzero(self):
-        p = Program.create().call_contract(ADDR_A, b"\x12\x34")
+        p = Program().call_contract(ADDR_A, b"\x12\x34")
         assert len(p) > 0
 
     def test_bytes_builtin(self):
@@ -575,8 +575,8 @@ class TestProgramComposition:
         assert p2.build() == push_u256(8)
 
     def test_add_does_not_mutate_operands(self):
-        p1 = Program.create().call_contract(ADDR_A, b"\x12\x34")
-        p2 = Program.create().call_contract(ADDR_B, b"\xaa")
+        p1 = Program().call_contract(ADDR_A, b"\x12\x34")
+        p2 = Program().call_contract(ADDR_B, b"\xaa")
 
         bytes_p1_before = p1.build()
         bytes_p2_before = p2.build()
@@ -2098,19 +2098,32 @@ class TestMiniEVM:
     # Program.push_bytes (CODECOPY-based)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _run_program_int(code: bytes) -> int:
+        """Execute *code* directly (program already includes its own RETURN_TOP).
+
+        Programs with data sections refuse external `+` concat (Program.build
+        returns a sealed _BuiltBytecode), so the terminator must be _emit-ed
+        inside the Program rather than appended after build().
+        """
+        result = mini_evm(code)
+        assert not result.is_error, f"execution reverted unexpectedly: {result.output.hex()}"
+        assert len(result.output) == 32
+        return int.from_bytes(result.output, "big")
+
     def test_program_push_bytes_length(self):
         # Program.push_bytes uses CODECOPY + data section.
         # All post-push code must be part of the same Program so the data section
         # stays at the end of the built bytecode.
         data = b"hello world"
         code = Program().push_bytes(data)._emit(pop())._emit(RETURN_TOP).build()
-        assert self._run_int(code) == len(data)
+        assert self._run_program_int(code) == len(data)
 
     def test_program_push_bytes_offset_is_free_memory_pointer(self):
         # argsOffset should be the free-memory pointer (0x280 on first use).
         data = b"hello world"
         code = Program().push_bytes(data)._emit(swap())._emit(pop())._emit(RETURN_TOP).build()
-        assert self._run_int(code) == 0x280
+        assert self._run_program_int(code) == 0x280
 
     def test_program_push_bytes_data_written_to_memory(self):
         # CODECOPY places the data at argsOffset; read it back via MLOAD.
@@ -2124,15 +2137,14 @@ class TestMiniEVM:
             ._emit(RETURN_TOP)
             .build()
         )
-        result = self._run_int(code)
         expected = int.from_bytes(data[:32].ljust(32, b"\x00"), "big")
-        assert result == expected
+        assert self._run_program_int(code) == expected
 
     def test_program_push_bytes_large_data(self):
         # A 256-byte payload: verify argsLen is reported correctly.
         data = bytes(range(256))  # 0x00..0xff
         len_code = Program().push_bytes(data)._emit(pop())._emit(RETURN_TOP).build()
-        assert self._run_int(len_code) == 256
+        assert self._run_program_int(len_code) == 256
 
     def test_program_push_bytes_multiple_sections(self):
         # Two sequential push_bytes calls allocate memory consecutively.
@@ -2151,7 +2163,7 @@ class TestMiniEVM:
             .build()
         )
         expected = int.from_bytes(data2[:32], "big")
-        assert self._run_int(code) == expected
+        assert self._run_program_int(code) == expected
 
     # ------------------------------------------------------------------
     # self_addr
