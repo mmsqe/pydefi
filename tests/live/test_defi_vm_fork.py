@@ -784,8 +784,9 @@ class TestDeFiVMFork:
         stack, then calls double(7) via the high-level ABI builder.  Verifies the
         on-chain result equals 14.
 
-        All operations are in a single Program so the CODECOPY data section remains
-        at the very end of the built bytecode.
+        Keep the sequence in a single Program to preserve Program-level data-section
+        handling; avoid concatenating separate Program.build() outputs when relying
+        on embedded data.
         """
         w3 = ctx["w3"]
         vm = ctx["vm"]
@@ -820,8 +821,9 @@ class TestDeFiVMFork:
         calls addInputs(6, 11) via the high-level ABI builder.  Verifies the
         on-chain result equals 17.
 
-        All operations are in a single Program so the CODECOPY data section remains
-        at the very end of the built bytecode.
+        Keep the sequence in a single Program to preserve Program-level data-section
+        handling; avoid concatenating separate Program.build() outputs when relying
+        on embedded data.
         """
         w3 = ctx["w3"]
         vm = ctx["vm"]
@@ -857,8 +859,9 @@ class TestDeFiVMFork:
         double(5) → 10 pushed onto stack via ret_u256, then double(10) via
         call_contract_abi with Patch().  Verifies the final result equals 20.
 
-        All operations are in a single Program so both CODECOPY data sections
-        are appended consecutively at the very end of the built bytecode.
+        Keep the flow in a single Program/build step; when using
+        Program.push_bytes / Venom-managed data sections, do not concatenate
+        separately built bytecode fragments.
         """
         w3 = ctx["w3"]
         vm = ctx["vm"]
