@@ -1,705 +1,716 @@
-"""DeFiVM program builder — Python DSL for assembling DeFiVM EVM bytecode.
+"""DeFiVM Program — SSA-style builder over Vyper's Venom IR.
 
-Programs are raw EVM bytecode executed on the native EVM stack by the
-Analog-Labs interpreter.  ``execute()`` in DeFiVM.sol runs a program via
-``DELEGATECALL`` into that interpreter; it does not deploy the bytecode via
-``CREATE``.  As a result, callers should reason about calldata, memory, and
-gas behaviour using the interpreter/delegatecall execution model rather than
-the semantics of a freshly deployed contract.
+A Pythonic value-flow API: methods that produce values return :class:`Value`
+handles that the user threads through subsequent calls, and Venom's stack
+allocator generates DUP / SWAP / POP automatically.  Quick example::
 
-Memory conventions used by the interpreter
-------------------------------------------
-- Registers:          ``memory[0x80 + i*32]`` for ``i`` in 0..15
-- Free memory pointer: ``memory[0x40]`` (initialised to 0x280 on first use)
-- Dynamic buffers:    allocated starting at ``memory[0x280]``
+    from pydefi.vm import Program
 
-Usage example::
+    prog = Program()
+    success = prog.call_contract(ROUTER, calldata)
+    prog.assert_(success)
+    prog.stop()
+    bytecode = prog.build()
 
-    from pydefi.vm.program import push_u256, push_addr, push_bytes, call, assert_ge
+Patched call (the calldata pattern)::
 
-    program = (
-        push_u256(0) + push_u256(0)          # retLen, retOffset
-        + push_bytes(swap_calldata)
-        + push_u256(0) + push_addr(SWAP_ADAPTER) + gas_opcode()
-        + call()
+    prog = Program()
+    quote_ok = prog.call_contract(QUOTER, quote_calldata)
+    prog.assert_(quote_ok)
+    amount = prog.returndata_word(0)
+    swap_ok = prog.call_contract(
+        ROUTER,
+        swap_template,
+        patches={36: amount},  # write amount into the calldata at offset 36
     )
+    prog.assert_(swap_ok)
+    prog.stop()
+    bytecode = prog.build()
+
+Design notes
+------------
+``Program`` owns one :class:`vyper.venom.context.IRContext` and one
+``main`` :class:`IRFunction` for its lifetime.  Each method that emits IR
+appends instructions to the *current* basic block, exposed via
+``self._builder.current_block()``.
+
+**Memory model (DELEGATECALL execution).**  Programs are run by the
+Analog-Labs interpreter via ``DELEGATECALL``, which means we manage
+free-memory ourselves rather than relying on Venom's compile-time
+``alloca``/``memtop``.  Layout matches the legacy builder:
+
+* Registers:        ``mem[0x80 + i*32]`` for ``i`` in 0..15
+* Free-mem pointer: ``mem[0x40]`` (defaults to 0x280 on first use)
+* Dynamic buffers:  start at ``mem[0x280]``
+
+**Calldata buffers.**  Static calldata for external calls is appended to a
+Venom data section; the body emits ``codecopy`` from the section into a
+fresh memory allocation, applies optional patches via ``mstore``, then
+``call``.  Venom resolves the data-section label to its absolute byte
+position in the compiled output, so no post-processing patches are needed.
+
+**Termination.**  A ``Program`` is "open" until the user calls one of
+:meth:`stop`, :meth:`return_`, :meth:`return_word`, :meth:`revert`, or a
+control-flow primitive that terminates the current BB.  :meth:`build` adds
+an implicit ``stop`` if the current BB is still open.
 """
 
 from __future__ import annotations
 
-from vyper.evm.opcodes import OPCODES as _OPCODES
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Union
 
-from pydefi.types import Address
+from eth_abi.abi import encode, encode_with_hooks
+from eth_contract.contract import ContractFunction
+from vyper.compiler.phases import generate_bytecode
+from vyper.compiler.settings import OptimizationLevel, VenomOptimizationFlags
+from vyper.venom import generate_assembly_experimental, run_passes_on
+from vyper.venom.basicblock import IRBasicBlock, IRLabel, IRLiteral, IRVariable
+from vyper.venom.builder import VenomBuilder
+from vyper.venom.context import IRContext
 
+if TYPE_CHECKING:
+    from eth_abi.hooks import EncodingContext
 
-def _op(name: str) -> int:
-    """Return the opcode byte for *name* from Vyper's canonical opcode table."""
-    return _OPCODES[name][0]
-
-
-# ---------------------------------------------------------------------------
-# Opcode constants — derived from Vyper's opcode table, never hand-coded
-# ---------------------------------------------------------------------------
-
-OP_PUSH_U256: int = _op("PUSH32")  # PUSH32 — emitted by push_u256()
-OP_PUSH_ADDR: int = _op("PUSH20")  # PUSH20 — emitted by push_addr()
-OP_DUP: int = _op("DUP1")  # DUP1 — emitted by dup()
-OP_SWAP: int = _op("SWAP1")  # SWAP1 — emitted by swap()
-OP_POP: int = _op("POP")  # POP — emitted by pop()
-# NOTE: OP_JUMP and OP_JUMPI share the PUSH2 prefix (0x61) with load_reg/store_reg.
-# They identify the first byte of the 4-byte PUSH2 target + JUMP/JUMPI sequence.
-OP_JUMP: int = _op("PUSH2")  # first byte of jump() sequence (PUSH2 target JUMP)
-OP_JUMPI: int = OP_JUMP  # first byte of jumpi() sequence (PUSH2 target JUMPI)
-OP_ADD: int = _op("ADD")  # ADD — emitted by add()
-OP_MUL: int = _op("MUL")  # MUL — emitted by mul()
-OP_SUB: int = _op("DUP2")  # DUP2 — first byte of saturating sub() sequence
-OP_DIV: int = _op("DIV")  # DIV — emitted by div()
-OP_MOD: int = _op("MOD")  # MOD — emitted by mod()
-OP_LT: int = _op("LT")  # LT — emitted by lt()
-OP_GT: int = _op("GT")  # GT — emitted by gt()
-OP_EQ: int = _op("EQ")  # EQ — emitted by eq()
-OP_ISZERO: int = _op("ISZERO")  # ISZERO — emitted by iszero()
-OP_AND: int = _op("AND")  # AND — emitted by bitwise_and()
-OP_OR: int = _op("OR")  # OR — emitted by bitwise_or()
-OP_XOR: int = _op("XOR")  # XOR — emitted by bitwise_xor()
-OP_NOT: int = _op("NOT")  # NOT — emitted by bitwise_not()
-OP_SHL: int = _op("SHL")  # SHL — emitted by shl()
-OP_SHR: int = _op("SHR")  # SHR — emitted by shr()
-OP_GAS: int = _op("GAS")  # GAS — emitted by gas_opcode()
-OP_CALL: int = _op("CALL")  # CALL — core opcode in the call() sequence
-OP_SELF_ADDR: int = _op("ADDRESS")  # ADDRESS — emitted by self_addr()
-OP_BALANCE: int = _op("BALANCE")  # BALANCE — used in balance_of() ETH path
-OP_MLOAD: int = _op("MLOAD")  # MLOAD — load word from memory
-OP_MSTORE: int = _op("MSTORE")  # MSTORE — store word to memory
-OP_JUMPDEST: int = _op("JUMPDEST")  # JUMPDEST — marks a valid jump target
-OP_RETURNDATACOPY: int = _op("RETURNDATACOPY")  # RETURNDATACOPY — copy returndata into memory
-OP_STATICCALL: int = _op("STATICCALL")  # STATICCALL — used by balance_of() ERC-20 path
-OP_REVERT: int = _op("REVERT")  # REVERT
-OP_CODECOPY: int = _op("CODECOPY")  # CODECOPY — copy bytecode slice into memory
-
-# ---------------------------------------------------------------------------
-# Private module-level opcode aliases (used only inside multi-opcode helpers)
-# ---------------------------------------------------------------------------
-
-_PUSH1: int = _op("PUSH1")  # PUSH1 — followed by one immediate byte
-_PUSH2: int = _op("PUSH2")  # PUSH2 — followed by two immediate bytes (= OP_JUMP first byte)
-_PUSH4: int = _op("PUSH4")  # PUSH4 — followed by four immediate bytes
-_PC: int = _op("PC")  # PC — push current program counter
-_JUMP: int = _op("JUMP")  # JUMP raw opcode (inside multi-opcode sequences)
-_JUMPI: int = _op("JUMPI")  # JUMPI raw opcode
-_SUB_OP: int = _op("SUB")  # SUB — integer subtraction
-_DUP2: int = _op("DUP2")  # DUP2
-_DUP3: int = _op("DUP3")  # DUP3
-_DUP4: int = _op("DUP4")  # DUP4
-_DUP6: int = _op("DUP6")  # DUP6
-_SWAP2: int = _op("SWAP2")  # SWAP2
-_SWAP3: int = _op("SWAP3")  # SWAP3
-_OP_RETURN: int = _op("RETURN")  # RETURN — end execution and return data from memory
+    from pydefi.types import Address
 
 
 # ---------------------------------------------------------------------------
-# Shared helper
+# Public types
 # ---------------------------------------------------------------------------
 
 
-def _push_imm(v: int) -> bytes:
-    """Return the smallest PUSH opcode sequence for a non-negative integer *v*."""
-    if v <= 0xFF:
-        return bytes([_PUSH1, v])
-    elif v <= 0xFFFF:
-        return bytes([_PUSH2, v >> 8, v & 0xFF])
-    else:
-        n = (v.bit_length() + 7) // 8
-        return bytes([0x5F + n]) + v.to_bytes(n, "big")
+class Value:
+    """Opaque handle to an SSA value (an EVM word produced at runtime).
 
+    Created by methods on :class:`Program` (e.g. :meth:`Program.const`,
+    :meth:`Program.add`, :meth:`Program.call_contract`).  Pass these handles
+    as arguments to other ``Program`` methods to build a value-flow graph
+    that Venom compiles to EVM bytecode.
 
-# ---------------------------------------------------------------------------
-# Stack instructions
-# ---------------------------------------------------------------------------
-
-
-def push_u256(n: int) -> bytes:
-    """Emit PUSH32 — push a uint256 literal onto the native EVM stack."""
-    if n < 0:
-        raise ValueError(f"push_u256: value must be non-negative, got {n}")
-    return bytes([OP_PUSH_U256]) + n.to_bytes(32, "big")
-
-
-def push_addr(a: Address) -> bytes:
-    """Emit PUSH20 — push a 20-byte Ethereum address onto the native EVM stack."""
-    if len(a) != 20:
-        raise ValueError(f"push_addr: bad address length: {a!r}")
-    return bytes([OP_PUSH_ADDR]) + a
-
-
-def gas_opcode() -> bytes:
-    """Emit GAS — push the remaining gas onto the stack."""
-    return bytes([OP_GAS])
-
-
-def fp_init() -> bytes:
-    """Emit opcodes that push the current free-memory pointer onto the stack.
-
-    Computes ``fp if fp != 0 else 0x280`` where ``fp = mem[0x40]``.
-    If the free-memory pointer has not been initialised yet (zero), defaults
-    to ``0x280`` (past the register area).
-
-    This preamble is shared between :func:`push_bytes`, :func:`emit_abi_encode`,
-    and :func:`emit_abi_encode_packed`.
+    Users should treat :class:`Value` as opaque — direct operand access is
+    intentionally not exposed.
     """
-    return bytes(
-        [
-            _PUSH1,
-            0x40,  # PUSH1 0x40
-            OP_MLOAD,  # MLOAD           → [fp]
-            _PUSH2,
-            0x02,
-            0x80,  # PUSH2 0x0280    → [0x280, fp]
-            _DUP2,  # DUP2            → [fp, 0x280, fp]
-            OP_ISZERO,  # ISZERO          → [fp==0, 0x280, fp]
-            OP_MUL,  # MUL             → [0x280*(fp==0), fp]
-            OP_OR,  # OR              → [max_fp]
+
+    __slots__ = ("_op",)
+
+    def __init__(self, op: Union[IRVariable, IRLiteral]) -> None:
+        self._op = op
+
+    def __repr__(self) -> str:
+        return f"Value({self._op!r})"
+
+
+class Label:
+    """Opaque handle to a basic block (jump target).
+
+    Created by :meth:`Program.label`.  Use :meth:`Program.jump`,
+    :meth:`Program.branch`, or :meth:`Program.goto` to direct control flow.
+    """
+
+    __slots__ = ("_bb", "name")
+
+    def __init__(self, bb: IRBasicBlock, name: str) -> None:
+        self._bb = bb
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"Label({self.name!r})"
+
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+
+#: Anything acceptable in a ``Value`` slot — runtime SSA handle, plain ``int``
+#: literal, or 20-byte ``bytes`` address (interpreted as big-endian uint256).
+ValueLike = Union[Value, int, bytes]
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _pad32(data: bytes) -> bytes:
+    """Return *data* zero-padded to the next 32-byte boundary."""
+    return data.ljust((len(data) + 31) & ~31, b"\x00")
+
+
+#: Placeholders that satisfy eth_abi's per-type encoders.  We can't use ``0``
+#: for everything — the AddressEncoder rejects ``int`` and the BytesEncoder
+#: needs ``bytes``.  Mapping covers the common static types used in DeFi
+#: function signatures; unknown types fall back to ``0`` and surface an
+#: encoding error if that's not accepted.
+_ABI_PLACEHOLDERS: dict[str, object] = {
+    "address": b"\x00" * 20,
+    "bool": False,
+    "bytes32": b"\x00" * 32,
+    "bytes20": b"\x00" * 20,
+    "bytes16": b"\x00" * 16,
+    "bytes8": b"\x00" * 8,
+    "bytes4": b"\x00" * 4,
+}
+
+
+class _ValuePlaceholder:
+    """Internal placeholder that records the calldata offset of a Value during
+    ABI encoding via :func:`eth_abi.encode_with_hooks`.
+    """
+
+    def __init__(self, value: Value, abi_type: str) -> None:
+        self.value = value
+        self.abi_type = abi_type
+        self.offset: int | None = None
+
+    def __call__(self, ctx: "EncodingContext") -> object:
+        # 4 = function selector prefix.  ctx.offset is the byte position of
+        # the encoded value within the args (start of its 32-byte slot for
+        # static types — which is where Program.call_contract MSTOREs).
+        self.offset = 4 + ctx.offset
+        return _ABI_PLACEHOLDERS.get(self.abi_type, 0)
+
+
+def _replace_values_with_placeholders(arg: object, abi_type: str, sink: list[_ValuePlaceholder]) -> object:
+    """Recursively replace :class:`Value` instances with :class:`_ValuePlaceholder`.
+
+    *abi_type* is the type string for *arg* (e.g. ``"uint256"``, ``"address"``,
+    ``"(uint256,address)"`` for a struct).  Used to select an encoder-friendly
+    placeholder when the current leaf is a :class:`Value`.
+
+    Returns a fresh structure suitable for :func:`eth_abi.encode_with_hooks`.
+    Non-Value leaves (int, str, bool, bytes) pass through unchanged.
+
+    Container handling: tuple/list types are walked recursively but for
+    Value leaves we currently only annotate with the outer type — sufficient
+    for the static-scalar parameter shapes pydefi uses.  Patches inside
+    nested tuples/lists fall back to the generic ``0`` placeholder.
+    """
+    if isinstance(arg, Value):
+        ph = _ValuePlaceholder(arg, abi_type)
+        sink.append(ph)
+        return ph
+    if isinstance(arg, tuple):
+        return tuple(_replace_values_with_placeholders(item, "", sink) for item in arg)
+    if isinstance(arg, list):
+        return [_replace_values_with_placeholders(item, "", sink) for item in arg]
+    return arg
+
+
+# ---------------------------------------------------------------------------
+# Program
+# ---------------------------------------------------------------------------
+
+
+class Program:
+    """SSA-style fluent builder over Vyper's Venom IR.
+
+    Each instance owns one :class:`IRContext` and one ``main``
+    :class:`IRFunction`; method calls append IR to the current basic block.
+    Call :meth:`build` to compile the accumulated IR to EVM bytecode.
+
+    Methods either:
+
+    * **Produce a value** — return a :class:`Value` handle.  Examples:
+      :meth:`const`, :meth:`add`, :meth:`call_contract`, :meth:`load_reg`.
+    * **Have a side effect** — return ``None``.  Examples: :meth:`store_reg`,
+      :meth:`assert_`, :meth:`stop`, :meth:`jump`.
+
+    Wherever a method takes a ``ValueLike`` argument, you may pass a
+    :class:`Value` returned by another method, a Python ``int`` (auto-wrapped
+    as a constant), or 20 raw bytes (interpreted as a big-endian address).
+    """
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    def __init__(self) -> None:
+        self._ctx = IRContext()  # type: ignore[operator]
+        self._fn = self._ctx.create_function("main")
+        self._ctx.entry_function = self._fn
+        self._builder = VenomBuilder(self._ctx, self._fn)  # type: ignore[operator]
+        self._data_section_counter = 0  # for unique label names
+
+    # ------------------------------------------------------------------
+    # Operand coercion
+    # ------------------------------------------------------------------
+
+    def _to_operand(self, v: ValueLike) -> Union[IRVariable, IRLiteral, int]:
+        """Coerce a :class:`ValueLike` into something acceptable as a Venom operand.
+
+        * :class:`Value`  → its underlying SSA / literal operand.
+        * ``int``         → Venom accepts plain ``int`` literals directly.
+        * ``bytes`` (len 20) → big-endian ``int`` (an EVM address).
+        """
+        if isinstance(v, Value):
+            return v._op
+        if isinstance(v, int):
+            if v < 0:
+                raise ValueError(f"operand must be non-negative, got {v}")
+            return v
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            if len(v) != 20:
+                raise ValueError(
+                    f"operand: bytes must be 20 (an address), got {len(v)} bytes; "
+                    "use Program.const(int.from_bytes(...)) for arbitrary widths"
+                )
+            return int.from_bytes(bytes(v), "big")
+        raise TypeError(f"operand: unsupported type {type(v).__name__}")
+
+    def _wrap(self, op: Union[IRVariable, IRLiteral]) -> Value:
+        return Value(op)
+
+    # ------------------------------------------------------------------
+    # Constants
+    # ------------------------------------------------------------------
+
+    def const(self, n: int) -> Value:
+        """Return a :class:`Value` wrapping the constant uint256 *n*."""
+        if n < 0:
+            raise ValueError(f"const: value must be non-negative, got {n}")
+        if n >= 1 << 256:
+            raise ValueError(f"const: value {n} does not fit in uint256")
+        return Value(IRLiteral(n))  # type: ignore[operator]
+
+    def addr(self, a: "Address") -> Value:
+        """Return a :class:`Value` for a 20-byte EVM address."""
+        if len(a) != 20:
+            raise ValueError(f"addr: address must be 20 bytes, got {len(a)}")
+        return Value(IRLiteral(int.from_bytes(bytes(a), "big")))  # type: ignore[operator]
+
+    # ------------------------------------------------------------------
+    # Arithmetic
+    # ------------------------------------------------------------------
+
+    def add(self, a: ValueLike, b: ValueLike) -> Value:
+        """Wrapping uint256 ``a + b``."""
+        return self._wrap(self._builder.add(self._to_operand(a), self._to_operand(b)))
+
+    def sub(self, a: ValueLike, b: ValueLike) -> Value:
+        """Saturating ``max(a - b, 0)``.
+
+        Implemented as ``(a - b) * (a >= b)`` since EVM SUB wraps modulo 2^256.
+        """
+        a_op = self._to_operand(a)
+        b_op = self._to_operand(b)
+        # raw_diff = a - b (wraps if a < b)
+        raw_diff = self._builder.sub(a_op, b_op)
+        # not_underflow = 1 if a >= b else 0  ==  iszero(a < b)
+        not_underflow = self._builder.iszero(self._builder.lt(a_op, b_op))
+        return self._wrap(self._builder.mul(raw_diff, not_underflow))
+
+    def mul(self, a: ValueLike, b: ValueLike) -> Value:
+        """Wrapping uint256 ``a * b``."""
+        return self._wrap(self._builder.mul(self._to_operand(a), self._to_operand(b)))
+
+    def div(self, a: ValueLike, b: ValueLike) -> Value:
+        """Unsigned ``a // b``; EVM DIV returns 0 when ``b == 0``."""
+        return self._wrap(self._builder.div(self._to_operand(a), self._to_operand(b)))
+
+    def mod(self, a: ValueLike, b: ValueLike) -> Value:
+        """Unsigned ``a % b``; EVM MOD returns 0 when ``b == 0``."""
+        return self._wrap(self._builder.mod(self._to_operand(a), self._to_operand(b)))
+
+    # ------------------------------------------------------------------
+    # Comparison / boolean
+    # ------------------------------------------------------------------
+
+    def lt(self, a: ValueLike, b: ValueLike) -> Value:
+        """Unsigned ``1 if a < b else 0``."""
+        return self._wrap(self._builder.lt(self._to_operand(a), self._to_operand(b)))
+
+    def gt(self, a: ValueLike, b: ValueLike) -> Value:
+        """Unsigned ``1 if a > b else 0``."""
+        return self._wrap(self._builder.gt(self._to_operand(a), self._to_operand(b)))
+
+    def eq(self, a: ValueLike, b: ValueLike) -> Value:
+        """``1 if a == b else 0``."""
+        return self._wrap(self._builder.eq(self._to_operand(a), self._to_operand(b)))
+
+    def is_zero(self, a: ValueLike) -> Value:
+        """``1 if a == 0 else 0``."""
+        return self._wrap(self._builder.iszero(self._to_operand(a)))
+
+    # ------------------------------------------------------------------
+    # Bitwise
+    # ------------------------------------------------------------------
+
+    def bit_and(self, a: ValueLike, b: ValueLike) -> Value:
+        return self._wrap(self._builder.and_(self._to_operand(a), self._to_operand(b)))
+
+    def bit_or(self, a: ValueLike, b: ValueLike) -> Value:
+        return self._wrap(self._builder.or_(self._to_operand(a), self._to_operand(b)))
+
+    def bit_xor(self, a: ValueLike, b: ValueLike) -> Value:
+        return self._wrap(self._builder.xor(self._to_operand(a), self._to_operand(b)))
+
+    def bit_not(self, a: ValueLike) -> Value:
+        return self._wrap(self._builder.not_(self._to_operand(a)))
+
+    def shl(self, value: ValueLike, shift: ValueLike) -> Value:
+        """``value << shift`` (Venom signature: ``shl(bits, val)``)."""
+        return self._wrap(self._builder.shl(self._to_operand(shift), self._to_operand(value)))
+
+    def shr(self, value: ValueLike, shift: ValueLike) -> Value:
+        """``value >> shift`` (Venom signature: ``shr(bits, val)``)."""
+        return self._wrap(self._builder.shr(self._to_operand(shift), self._to_operand(value)))
+
+    # ------------------------------------------------------------------
+    # Memory / Registers
+    # ------------------------------------------------------------------
+
+    def load_reg(self, i: int) -> Value:
+        """Load 32-byte word from register *i* (memory slot ``0x80 + i*32``)."""
+        if not 0 <= i <= 15:
+            raise ValueError(f"load_reg: register index must be 0..15, got {i}")
+        addr = 0x80 + i * 32
+        return self._wrap(self._builder.mload(IRLiteral(addr)))  # type: ignore[arg-type]
+
+    def store_reg(self, i: int, v: ValueLike) -> None:
+        """Store *v* into register *i* (memory slot ``0x80 + i*32``)."""
+        if not 0 <= i <= 15:
+            raise ValueError(f"store_reg: register index must be 0..15, got {i}")
+        addr = 0x80 + i * 32
+        self._builder.mstore(IRLiteral(addr), self._to_operand(v))  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Self / context
+    # ------------------------------------------------------------------
+
+    def self_addr(self) -> Value:
+        """EVM ``ADDRESS`` — the running program's own address."""
+        return self._wrap(self._builder.address())
+
+    def gas_left(self) -> Value:
+        """EVM ``GAS`` — remaining gas."""
+        return self._wrap(self._builder.gas())
+
+    # ------------------------------------------------------------------
+    # Internal: free-memory and data-section helpers
+    # ------------------------------------------------------------------
+
+    def _alloc_calldata(self, calldata: bytes) -> tuple[IRVariable, int]:
+        """Append *calldata* as a Venom data section, copy into free memory.
+
+        Returns ``(base_fp, blen)`` where ``base_fp`` is the SSA pointer to
+        the start of the buffer in memory and ``blen`` is the unpadded byte
+        length (the value to pass as ``argsLen`` to ``CALL``).
+        """
+        if len(calldata) > 0xFFFF:
+            raise ValueError(f"calldata too large ({len(calldata)} bytes, max 65535)")
+        blen = len(calldata)
+        blen_padded = (blen + 31) & ~31
+
+        label = IRLabel(f"pydefi_calldata_{self._data_section_counter}", is_symbol=True)  # type: ignore[operator]
+        self._data_section_counter += 1
+        self._ctx.append_data_section(label)
+        self._ctx.append_data_item(_pad32(calldata))
+
+        # base_fp = mem[0x40] | (iszero(mem[0x40]) * 0x280)  — defaults to 0x280
+        fp = self._builder.mload(IRLiteral(0x40))  # type: ignore[arg-type]
+        default_fp = self._builder.mul(self._builder.iszero(fp), 0x280)
+        base_fp = self._builder.or_(fp, default_fp)
+        # codecopy(base_fp, &calldata, blen_padded)
+        data_src = self._builder.offset(0, label)
+        self._builder.codecopy(base_fp, data_src, blen_padded)
+        # mem[0x40] = base_fp + blen_padded
+        self._builder.mstore(IRLiteral(0x40), self._builder.add(base_fp, blen_padded))  # type: ignore[arg-type]
+        return base_fp, blen
+
+    def _alloc(self, size: int) -> IRVariable:
+        """Reserve *size* bytes in free memory, advance ``mem[0x40]``, return base."""
+        fp = self._builder.mload(IRLiteral(0x40))  # type: ignore[arg-type]
+        default_fp = self._builder.mul(self._builder.iszero(fp), 0x280)
+        base = self._builder.or_(fp, default_fp)
+        self._builder.mstore(IRLiteral(0x40), self._builder.add(base, size))  # type: ignore[arg-type]
+        return base
+
+    # ------------------------------------------------------------------
+    # External calls
+    # ------------------------------------------------------------------
+
+    def call_contract(
+        self,
+        to: ValueLike,
+        calldata: bytes,
+        *,
+        value: ValueLike = 0,
+        gas: ValueLike | None = None,
+        patches: Mapping[int, ValueLike] | None = None,
+    ) -> Value:
+        """Emit a CALL with static calldata and optional runtime patches.
+
+        Args:
+            to:        Target contract address.
+            calldata:  Pre-encoded calldata template; stored in a Venom data
+                       section and copied into memory before the call.
+            value:     ETH value to forward (wei).
+            gas:       Gas limit; ``None`` forwards all remaining gas.
+            patches:   Optional ``{calldata_offset: value}`` overlay.  Each
+                       entry overwrites a 32-byte word in the in-memory
+                       calldata buffer at the given offset before CALL.
+
+        Returns:
+            A :class:`Value` holding the CALL success flag (1 on success,
+            0 on failure).  Use :meth:`assert_` to revert on failure.
+        """
+        base_fp, blen = self._alloc_calldata(calldata)
+
+        if patches:
+            for offset, val in patches.items():
+                if not 0 <= offset <= blen - 32:
+                    raise ValueError(
+                        f"call_contract: patch offset {offset} out of bounds "
+                        f"(calldata length {blen}, must satisfy 0 <= offset <= len-32)"
+                    )
+                target_addr = self._builder.add(base_fp, offset)
+                self._builder.mstore(target_addr, self._to_operand(val))
+
+        gas_op = self._builder.gas() if gas is None else self._to_operand(gas)
+        success = self._builder.call(
+            gas_op,
+            self._to_operand(to),
+            self._to_operand(value),
+            base_fp,
+            blen,
+            0,
+            0,
+        )
+        return self._wrap(success)
+
+    def call_contract_abi(
+        self,
+        to: ValueLike,
+        abi_sig: str,
+        *args: object,
+        value: ValueLike = 0,
+        gas: ValueLike | None = None,
+    ) -> Value:
+        """Emit a CALL with calldata built from a human-readable ABI signature.
+
+        Plain Python values (``int``, ``str`` address, ``bool``, ``bytes``,
+        nested ``tuple``/``list``) are statically encoded.  :class:`Value`
+        instances anywhere in the argument tree become *runtime patches* —
+        the ABI placeholder is encoded as ``0`` and ``mstore`` overwrites it
+        in the in-memory calldata buffer with the SSA value before CALL.
+
+        The ``function`` keyword in *abi_sig* is optional; both bare
+        ``"transfer(address,uint256)"`` and qualified ``"function transfer(...)"``
+        forms are accepted.
+
+        Returns:
+            A :class:`Value` holding the CALL success flag.
+        """
+        normalised = abi_sig if abi_sig.lstrip().startswith("function ") else "function " + abi_sig
+        fn = ContractFunction.from_abi(normalised)
+        param_types = fn.input_types
+
+        if len(args) != len(param_types):
+            raise ValueError(
+                f"call_contract_abi: expected {len(param_types)} argument(s) for signature {abi_sig!r}, got {len(args)}"
+            )
+
+        # Walk the arg tree, replacing each Value with a placeholder hook that
+        # records the value's calldata offset during ABI encoding.
+        placeholders: list[_ValuePlaceholder] = []
+        encoded_args: list[object] = [
+            _replace_values_with_placeholders(a, t, placeholders) for a, t in zip(args, param_types)
         ]
-    )
 
+        if not placeholders:
+            calldata = bytes(fn.selector) + encode(param_types, encoded_args)
+            return self.call_contract(to, calldata, value=value, gas=gas)
 
-def push_bytes(data: bytes) -> bytes:
-    """Copy *data* into free memory and leave ``[argsOffset(TOS), argsLen(2nd)]``.
+        encoded = encode_with_hooks(param_types, encoded_args)
+        calldata = bytes(fn.selector) + encoded
+        patches: dict[int, ValueLike] = {p.offset: p.value for p in placeholders if p.offset is not None}
+        return self.call_contract(to, calldata, value=value, gas=gas, patches=patches)
 
-    Each 32-byte chunk of *data* is embedded as a ``PUSH32`` immediate and
-    stored with ``MSTORE``.  The free memory pointer at ``mem[0x40]`` is
-    initialised to ``0x280`` minimum and advanced after the allocation.
+    # ------------------------------------------------------------------
+    # Returndata
+    # ------------------------------------------------------------------
 
-    This implementation avoids ``CALLDATACOPY`` (opcode ``0x37``) because the
-    Analog-Labs EVM interpreter's CALLDATACOPY handler ignores the user-supplied
-    source offset and always reads from ``calldatasize`` (past the end of the
-    program calldata), copying zeros instead of the intended bytes.
-    """
-    if len(data) > 0xFFFF:
-        raise ValueError(f"push_bytes: data too large ({len(data)} bytes, max 65535)")
-    blen = len(data)
-    blen_padded = (blen + 31) & ~31
+    def returndata_word(self, offset: int = 0) -> Value:
+        """Read 32 bytes from the last call's returndata at *offset*."""
+        if offset < 0:
+            raise ValueError(f"returndata_word: offset must be non-negative, got {offset}")
+        scratch = self._alloc(32)
+        self._builder.returndatacopy(scratch, offset, 32)
+        return self._wrap(self._builder.mload(scratch))
 
-    # Build the output in a list of chunks to avoid O(n²) bytes concatenation.
-    parts: list[bytes] = []
+    # ------------------------------------------------------------------
+    # Assertions
+    # ------------------------------------------------------------------
 
-    # Compute max_fp = fp | (0x280 * (fp == 0))
-    parts.append(fp_init())
+    def assert_(self, cond: ValueLike, msg: str = "") -> None:
+        """Revert if *cond* is zero.
 
-    # Store each 32-byte chunk; max_fp stays at TOS between iterations.
-    for i in range(0, blen_padded, 32):
-        chunk = data[i : i + 32].ljust(32, b"\x00")
-        chunk_val = int.from_bytes(chunk, "big")
+        With ``msg=""`` (default) emits a bare REVERT(0, 0).  With a non-empty
+        message ≤ 32 bytes, encodes ``Error(string)`` ABI in memory and
+        REVERTs with that payload — matching Solidity's
+        ``require(cond, "message")``.
+        """
+        if not msg:
+            self._builder.assert_(self._to_operand(cond))
+            return
 
-        # Duplicate max_fp, then compute store address = max_fp + i.
-        parts.append(bytes([OP_DUP]))  # DUP1 → [max_fp, max_fp, ...]
-        if i > 0:
-            parts.append(_push_imm(i))  # [i, max_fp, max_fp]
-            parts.append(bytes([OP_ADD]))  # ADD → [max_fp+i, max_fp]
+        raw = msg.encode()
+        if len(raw) > 32:
+            raise ValueError(f"assert_: message too long ({len(raw)} bytes, max 32)")
 
-        # Push the 32-byte chunk (use PUSH1 0 for all-zero chunks).
-        if chunk_val == 0:
-            parts.append(bytes([_PUSH1, 0x00]))  # PUSH1 0
+        # Conditional revert: if cond == 0 → revert with Error(string), else fall through.
+        ok_bb = self._builder.create_block("assert_ok")
+        revert_bb = self._builder.create_block("assert_revert")
+        self._builder.append_block(ok_bb)
+        self._builder.append_block(revert_bb)
+        self._builder.jnz(self._to_operand(cond), ok_bb.label, revert_bb.label)
+
+        # Build Error(string) payload in revert_bb:
+        #   mem[fp+0..4]     = selector 0x08c379a0
+        #   mem[fp+4..36]    = offset 0x20
+        #   mem[fp+36..68]   = msg length
+        #   mem[fp+68..68+padded] = msg bytes
+        self._builder.set_block(revert_bb)
+        msglen = len(raw)
+        msg_word = int.from_bytes(raw.ljust(32, b"\x00"), "big")
+        # Selector left-aligned in a 32-byte slot at fp+0; mstore(fp, selector_word)
+        # writes the selector at fp+0..4 with zeros at fp+4..32 — but we then
+        # overwrite fp+4..36 with the offset, so net layout is correct.
+        selector_word = 0x08C379A000000000000000000000000000000000000000000000000000000000
+        base = self._alloc(100)  # 4 + 32 + 32 + 32
+        self._builder.mstore(base, selector_word)
+        self._builder.mstore(self._builder.add(base, 4), 0x20)
+        self._builder.mstore(self._builder.add(base, 36), msglen)
+        self._builder.mstore(self._builder.add(base, 68), msg_word)
+        self._builder.revert(base, 100)
+
+        # Continue at ok_bb
+        self._builder.set_block(ok_bb)
+
+    def assert_ge(self, a: ValueLike, b: ValueLike, msg: str = "") -> None:
+        """Revert if ``a < b`` (i.e. require ``a >= b``)."""
+        a_op = self._to_operand(a)
+        b_op = self._to_operand(b)
+        not_lt = self._builder.iszero(self._builder.lt(a_op, b_op))
+        self.assert_(self._wrap(not_lt), msg)
+
+    def assert_le(self, a: ValueLike, b: ValueLike, msg: str = "") -> None:
+        """Revert if ``a > b`` (i.e. require ``a <= b``)."""
+        a_op = self._to_operand(a)
+        b_op = self._to_operand(b)
+        not_gt = self._builder.iszero(self._builder.gt(a_op, b_op))
+        self.assert_(self._wrap(not_gt), msg)
+
+    # ------------------------------------------------------------------
+    # Control flow
+    # ------------------------------------------------------------------
+
+    def label(self, name: str) -> Label:
+        """Create a fresh basic block and return its :class:`Label`.
+
+        Does NOT switch the insertion point — call :meth:`goto` to start
+        emitting into the new block.  This separation lets you create a label
+        that you'll jump to from multiple places before populating its body.
+
+        The block is appended to the function immediately so that it can be
+        referenced by :meth:`jump` / :meth:`branch` before being populated.
+        """
+        bb = self._builder.create_block(name)
+        self._builder.append_block(bb)
+        return Label(bb, name)
+
+    def goto(self, target: Label) -> None:
+        """Switch the insertion point to *target*'s basic block.
+
+        The previously-current block must already be terminated (e.g. via
+        :meth:`jump`, :meth:`branch`, :meth:`stop`, …).
+        """
+        self._builder.set_block(target._bb)
+
+    def jump(self, target: Label) -> None:
+        """Terminate the current block with an unconditional ``jmp`` to *target*."""
+        self._builder.jmp(target._bb.label)
+
+    def branch(self, cond: ValueLike, *, true: Label, false: Label) -> None:
+        """Terminate the current block with conditional ``jnz``.
+
+        Jumps to *true* if ``cond != 0``, else to *false*.
+        """
+        self._builder.jnz(self._to_operand(cond), true._bb.label, false._bb.label)
+
+    # ------------------------------------------------------------------
+    # Termination
+    # ------------------------------------------------------------------
+
+    def stop(self) -> None:
+        """Terminate the current block with ``STOP`` (halt, no return data)."""
+        self._builder.stop()
+
+    def return_(self, offset: ValueLike, length: ValueLike) -> None:
+        """Terminate with ``RETURN(offset, length)`` — return memory slice."""
+        self._builder.return_(self._to_operand(offset), self._to_operand(length))
+
+    def return_word(self, value: ValueLike) -> None:
+        """Convenience: store *value* at ``mem[0]`` and ``RETURN(0, 32)``."""
+        self._builder.mstore(IRLiteral(0), self._to_operand(value))  # type: ignore[arg-type]
+        self._builder.return_(IRLiteral(0), IRLiteral(32))  # type: ignore[arg-type]
+
+    def revert(self, offset: ValueLike = 0, length: ValueLike = 0) -> None:
+        """Terminate with ``REVERT(offset, length)`` — revert with memory slice."""
+        self._builder.revert(self._to_operand(offset), self._to_operand(length))
+
+    # ------------------------------------------------------------------
+    # Build
+    # ------------------------------------------------------------------
+
+    def build(
+        self,
+        *,
+        optimize: OptimizationLevel = OptimizationLevel.GAS,  # type: ignore[valid-type]
+        disable_constant_folding: bool = False,
+    ) -> bytes:
+        """Compile the accumulated IR via Venom and return EVM bytecode.
+
+        If the current basic block is not terminated, an implicit ``STOP`` is
+        inserted before compilation.
+
+        Args:
+            optimize: Venom optimization level.  Defaults to ``GAS`` for
+                production builds.
+            disable_constant_folding: Disable SCCP, algebraic optimization,
+                and assert elimination.  Useful in tests that exercise
+                runtime behavior with constant inputs — without this,
+                ``assert_(prog.const(0))`` raises a Venom
+                ``StaticAssertionException`` at compile time because SCCP
+                proves the assertion will fail.  Real programs whose
+                conditions depend on call returndata or other runtime data
+                are unaffected.
+        """
+        if not self._builder.is_terminated():
+            self._builder.stop()
+
+        if disable_constant_folding:
+            flags = VenomOptimizationFlags(  # type: ignore[call-arg]
+                level=optimize,
+                disable_sccp=True,
+                disable_algebraic_optimization=True,
+                disable_assert_elimination=True,
+                disable_branch_optimization=True,
+            )
         else:
-            parts.append(bytes([OP_PUSH_U256]) + chunk)  # PUSH32 chunk
-
-        parts.append(bytes([OP_SWAP, OP_MSTORE]))  # SWAP1, MSTORE → mem[max_fp+i]=chunk; [max_fp]
-
-    # Update free-memory pointer: mem[0x40] = max_fp + blen_padded.
-    parts.append(bytes([OP_DUP]))  # DUP1 → [max_fp, max_fp]
-    parts.append(_push_imm(blen_padded))  # [blen_padded, max_fp, max_fp]
-    parts.append(bytes([OP_ADD]))  # ADD → [new_fp, max_fp]
-    parts.append(bytes([_PUSH1, 0x40]))  # PUSH1 0x40
-    parts.append(bytes([OP_MSTORE]))  # MSTORE → mem[0x40] = new_fp; [max_fp]
-
-    # Leave [argsOffset(TOS), argsLen(2nd)].
-    parts.append(_push_imm(blen))  # [blen, max_fp]
-    parts.append(bytes([OP_SWAP]))  # SWAP1 → [max_fp=argsOffset, blen=argsLen]
-    return b"".join(parts)
-
-
-def dup() -> bytes:
-    """Emit DUP1 — duplicate the top stack item."""
-    return bytes([OP_DUP])
-
-
-def dup2() -> bytes:
-    """Emit DUP2 — duplicate the second stack item."""
-    return bytes([_DUP2])
-
-
-def dup_n(n: int) -> bytes:
-    """Emit DUPn — duplicate the stack item *n* positions from the top.
-
-    Args:
-        n: Stack depth (1 = TOS, 2 = second from top, …, 16 = sixteenth).
-
-    Raises:
-        ValueError: If *n* is not in the range 1..16.
-    """
-    if not 1 <= n <= 16:
-        raise ValueError(f"dup_n: depth must be 1..16, got {n}")
-    return bytes([0x7F + n])
-
-
-def swap() -> bytes:
-    """Emit SWAP1 — exchange the top two stack items."""
-    return bytes([OP_SWAP])
-
-
-def pop() -> bytes:
-    """Emit POP — discard the top stack item."""
-    return bytes([OP_POP])
-
-
-def load_reg(i: int) -> bytes:
-    """Emit PUSH2 addr MLOAD — push register *i* onto the stack."""
-    if not 0 <= i <= 15:
-        raise ValueError(f"load_reg: register index must be 0..15, got {i}")
-    addr = 0x80 + i * 32
-    return bytes([_PUSH2, addr >> 8, addr & 0xFF, OP_MLOAD])
-
-
-def store_reg(i: int) -> bytes:
-    """Emit PUSH2 addr MSTORE — pop TOS into register *i*."""
-    if not 0 <= i <= 15:
-        raise ValueError(f"store_reg: register index must be 0..15, got {i}")
-    addr = 0x80 + i * 32
-    return bytes([_PUSH2, addr >> 8, addr & 0xFF, OP_MSTORE])
-
-
-# ---------------------------------------------------------------------------
-# Control flow instructions
-# ---------------------------------------------------------------------------
-
-
-def jump(target: int) -> bytes:
-    """Emit PUSH2 target JUMP — unconditional jump."""
-    return bytes([_PUSH2, target >> 8, target & 0xFF, _JUMP])
-
-
-def jumpi(target: int) -> bytes:
-    """Emit PUSH2 target JUMPI — conditional jump; pops condition from stack."""
-    return bytes([_PUSH2, target >> 8, target & 0xFF, _JUMPI])
-
-
-def revert_if(msg: str) -> bytes:
-    """Pop condition; if non-zero, revert with ``Error(string)`` *msg* (≤32 bytes).
-
-    Self-contained 101-byte PC-relative sequence.
-    """
-    raw = msg.encode()
-    if len(raw) > 32:
-        raise ValueError(f"revert_if: message too long ({len(raw)} bytes, max 32)")
-    msglen = len(raw)
-    msg_word = int.from_bytes(raw.ljust(32, b"\x00"), "big")
-    selector_word = 0x08C379A000000000000000000000000000000000000000000000000000000000
-
-    # 94-byte revert block: builds Error(string) and reverts
-    revert_block = (
-        bytes(
-            [
-                _PUSH1,
-                0x40,  # PUSH1 0x40
-                OP_MLOAD,  # MLOAD                   → [scratch]
-                OP_PUSH_U256,  # PUSH32 selector
-            ]
-        )
-        + selector_word.to_bytes(32, "big")
-        + bytes(
-            [
-                _DUP2,  # DUP2                    → [scratch, sel, scratch]
-                OP_MSTORE,  # MSTORE                  → [scratch]
-                _PUSH1,
-                0x20,  # PUSH1 0x20
-                _DUP2,  # DUP2                    → [scratch, 32, scratch]
-                _PUSH1,
-                0x04,  # PUSH1 4
-                OP_ADD,  # ADD                     → [scratch+4, 32, scratch]
-                OP_MSTORE,  # MSTORE                  → [scratch]
-                _PUSH1,
-                msglen,  # PUSH1 msglen
-                _DUP2,  # DUP2                    → [scratch, msglen, scratch]
-                _PUSH1,
-                0x24,  # PUSH1 0x24
-                OP_ADD,  # ADD                     → [scratch+0x24, msglen, scratch]
-                OP_MSTORE,  # MSTORE                  → [scratch]
-                OP_PUSH_U256,  # PUSH32 msg_word
-            ]
-        )
-        + msg_word.to_bytes(32, "big")
-        + bytes(
-            [
-                _DUP2,  # DUP2                    → [scratch, msg_word, scratch]
-                _PUSH1,
-                0x44,  # PUSH1 0x44
-                OP_ADD,  # ADD                     → [scratch+0x44, msg_word, scratch]
-                OP_MSTORE,  # MSTORE                  → [scratch]
-                _PUSH1,
-                0x64,  # PUSH1 0x64 (100)
-                OP_SWAP,  # SWAP1                   → [scratch, 100]
-                OP_REVERT,  # REVERT
-            ]
-        )
-    )
-    assert len(revert_block) == 94
-
-    # Full sequence: ISZERO PC PUSH1 99 ADD JUMPI <revert_block> JUMPDEST
-    # PC at byte 1; JUMPDEST at byte 100; distance = 99
-    return (
-        bytes(
-            [
-                OP_ISZERO,  # ISZERO       byte 0
-                _PC,  # PC           byte 1  (= instr_start + 1)
-                _PUSH1,
-                99,  # PUSH1 99     bytes 2-3
-                OP_ADD,  # ADD          byte 4
-                _JUMPI,  # JUMPI        byte 5
-            ]
-        )
-        + revert_block
-        + bytes([OP_JUMPDEST])
-    )  # JUMPDEST  byte 100
-
-
-def assert_ge(msg: str = "") -> bytes:
-    """Pop *a* (TOS), *b* (2nd); revert if ``a < b``.  Stack effect: ``(a, b → )``."""
-    raw = msg.encode()
-    if len(raw) > 32:
-        raise ValueError(f"assert_ge: message too long ({len(raw)} bytes, max 32)")
-    # DUP2 DUP2 LT produces [a<b, a, b]; revert_if consumes [a<b]; then POP POP
-    return bytes([_DUP2, _DUP2, OP_LT]) + revert_if(msg) + bytes([OP_POP, OP_POP])
-
-
-def assert_le(msg: str = "") -> bytes:
-    """Pop *a* (TOS), *b* (2nd); revert if ``a > b``.  Stack effect: ``(a, b → )``."""
-    raw = msg.encode()
-    if len(raw) > 32:
-        raise ValueError(f"assert_le: message too long ({len(raw)} bytes, max 32)")
-    return bytes([_DUP2, _DUP2, OP_GT]) + revert_if(msg) + bytes([OP_POP, OP_POP])
-
-
-# ---------------------------------------------------------------------------
-# Arithmetic / bitwise instructions (direct EVM opcodes)
-# ---------------------------------------------------------------------------
-
-
-def add() -> bytes:
-    """Emit ADD."""
-    return bytes([OP_ADD])
-
-
-def mul() -> bytes:
-    """Emit MUL."""
-    return bytes([OP_MUL])
-
-
-def sub() -> bytes:
-    """Emit saturating SUB: ``max(a - b, 0)`` where *a* is TOS, *b* is 2nd.
-
-    8-byte sequence: DUP2 DUP2 LT ISZERO SWAP2 SWAP1 SUB MUL
-    """
-    return bytes([_DUP2, _DUP2, OP_LT, OP_ISZERO, _SWAP2, OP_SWAP, _SUB_OP, OP_MUL])
-
-
-def div() -> bytes:
-    """Emit DIV."""
-    return bytes([OP_DIV])
-
-
-def mod() -> bytes:
-    """Emit MOD."""
-    return bytes([OP_MOD])
-
-
-def lt() -> bytes:
-    """Emit LT."""
-    return bytes([OP_LT])
-
-
-def gt() -> bytes:
-    """Emit GT."""
-    return bytes([OP_GT])
-
-
-def eq() -> bytes:
-    """Emit EQ."""
-    return bytes([OP_EQ])
-
-
-def iszero() -> bytes:
-    """Emit ISZERO."""
-    return bytes([OP_ISZERO])
-
-
-def bitwise_and() -> bytes:
-    """Emit AND."""
-    return bytes([OP_AND])
-
-
-def bitwise_or() -> bytes:
-    """Emit OR."""
-    return bytes([OP_OR])
-
-
-def bitwise_xor() -> bytes:
-    """Emit XOR."""
-    return bytes([OP_XOR])
-
-
-def bitwise_not() -> bytes:
-    """Emit NOT."""
-    return bytes([OP_NOT])
-
-
-def shl() -> bytes:
-    """Emit SHL."""
-    return bytes([OP_SHL])
-
-
-def shr() -> bytes:
-    """Emit SHR."""
-    return bytes([OP_SHR])
-
-
-def self_addr() -> bytes:
-    """Emit ADDRESS — push the deployed program's own address."""
-    return bytes([OP_SELF_ADDR])
-
-
-# ---------------------------------------------------------------------------
-# External call
-# ---------------------------------------------------------------------------
-
-
-#: 11-byte PC-relative revert block executed after CALL when require_success=True.
-#: Stack on entry: [success]
-#:   DUP1 PC PUSH1 9 ADD JUMPI    → jump to JUMPDEST if success≠0
-#:   PUSH1 0 DUP1 REVERT          ← taken when success=0
-#:   JUMPDEST                     ← success=1 lands here; [success] remains
-#: PC is at byte 1; JUMPDEST is at byte 10; distance = 9.  Position-independent so
-#: the block stays correct after any program composition shifts its absolute offset.
-REQUIRE_SUCCESS_BLOCK: bytes = bytes(
-    [
-        OP_DUP,  # DUP1          byte 0
-        _PC,  # PC            byte 1
-        _PUSH1,
-        9,  # PUSH1 9       bytes 2-3
-        OP_ADD,  # ADD           byte 4
-        _JUMPI,  # JUMPI         byte 5
-        _PUSH1,
-        0x00,  # PUSH1 0       bytes 6-7
-        OP_DUP,  # DUP1          byte 8
-        OP_REVERT,  # REVERT        byte 9
-        OP_JUMPDEST,  # JUMPDEST      byte 10
-    ]
-)
-
-
-def call(require_success: bool = True) -> bytes:
-    """Emit EVM CALL with optional PC-relative revert on failure.
-
-    Stack before (TOS first): gas, addr, value, argsOffset, argsLen, retOffset, retLen.
-    Stack after (require_success=False): [success].
-    Stack after (require_success=True): [success] (reverts on failure; on success the CALL
-    success flag remains on the stack).
-    """
-    if not require_success:
-        return bytes([OP_CALL])
-    return bytes([OP_CALL]) + REQUIRE_SUCCESS_BLOCK
-
-
-# ---------------------------------------------------------------------------
-# Balance query
-# ---------------------------------------------------------------------------
-
-
-def balance_of() -> bytes:
-    """Pop token (TOS) and account (2nd); push balance.
-
-    If token == 0: EVM BALANCE(account).
-    If token != 0: STATICCALL token.balanceOf(account).
-
-    75-byte PC-relative sequence.
-    """
-    SELECTOR = 0x70A0823100000000000000000000000000000000000000000000000000000000
-
-    # Preamble (7 bytes): if token==0 jump to ETH path at byte 71
-    # PC at byte 2; ETH_PATH_JUMPDEST at byte 71; distance = 69
-    preamble = bytes(
-        [
-            OP_DUP,  # DUP1         byte 0
-            OP_ISZERO,  # ISZERO       byte 1
-            _PC,  # PC           byte 2
-            _PUSH1,
-            69,  # PUSH1 69     bytes 3-4
-            OP_ADD,  # ADD          byte 5
-            _JUMPI,  # JUMPI        byte 6
-        ]
-    )
-
-    # ERC-20 path (64 bytes, bytes 7-70)
-    # PC at relative byte 59 → absolute byte 66; END_JUMPDEST at byte 74; distance = 8
-    erc20_path = (
-        bytes(
-            [
-                _PUSH1,
-                0x40,  # PUSH1 0x40
-                OP_MLOAD,  # MLOAD                         → [fp, token, account]
-                OP_PUSH_U256,  # PUSH32 selector
-            ]
-        )
-        + SELECTOR.to_bytes(32, "big")
-        + bytes(
-            [
-                _DUP2,  # DUP2                          → [fp, sel, fp, token, account]
-                OP_MSTORE,  # MSTORE   mem[fp]=sel          → [fp, token, account]
-                _DUP3,  # DUP3                          → [account, fp, token, account]
-                _DUP2,  # DUP2                          → [fp, account, fp, token, account]
-                _PUSH1,
-                0x04,  # PUSH1 4
-                OP_ADD,  # ADD                           → [fp+4, account, fp, token, account]
-                OP_MSTORE,  # MSTORE   mem[fp+4]=account    → [fp, token, account]
-                # STATICCALL(gas, token, fp, 36, fp, 32)
-                _PUSH1,
-                0x20,  # PUSH1 0x20  retLen=32
-                _DUP2,  # DUP2        retOff=fp
-                _PUSH1,
-                0x24,  # PUSH1 0x24  argsLen=36
-                _DUP4,  # DUP4        argsOff=fp
-                _DUP6,  # DUP6        addr=token
-                OP_GAS,  # GAS
-                OP_STATICCALL,  # STATICCALL  → [success, fp, token, account]
-                OP_SWAP,  # SWAP1                         → [fp, success, token, account]
-                OP_MLOAD,  # MLOAD                         → [balance, success, token, account]
-                _SWAP3,  # SWAP3                         → [account, success, token, balance]
-                OP_POP,  # POP                           → [success, token, balance]
-                OP_POP,  # POP                           → [token, balance]
-                OP_POP,  # POP                           → [balance]
-                # Jump to END at byte 74
-                _PC,  # PC    byte 66 (= 7 + 59)
-                _PUSH1,
-                8,  # PUSH1 8
-                OP_ADD,  # ADD
-                _JUMP,  # JUMP
-            ]
-        )
-    )
-    assert len(erc20_path) == 64
-
-    # ETH path (bytes 71-73)
-    eth_path = bytes(
-        [
-            OP_JUMPDEST,  # JUMPDEST  byte 71
-            OP_POP,  # POP       byte 72  (remove token=0)
-            OP_BALANCE,  # BALANCE   byte 73
-        ]
-    )
-
-    # END (byte 74)
-    end = bytes([OP_JUMPDEST])
-
-    result = preamble + erc20_path + eth_path + end
-    assert len(result) == 75
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Calldata patching
-# ---------------------------------------------------------------------------
-
-
-def patch_value(offset: int, size: int) -> bytes:
-    """Overwrite a ``size``-byte value in the calldata buffer at *offset*.
-
-    ABI right-aligns values shorter than 32 bytes within a 32-byte word, so the
-    MSTORE target is ``offset + size - 32``.
-
-    Args:
-        offset: Byte offset of the value's first byte inside the calldata buffer.
-        size:   Number of bytes occupied by the value.  Must satisfy
-                ``0 < size <= 32``.
-
-    Stack before: [value(TOS), argsOffset(2nd), argsLen(3rd), ...]
-    Stack after:  [argsOffset(TOS), argsLen(2nd), ...]
-    """
-    if not (0 < size <= 32):
-        raise ValueError(f"patch_value: size must be in (0, 32], got {size}")
-    mstore_off = offset + size - 32
-    if mstore_off < 0:
-        raise ValueError(
-            f"patch_value: offset {offset} is too small for size {size}; MSTORE target {mstore_off} would be negative"
-        )
-    if mstore_off > 0xFFFF:
-        raise ValueError(f"patch_value: mstore offset {mstore_off} exceeds 16-bit PUSH2 range")
-    return bytes([_DUP2, _PUSH2, mstore_off >> 8, mstore_off & 0xFF, OP_ADD, OP_MSTORE])
-
-
-def ret_u256(offset: int) -> bytes:
-    """Copy 32 bytes from returndata at *offset* into free memory; push the value.
-
-    11-byte sequence.
-    """
-    return bytes(
-        [
-            _PUSH1,
-            0x40,  # PUSH1 0x40
-            OP_MLOAD,  # MLOAD         → [fp]
-            _PUSH1,
-            0x20,  # PUSH1 0x20    → [32, fp]
-            _PUSH2,
-            offset >> 8,
-            offset & 0xFF,  # PUSH2 offset  → [offset, 32, fp]
-            _DUP3,  # DUP3          → [fp, offset, 32, fp]
-            OP_RETURNDATACOPY,  # RETURNDATACOPY → [fp]
-            OP_MLOAD,  # MLOAD         → [value]
-        ]
-    )
-
-
-def ret_slice(offset: int, length: int) -> bytes:
-    """Copy a slice from returndata into free memory; push ``[argsOffset, argsLen]``.
-
-    23-byte sequence.
-    """
-    length_padded = (length + 31) & ~31
-    return bytes(
-        [
-            _PUSH1,
-            0x40,  # PUSH1 0x40
-            OP_MLOAD,  # MLOAD              → [fp]
-            OP_DUP,  # DUP1               → [fp, fp]
-            _PUSH2,
-            length >> 8,
-            length & 0xFF,  # PUSH2 length
-            _PUSH2,
-            offset >> 8,
-            offset & 0xFF,  # PUSH2 offset
-            _DUP4,  # DUP4               → [fp, offset, length, fp, fp]
-            OP_RETURNDATACOPY,  # RETURNDATACOPY     → [fp, fp]
-            _PUSH2,
-            length_padded >> 8,
-            length_padded & 0xFF,
-            OP_ADD,  # ADD                → [new_fp, fp]
-            _PUSH1,
-            0x40,  # PUSH1 0x40
-            OP_MSTORE,  # MSTORE             → [fp]
-            _PUSH2,
-            length >> 8,
-            length & 0xFF,  # PUSH2 length
-            OP_SWAP,  # SWAP1              → [fp=argsOffset, length=argsLen]
-        ]
-    )
-
-
-def return_tos() -> bytes:
-    """Store TOS at ``memory[0x00]`` and RETURN 32 bytes.
-
-    Terminal instruction for quote programs: pops TOS, writes it to
-    ``mem[0x00]``, and returns 32 bytes so ``eth_call`` returndata holds the
-    computed value.
-
-    Returns:
-        8-byte sequence: ``PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN``.
-    """
-    return bytes([_PUSH1, 0x00, OP_MSTORE, _PUSH1, 0x20, _PUSH1, 0x00, _OP_RETURN])
+            flags = VenomOptimizationFlags(level=optimize)  # type: ignore[call-arg]
+        run_passes_on(self._ctx, flags, disable_mem_checks=True)  # type: ignore[misc]
+        asm = generate_assembly_experimental(self._ctx, optimize=optimize)  # type: ignore[misc]
+        bytecode, _ = generate_bytecode(asm)  # type: ignore[misc]
+        return bytecode
+
+    # ------------------------------------------------------------------
+    # Convenience dunders
+    # ------------------------------------------------------------------
+
+    def __bytes__(self) -> bytes:
+        return self.build()
+
+    def __repr__(self) -> str:
+        return f"Program(data_sections={self._data_section_counter})"
