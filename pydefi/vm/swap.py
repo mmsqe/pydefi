@@ -113,19 +113,15 @@ def _build_v3_pool_swap(prog: Program, amount_in: Value, hop: SwapHop) -> Value:
     sqrt_price_limit_x96 = hop.sqrt_price_limit_x96 or (_SQRT_PRICE_MIN if hop.zero_for_one else _SQRT_PRICE_MAX)
     callback_data = encode_v3_callback_data(hop.token_in)
 
-    swap_tmpl = prog.template(
-        "function swap(address recipient, bool zeroForOne,"
-        " int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes data)"
-    )
-    success = prog.call_contract(
+    success = prog.call_contract_abi(
         hop.pool,
-        swap_tmpl(
-            recipient=hop.recipient,
-            zeroForOne=hop.zero_for_one,
-            amountSpecified=amount_in,
-            sqrtPriceLimitX96=sqrt_price_limit_x96,
-            data=callback_data,
-        ),
+        "function swap(address recipient, bool zeroForOne,"
+        " int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes data)",
+        hop.recipient,
+        hop.zero_for_one,
+        amount_in,  # patched in
+        sqrt_price_limit_x96,
+        callback_data,
     )
     prog.assert_(success)
 
@@ -139,7 +135,7 @@ def _build_v3_pool_swap(prog: Program, amount_in: Value, hop: SwapHop) -> Value:
 
 def _build_v2_compute_out(prog: Program, amount_in: Value, hop: SwapHop, fee_num: int) -> Value:
     """Compute V2 ``amountOut`` from ``getReserves()`` (no transfer)."""
-    success = prog.call_contract(hop.pool, prog.template("getReserves()")())
+    success = prog.call_contract_abi(hop.pool, "getReserves()")
     prog.assert_(success)
 
     if hop.zero_for_one:
@@ -169,10 +165,11 @@ def _build_v2_quote(prog: Program, amount_in: Value, hop: SwapHop) -> Value:
 def _build_v3_quote(prog: Program, amount_in: Value, hop: SwapHop, quoter_address: Address) -> Value:
     """V3 pool quote — calls ``quoter.quoteExactInput`` (view-only)."""
     packed_path = encode_v3_path([hop.token_in, hop.token_out], [hop.fee_bps * 100])
-    quote_tmpl = prog.template("function quoteExactInput(bytes path, uint256 amountIn) returns (uint256 amountOut)")
-    success = prog.call_contract(
+    success = prog.call_contract_abi(
         quoter_address,
-        quote_tmpl(path=packed_path, amountIn=amount_in),
+        "function quoteExactInput(bytes path, uint256 amountIn) returns (uint256 amountOut)",
+        packed_path,
+        amount_in,  # patched in
     )
     prog.assert_(success)
     return prog.returndata_word(0)
@@ -186,21 +183,34 @@ def _build_v2_direct_swap(prog: Program, amount_in: Value, hop: SwapHop) -> Valu
     amount_out = _build_v2_compute_out(prog, amount_in, hop, 10000 - hop.fee_bps)
 
     # Transfer amount_in to the pool.
-    transfer_tmpl = prog.template("function transfer(address to, uint256 amount)")
-    transfer_success = prog.call_contract(
+    transfer_success = prog.call_contract_abi(
         hop.token_in,
-        transfer_tmpl(to=hop.pool, amount=amount_in),
+        "function transfer(address to, uint256 amount)",
+        hop.pool,
+        amount_in,
     )
     prog.assert_(transfer_success)
 
     # Call pool.swap(amount0Out, amount1Out, to, data).
-    swap_tmpl = prog.template("function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)")
     if hop.zero_for_one:
         # token0 in, token1 out: amount0Out=0, amount1Out=amount_out
-        payload = swap_tmpl(amount0Out=0, amount1Out=amount_out, to=hop.recipient, data=b"")
+        swap_success = prog.call_contract_abi(
+            hop.pool,
+            "function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)",
+            0,
+            amount_out,
+            hop.recipient,
+            b"",
+        )
     else:
-        payload = swap_tmpl(amount0Out=amount_out, amount1Out=0, to=hop.recipient, data=b"")
-    swap_success = prog.call_contract(hop.pool, payload)
+        swap_success = prog.call_contract_abi(
+            hop.pool,
+            "function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)",
+            amount_out,
+            0,
+            hop.recipient,
+            b"",
+        )
     prog.assert_(swap_success)
     return amount_out
 

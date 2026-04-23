@@ -73,36 +73,22 @@ class TestCalldataTemplate:
         tmpl = CalldataTemplate("transfer(address,uint256)", names=["recipient", "amt"])
         assert tmpl.param_names == ["recipient", "amt"]
 
-    def test_blob_selector_prefix(self):
-        # Static-only invocation encodes into the blob entirely; selector is
-        # the first 4 bytes of whatever the template produces.
+    def test_blob_is_zero_filled_with_selector_prefix(self):
         tmpl = CalldataTemplate("transfer(address,uint256)")
-        payload = tmpl(0, 0)
-        assert payload.blob.startswith(bytes.fromhex("a9059cbb"))  # transfer selector
+        blob = tmpl._blob
+        assert blob.startswith(bytes.fromhex("a9059cbb"))  # transfer selector
+        assert blob[4:] == b"\x00" * 64
 
-    def test_static_args_bake_into_blob_no_patches(self):
-        # Static literals are encoded directly into the blob; only runtime
-        # Value arguments become patches. Two invocations with different
-        # static args therefore produce different blobs.
+    def test_static_int_args_encoded_as_patches_not_in_blob(self):
+        # With dedup in mind: the blob stays all-zero so separate tmpl(...)
+        # invocations with different literal args share one data section.
         tmpl = CalldataTemplate("transfer(address,uint256)")
         p1 = tmpl(0xABAB, 100)
         p2 = tmpl(0xCDCD, 200)
-        assert p1.patches == {}
-        assert p2.patches == {}
-        assert p1.blob != p2.blob
-        assert p1.blob.startswith(bytes.fromhex("a9059cbb"))
-        # uint256 tail slot for amount=100 encodes big-endian right-aligned
-        assert p1.blob[-32:] == (100).to_bytes(32, "big")
-
-    def test_runtime_value_args_appear_as_patches(self):
-        p = Program()
-        amount = p.const(42)
-        tmpl = p.template("transfer(address,uint256)")
-        payload = tmpl(0xABAB, amount)
-        # Recipient (static) is baked in; amount (Value) is a patch at offset 36.
-        assert set(payload.patches.keys()) == {36}
-        # Recipient address is visible in the static head.
-        assert int.from_bytes(payload.blob[4:36], "big") == 0xABAB
+        assert p1.blob == p2.blob
+        # literal != 0 → patch emitted for each non-zero slot
+        assert p1.patches == {4: 0xABAB, 36: 100}
+        assert p2.patches == {4: 0xCDCD, 36: 200}
 
     def test_zero_literals_produce_no_patches(self):
         tmpl = CalldataTemplate("transfer(address,uint256)")
@@ -156,29 +142,14 @@ class TestCallContractAcceptsPayload:
         _build_and_run(p)
 
     def test_same_template_reused_shares_data_section(self):
-        # All-runtime-Value args: the static portion of the blob (selector +
-        # placeholder zero slots) is identical across invocations → dedup
-        # keeps them on one data section.
         p = Program()
         tmpl = p.template("transfer(address to, uint256 amount)")
-        recipient = p.const(0xAAAA)
-        amount = p.const(1000)
-        for _ in range(5):
-            p.call_contract(_TARGET, tmpl(to=recipient, amount=amount))
+        for i in range(5):
+            p.call_contract(_TARGET, tmpl(to=0xAAAA + i, amount=1000 + i))
         p.stop()
         _build_and_run(p)
+        # The shared zero-filled blob is one section; all 5 invocations reuse it.
         assert len(p._ctx.data_segment) == 1
-
-    def test_distinct_static_args_produce_distinct_sections(self):
-        # Static args are baked into the blob; distinct statics yield
-        # distinct blobs and therefore distinct data sections.
-        p = Program()
-        tmpl = p.template("transfer(address to, uint256 amount)")
-        for i in range(3):
-            p.call_contract(_TARGET, tmpl(to=0xAAAA + i, amount=1000))
-        p.stop()
-        _build_and_run(p)
-        assert len(p._ctx.data_segment) == 3
 
     def test_explicit_patches_merge_over_template(self):
         p = Program()
@@ -194,16 +165,13 @@ class TestCallContractAcceptsPayload:
         p.stop()
         _build_and_run(p)
 
-    def test_bulk_calls_with_runtime_values_share_one_section(self):
-        # End-to-end: bulk calls through a template where the per-call
-        # differences are runtime Values (not static literals) collapse to
-        # one data section + per-call MSTORE patches.
+    def test_bulk_calls_stay_on_one_data_section(self):
+        # End-to-end: repeated calls through the same template don't bloat
+        # the bytecode with repeated copies of the blob.
         p = Program()
         xfer = p.template("transfer(address to, uint256 amount)")
-        recipient = p.const(0xAA01)
-        for i in range(4):
-            amount = p.const(1000 + i)
-            p.call_contract(_TARGET, xfer(to=recipient, amount=amount))
+        for recipient in (0xAA01, 0xAA02, 0xAA03, 0xAA04):
+            p.call_contract(_TARGET, xfer(to=recipient, amount=1000))
         p.stop()
         bc = p.build()
         assert len(p._ctx.data_segment) == 1

@@ -11,7 +11,7 @@ across:
  - Returndata access (returndata_word)
  - Runtime patching of calldata templates (``patches=`` kwarg)
  - Chained calls (first call's output → second call's patched input)
- - High-level ABI builder (Program.template) with Value handles as patches
+ - High-level ABI builder (call_contract_abi) with Value handles as patches
 
 Run with::
 
@@ -479,11 +479,11 @@ class TestDeFiVMFork:
         assert receipt["status"] == 1
 
     # ------------------------------------------------------------------
-    # Template-based ABI calldata with Value patches
+    # call_contract_abi with Patch (high-level ABI builder)
     # ------------------------------------------------------------------
 
-    async def test_template_patch_single_uint256(self, ctx):
-        """template(...) with a Value handle for the uint256 arg auto-patches it."""
+    async def test_call_contract_abi_patch_single_uint256(self, ctx):
+        """call_contract_abi with a Value handle for the uint256 arg auto-patches it."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
@@ -491,8 +491,11 @@ class TestDeFiVMFork:
 
         prog = Program()
         amount = prog.const(7)
-        double = prog.template("function double(uint256 x) external pure returns (uint256)")
-        success = prog.call_contract(adapter, double(x=amount))
+        success = prog.call_contract_abi(
+            adapter,
+            "function double(uint256 x) external pure returns (uint256)",
+            amount,
+        )
         prog.assert_(success)
         prog.assert_(prog.eq(prog.returndata_word(0), 14), "expected 14")
         prog.stop()
@@ -500,8 +503,8 @@ class TestDeFiVMFork:
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-    async def test_template_patch_two_uint256_args(self, ctx):
-        """template(...) with two Value args patches both calldata slots."""
+    async def test_call_contract_abi_patch_two_uint256_args(self, ctx):
+        """call_contract_abi with two Value args patches both calldata slots."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
@@ -510,8 +513,12 @@ class TestDeFiVMFork:
         prog = Program()
         a = prog.const(6)
         b = prog.const(11)
-        add_inputs = prog.template("function addInputs(uint256 a, uint256 b) external pure returns (uint256)")
-        success = prog.call_contract(adapter, add_inputs(a=a, b=b))
+        success = prog.call_contract_abi(
+            adapter,
+            "function addInputs(uint256 a, uint256 b) external pure returns (uint256)",
+            a,
+            b,
+        )
         prog.assert_(success)
         prog.assert_(prog.eq(prog.returndata_word(0), 17), "expected 17")
         prog.stop()
@@ -519,22 +526,22 @@ class TestDeFiVMFork:
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-    async def test_template_patch_chained(self, ctx):
-        """Chain two calls through one template: first uses a literal, second
-        uses the first's result (a runtime Value becoming a patch)."""
+    async def test_call_contract_abi_patch_chained(self, ctx):
+        """Chain two calls: first uses a literal arg; second uses the first's result."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
+        double_sig = "function double(uint256 x) external pure returns (uint256)"
+
         prog = Program()
-        double = prog.template("function double(uint256 x) external pure returns (uint256)")
-        # Call 1: double(5) → 10  (literal arg baked into blob)
-        s1 = prog.call_contract(adapter, double(x=5))
+        # Call 1: double(5) → 10  (literal arg, no Value handle)
+        s1 = prog.call_contract_abi(adapter, double_sig, 5)
         prog.assert_(s1)
         amount = prog.returndata_word(0)
         # Call 2: double(amount) → 20  (Value handle becomes a runtime patch)
-        s2 = prog.call_contract(adapter, double(x=amount))
+        s2 = prog.call_contract_abi(adapter, double_sig, amount)
         prog.assert_(s2)
         prog.assert_(prog.eq(prog.returndata_word(0), 20), "expected 20")
         prog.stop()
