@@ -5,7 +5,7 @@ Measures gas and bytecode size across a range of calldata sizes
 
 Run with::
 
-    python3 tests/bench_ssa_call.py
+    python3 tests/bench_program_call.py
 """
 
 from __future__ import annotations

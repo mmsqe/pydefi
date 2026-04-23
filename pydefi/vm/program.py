@@ -349,9 +349,12 @@ class Program:
 
         Used when the caller (e.g. the CCTP / OFT composer prologue in
         ``DeFiVM.sol``) pushes values onto the stack before dispatching to
-        the user program.  Each call consumes one slot; the first call
-        returns the value at TOS at program entry, the second returns the
-        slot below it, and so on.
+        the user program.  Each call consumes one pre-existing stack slot
+        in **Venom ``param`` order**: the first call returns the *deepest*
+        slot (the value pushed first by the prologue), the second call
+        returns the slot above it, and so on — last call returns TOS.
+        Callers must therefore request ``stack_param()`` values in the same
+        order the prologue pushed them.
 
         Lowers to Venom's ``param`` instruction which emits no bytecode —
         it's a dataflow marker telling Venom's stack allocator that the
@@ -631,8 +634,20 @@ class Program:
             return self.call_contract(to, calldata, value=value, gas=gas)
 
         encoded = encode_with_hooks(param_types, encoded_args)
+        # Every Value placeholder must have had its calldata offset recorded
+        # by the encoder hook.  An unresolved one would silently leave the
+        # ABI placeholder (0 / address(0) / False) in place at runtime and
+        # produce a subtly wrong call — fail loudly instead.
+        unresolved = [i for i, p in enumerate(placeholders) if p.offset is None]
+        if unresolved:
+            raise ValueError(
+                f"call_contract_abi: failed to resolve calldata offset for "
+                f"{len(unresolved)} runtime Value placeholder(s) in signature "
+                f"{abi_sig!r} — possibly nested in a tuple/list type the encoder "
+                f"didn't traverse with hooks"
+            )
         calldata = bytes(fn.selector) + encoded
-        patches: dict[int, ValueLike] = {p.offset: p.value for p in placeholders if p.offset is not None}
+        patches: dict[int, ValueLike] = {p.offset: p.value for p in placeholders}
         return self.call_contract(to, calldata, value=value, gas=gas, patches=patches)
 
     # ------------------------------------------------------------------
