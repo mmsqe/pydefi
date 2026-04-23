@@ -27,66 +27,74 @@ Usage example::
 
 from __future__ import annotations
 
+from vyper.evm.opcodes import OPCODES as _OPCODES
+
 from pydefi.types import Address
 
+
+def _op(name: str) -> int:
+    """Return the opcode byte for *name* from Vyper's canonical opcode table."""
+    return _OPCODES[name][0]
+
+
 # ---------------------------------------------------------------------------
-# Opcode constants — single EVM opcode identifiers
+# Opcode constants — derived from Vyper's opcode table, never hand-coded
 # ---------------------------------------------------------------------------
 
-OP_PUSH_U256: int = 0x7F  # PUSH32 — emitted by push_u256()
-OP_PUSH_ADDR: int = 0x73  # PUSH20 — emitted by push_addr()
-OP_DUP: int = 0x80  # DUP1 — emitted by dup()
-OP_SWAP: int = 0x90  # SWAP1 — emitted by swap()
-OP_POP: int = 0x50  # POP — emitted by pop()
+OP_PUSH_U256: int = _op("PUSH32")  # PUSH32 — emitted by push_u256()
+OP_PUSH_ADDR: int = _op("PUSH20")  # PUSH20 — emitted by push_addr()
+OP_DUP: int = _op("DUP1")  # DUP1 — emitted by dup()
+OP_SWAP: int = _op("SWAP1")  # SWAP1 — emitted by swap()
+OP_POP: int = _op("POP")  # POP — emitted by pop()
 # NOTE: OP_JUMP and OP_JUMPI share the PUSH2 prefix (0x61) with load_reg/store_reg.
 # They identify the first byte of the 4-byte PUSH2 target + JUMP/JUMPI sequence.
-OP_JUMP: int = 0x61  # first byte of jump() sequence (PUSH2 target JUMP)
-OP_JUMPI: int = 0x61  # first byte of jumpi() sequence (PUSH2 target JUMPI)
-OP_ADD: int = 0x01  # ADD — emitted by add()
-OP_MUL: int = 0x02  # MUL — emitted by mul()
-OP_SUB: int = 0x81  # DUP2 — first byte of saturating sub() sequence
-OP_DIV: int = 0x04  # DIV — emitted by div()
-OP_MOD: int = 0x06  # MOD — emitted by mod()
-OP_LT: int = 0x10  # LT — emitted by lt()
-OP_GT: int = 0x11  # GT — emitted by gt()
-OP_EQ: int = 0x14  # EQ — emitted by eq()
-OP_ISZERO: int = 0x15  # ISZERO — emitted by iszero()
-OP_AND: int = 0x16  # AND — emitted by bitwise_and()
-OP_OR: int = 0x17  # OR — emitted by bitwise_or()
-OP_XOR: int = 0x18  # XOR — emitted by bitwise_xor()
-OP_NOT: int = 0x19  # NOT — emitted by bitwise_not()
-OP_SHL: int = 0x1B  # SHL — emitted by shl()
-OP_SHR: int = 0x1C  # SHR — emitted by shr()
-OP_GAS: int = 0x5A  # GAS — emitted by gas_opcode()
-OP_CALL: int = 0xF1  # CALL — core opcode in the call() sequence
-OP_SELF_ADDR: int = 0x30  # ADDRESS — emitted by self_addr()
-OP_BALANCE: int = 0x31  # BALANCE — used in balance_of() ETH path
-OP_MLOAD: int = 0x51  # MLOAD — load word from memory
-OP_MSTORE: int = 0x52  # MSTORE — store word to memory
-OP_JUMPDEST: int = 0x5B  # JUMPDEST — marks a valid jump target
-OP_RETURNDATACOPY: int = 0x3E  # RETURNDATACOPY — copy returndata into memory
-OP_STATICCALL: int = 0xFA  # STATICCALL — used by balance_of() ERC-20 path
-OP_REVERT: int = 0xFD  # REVERT
-OP_CODECOPY: int = 0x39  # CODECOPY — copy bytecode slice into memory
+OP_JUMP: int = _op("PUSH2")  # first byte of jump() sequence (PUSH2 target JUMP)
+OP_JUMPI: int = OP_JUMP  # first byte of jumpi() sequence (PUSH2 target JUMPI)
+OP_ADD: int = _op("ADD")  # ADD — emitted by add()
+OP_MUL: int = _op("MUL")  # MUL — emitted by mul()
+OP_SUB: int = _op("DUP2")  # DUP2 — first byte of saturating sub() sequence
+OP_DIV: int = _op("DIV")  # DIV — emitted by div()
+OP_MOD: int = _op("MOD")  # MOD — emitted by mod()
+OP_LT: int = _op("LT")  # LT — emitted by lt()
+OP_GT: int = _op("GT")  # GT — emitted by gt()
+OP_EQ: int = _op("EQ")  # EQ — emitted by eq()
+OP_ISZERO: int = _op("ISZERO")  # ISZERO — emitted by iszero()
+OP_AND: int = _op("AND")  # AND — emitted by bitwise_and()
+OP_OR: int = _op("OR")  # OR — emitted by bitwise_or()
+OP_XOR: int = _op("XOR")  # XOR — emitted by bitwise_xor()
+OP_NOT: int = _op("NOT")  # NOT — emitted by bitwise_not()
+OP_SHL: int = _op("SHL")  # SHL — emitted by shl()
+OP_SHR: int = _op("SHR")  # SHR — emitted by shr()
+OP_GAS: int = _op("GAS")  # GAS — emitted by gas_opcode()
+OP_CALL: int = _op("CALL")  # CALL — core opcode in the call() sequence
+OP_SELF_ADDR: int = _op("ADDRESS")  # ADDRESS — emitted by self_addr()
+OP_BALANCE: int = _op("BALANCE")  # BALANCE — used in balance_of() ETH path
+OP_MLOAD: int = _op("MLOAD")  # MLOAD — load word from memory
+OP_MSTORE: int = _op("MSTORE")  # MSTORE — store word to memory
+OP_JUMPDEST: int = _op("JUMPDEST")  # JUMPDEST — marks a valid jump target
+OP_RETURNDATACOPY: int = _op("RETURNDATACOPY")  # RETURNDATACOPY — copy returndata into memory
+OP_STATICCALL: int = _op("STATICCALL")  # STATICCALL — used by balance_of() ERC-20 path
+OP_REVERT: int = _op("REVERT")  # REVERT
+OP_CODECOPY: int = _op("CODECOPY")  # CODECOPY — copy bytecode slice into memory
 
 # ---------------------------------------------------------------------------
 # Private module-level opcode aliases (used only inside multi-opcode helpers)
 # ---------------------------------------------------------------------------
 
-_PUSH1: int = 0x60  # PUSH1 — followed by one immediate byte
-_PUSH2: int = 0x61  # PUSH2 — followed by two immediate bytes (= OP_JUMP first byte)
-_PUSH4: int = 0x63  # PUSH4 — followed by four immediate bytes
-_PC: int = 0x58  # PC — push current program counter
-_JUMP: int = 0x56  # JUMP raw opcode (inside multi-opcode sequences)
-_JUMPI: int = 0x57  # JUMPI raw opcode
-_SUB_OP: int = 0x03  # SUB — integer subtraction
-_DUP2: int = 0x81  # DUP2
-_DUP3: int = 0x82  # DUP3
-_DUP4: int = 0x83  # DUP4
-_DUP6: int = 0x85  # DUP6
-_SWAP2: int = 0x91  # SWAP2
-_SWAP3: int = 0x92  # SWAP3
-_OP_RETURN: int = 0xF3  # RETURN — end execution and return data from memory
+_PUSH1: int = _op("PUSH1")  # PUSH1 — followed by one immediate byte
+_PUSH2: int = _op("PUSH2")  # PUSH2 — followed by two immediate bytes (= OP_JUMP first byte)
+_PUSH4: int = _op("PUSH4")  # PUSH4 — followed by four immediate bytes
+_PC: int = _op("PC")  # PC — push current program counter
+_JUMP: int = _op("JUMP")  # JUMP raw opcode (inside multi-opcode sequences)
+_JUMPI: int = _op("JUMPI")  # JUMPI raw opcode
+_SUB_OP: int = _op("SUB")  # SUB — integer subtraction
+_DUP2: int = _op("DUP2")  # DUP2
+_DUP3: int = _op("DUP3")  # DUP3
+_DUP4: int = _op("DUP4")  # DUP4
+_DUP6: int = _op("DUP6")  # DUP6
+_SWAP2: int = _op("SWAP2")  # SWAP2
+_SWAP3: int = _op("SWAP3")  # SWAP3
+_OP_RETURN: int = _op("RETURN")  # RETURN — end execution and return data from memory
 
 
 # ---------------------------------------------------------------------------

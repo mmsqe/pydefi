@@ -77,11 +77,12 @@ from pydefi.vm.program import (
     OP_PUSH_U256,
     OP_SHL,
     OP_SWAP,
+    _op,
     fp_init,
 )
 
 # Internal EVM opcode not exposed from program.py
-_SIGNEXTEND: int = 0x0B
+_SIGNEXTEND: int = _op("SIGNEXTEND")
 
 # ---------------------------------------------------------------------------
 # ABI type parsing helpers
