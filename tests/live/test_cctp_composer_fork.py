@@ -22,7 +22,6 @@ Run with::
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 import solcx
@@ -32,17 +31,30 @@ from web3 import AsyncWeb3, Web3
 from web3.exceptions import ContractLogicError, Web3RPCError
 
 from pydefi.types import ZERO_ADDRESS, Address, Hash
+from pydefi.vm import Program
 from tests.live.sol_utils import compile_sol_file, deploy, ensure_solc
 
-# This live test was written against the legacy stack-oriented
-# pydefi.vm.program.* helpers, deleted in the SSA migration.  Skip the entire
-# file via pytestmark so collection succeeds; the legacy names are stubbed
-# below so module/class bodies that reference them load cleanly.  pytestmark
-# prevents any test from actually running and dereferencing the stubs.
-pytestmark = pytest.mark.skip(reason="legacy stack-API removed; pending SSA rewrite")
 
-_legacy_stub: Any = lambda *_a, **_kw: b""  # noqa: E731
-call = pop = push_addr = push_bytes = push_u256 = store_reg = _legacy_stub
+def _compose_program(target_address: Address, target_calldata: bytes, *, value: int = 0) -> bytes:
+    """Build the DeFiVM program embedded as CCTP hookData.
+
+    The composer prologue leaves ``[amountReceived, sourceDomain]`` on the
+    EVM stack before dispatching to the user program.  This helper consumes
+    those via :meth:`Program.stack_param`, stores them in R1/R0, then issues
+    a single external call to *target_address* with *target_calldata*.  On
+    CALL failure the outer ``receiveAndExecute`` reverts (matching legacy
+    ``call(require_success=True)``).
+    """
+    prog = Program()
+    source_domain = prog.stack_param()  # TOS = sourceDomain
+    amount = prog.stack_param()  # 2nd = amountReceived
+    prog.store_reg(0, source_domain)
+    prog.store_reg(1, amount)
+    success = prog.call_contract(target_address, target_calldata, value=value)
+    prog.assert_(success)
+    prog.stop()
+    return prog.build()
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -433,20 +445,8 @@ class TestCCTPComposerBasic:
 
         amount = 1000 * 10**6  # 1000 USDC
 
-        # Build the DeFiVM program (will be embedded as hookData).
         target_calldata = target.fns.execute(b"\xde\xad\xbe\xef").data
-        program = (
-            store_reg(0)  # R0 = sourceDomain (top of stack after prologue)
-            + store_reg(1)  # R1 = amountReceived
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(target_calldata)
-            + push_u256(0)  # value = 0 ETH
-            + push_addr(target_address)
-            + bytes([0x5A])  # GAS — forward all remaining gas
-            + call()
-            + pop()  # discard success flag
-        )
+        program = _compose_program(target_address, target_calldata)
 
         message, attestation = _make_message_and_attestation(
             composer_address, amount, hook_data=HexBytes(program), nonce=1
@@ -484,18 +484,7 @@ class TestCCTPComposerBasic:
         expected_received = amount - fee
 
         target_calldata = target.fns.execute(b"fee_test").data
-        program = (
-            store_reg(0)  # R0 = sourceDomain
-            + store_reg(1)  # R1 = amountReceived (should be amount - fee)
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(target_calldata)
-            + push_u256(0)
-            + push_addr(target_address)
-            + bytes([0x5A])
-            + call()
-            + pop()
-        )
+        program = _compose_program(target_address, target_calldata)
 
         message, attestation = _make_message_and_attestation(
             HexBytes(composer_address), amount, hook_data=HexBytes(program), nonce=2, fee_executed=fee
@@ -524,18 +513,7 @@ class TestCCTPComposerBasic:
         eth_value = 10**16  # 0.01 ETH
 
         target_calldata = target.fns.execute(b"with eth").data
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(target_calldata)
-            + push_u256(eth_value)  # value = 0.01 ETH
-            + push_addr(target_address)
-            + bytes([0x5A])
-            + call()
-            + pop()
-        )
+        program = _compose_program(target_address, target_calldata, value=eth_value)
 
         message, attestation = _make_message_and_attestation(
             HexBytes(composer_address), amount, hook_data=HexBytes(program), nonce=3
@@ -560,18 +538,7 @@ class TestCCTPComposerBasic:
 
         amount = 0
         target_calldata = target.fns.execute(b"zero").data
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(target_calldata)
-            + push_u256(0)
-            + push_addr(target_address)
-            + bytes([0x5A])
-            + call()
-            + pop()
-        )
+        program = _compose_program(target_address, target_calldata)
 
         message, attestation = _make_message_and_attestation(
             HexBytes(composer_address), amount, hook_data=HexBytes(program), nonce=4
@@ -599,18 +566,7 @@ class TestCCTPComposerBasic:
         nonce_bytes32 = nonce_int.to_bytes(32, "big")
 
         target_calldata = target.fns.execute(b"event").data
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(target_calldata)
-            + push_u256(0)
-            + push_addr(target_address)
-            + bytes([0x5A])
-            + call()
-            + pop()
-        )
+        program = _compose_program(target_address, target_calldata)
 
         message, attestation = _make_message_and_attestation(
             HexBytes(composer_address), amount, hook_data=HexBytes(program), nonce=nonce_int, fee_executed=fee
@@ -644,18 +600,7 @@ class TestCCTPComposerBasic:
         pre_vm = await usdc.fns.balanceOf(vm_address).call(w3)
 
         transfer_calldata = usdc.fns.transfer(fresh_recipient, amount).data
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(transfer_calldata)
-            + push_u256(0)
-            + push_addr(usdc_address)
-            + bytes([0x5A])
-            + call()
-            + pop()
-        )
+        program = _compose_program(usdc_address, transfer_calldata)
 
         message, attestation = _make_message_and_attestation(
             HexBytes(composer_address), amount, hook_data=HexBytes(program), nonce=6
@@ -688,18 +633,7 @@ class TestCCTPComposerErrors:
 
         amount = 100 * 10**6
         target_calldata = target.fns.execute(b"fail").data
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(target_calldata)
-            + push_u256(0)
-            + push_addr(target_address)
-            + bytes([0x5A])
-            + call()
-            + pop()
-        )
+        program = _compose_program(target_address, target_calldata)
 
         message, attestation = _make_message_and_attestation(
             HexBytes(composer_address), amount, hook_data=HexBytes(program), nonce=50
@@ -732,16 +666,8 @@ class TestCCTPComposerErrors:
 
         amount = 50 * 10**6
 
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + push_bytes(b"\xde\xad")
-            + push_u256(0)
-            + push_addr(reverting_address)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-        )
+        # Call a reverting target — the outer receiveAndExecute should revert.
+        program = _compose_program(reverting_address, b"\xde\xad")
 
         message, attestation = _make_message_and_attestation(
             HexBytes(composer_address), amount, hook_data=HexBytes(program), nonce=51

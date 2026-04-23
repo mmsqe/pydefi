@@ -283,6 +283,22 @@ class Program:
     # Arithmetic
     # ------------------------------------------------------------------
 
+    def stack_param(self) -> Value:
+        """Consume a value that was already on the EVM stack when the program started.
+
+        Used when the caller (e.g. the CCTP / OFT composer prologue in
+        ``DeFiVM.sol``) pushes values onto the stack before dispatching to
+        the user program.  Each call consumes one slot; the first call
+        returns the value at TOS at program entry, the second returns the
+        slot below it, and so on.
+
+        Lowers to Venom's ``param`` instruction which emits no bytecode —
+        it's a dataflow marker telling Venom's stack allocator that the
+        variable is already on the stack.  Must be called before emitting
+        any other value-producing instruction in the entry basic block.
+        """
+        return self._wrap(self._builder.param())
+
     def add(self, a: ValueLike, b: ValueLike) -> Value:
         """Wrapping uint256 ``a + b``."""
         return self._wrap(self._builder.add(self._to_operand(a), self._to_operand(b)))
@@ -385,6 +401,37 @@ class Program:
     def gas_left(self) -> Value:
         """EVM ``GAS`` — remaining gas."""
         return self._wrap(self._builder.gas())
+
+    def eth_balance(self, account: ValueLike) -> Value:
+        """EVM ``BALANCE(account)`` — ETH balance of *account*."""
+        return self._wrap(self._builder.balance(self._to_operand(account)))
+
+    def erc20_balance_of(self, token: ValueLike, account: ValueLike) -> Value:
+        """ERC-20 ``token.balanceOf(account)`` via STATICCALL.
+
+        Reverts if the staticcall fails.  Use :meth:`eth_balance` for native
+        ETH balance (calls the BALANCE opcode directly, no staticcall).
+        """
+        # ABI: balanceOf(address) selector 0x70a08231, arg at offset 4..36.
+        selector = 0x70A08231 << (28 * 8)  # left-align to byte 0..3 of a 32-byte word
+        scratch = self._alloc(36)
+        # mem[scratch] = selector word (bytes 0..3 hold the selector, 4..31 are zero)
+        self._builder.mstore(scratch, selector)
+        # mem[scratch+4] = account (right-aligned in a 32-byte word; MSTORE at
+        # scratch+4 writes bytes scratch+4..scratch+36, with 12 leading zeros
+        # then the 20-byte address).
+        self._builder.mstore(self._builder.add(scratch, 4), self._to_operand(account))
+        # STATICCALL(gas, token, scratch, 36, scratch, 32) — reuse scratch for retdata.
+        success = self._builder.staticcall(
+            self._builder.gas(),
+            self._to_operand(token),
+            scratch,
+            36,
+            scratch,
+            32,
+        )
+        self._builder.assert_(success)
+        return self._wrap(self._builder.mload(scratch))
 
     # ------------------------------------------------------------------
     # Internal: free-memory and data-section helpers

@@ -1,15 +1,17 @@
 """Fork tests for DeFiVM — a minimal register-based macro-assembler for DeFi flows.
 
-These tests compile DeFiVM.sol with py-solc-x, deploy it on a local Anvil fork
-of Ethereum mainnet, and exercise the full instruction set including:
+Compiles DeFiVM.sol and a mock adapter with py-solc-x, deploys on a local
+Anvil mainnet fork, and exercises the SSA :class:`pydefi.vm.Program`
+across:
 
- - Stack / register instructions (PUSH_U256, PUSH_ADDR, PUSH_BYTES, DUP, SWAP, POP,
-   LOAD_REG, STORE_REG)
- - Control flow (JUMP, JUMPI, REVERT_IF, ASSERT_GE, ASSERT_LE)
- - External calls to a mock adapter (CALL)
- - Balance introspection (BALANCE_OF, SELF_ADDR, SUB) using
-   real on-chain WETH contract on the forked chain
- - ABI patching (PATCH_U256, PATCH_ADDR, RET_U256, RET_SLICE)
+ - Register round-trips (store_reg / load_reg)
+ - Assertions (assert_, assert_ge, assert_le) with and without Error(string) msgs
+ - ETH and ERC-20 balance introspection (eth_balance / erc20_balance_of)
+ - External CALL with static calldata
+ - Returndata access (returndata_word)
+ - Runtime patching of calldata templates (``patches=`` kwarg)
+ - Chained calls (first call's output → second call's patched input)
+ - High-level ABI builder (call_contract_abi) with Value handles as patches
 
 Run with::
 
@@ -19,13 +21,13 @@ Run with::
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 import solcx
 from eth_contract.contract import ContractFunction
 from eth_contract.erc20 import ERC20
 from eth_contract.utils import send_transaction as eth_send_transaction
+from eth_utils import keccak
 from hexbytes import HexBytes
 from web3.exceptions import ContractLogicError, Web3RPCError
 from web3.types import Wei
@@ -39,19 +41,6 @@ from pydefi.vm.swap import build_swap_transaction
 from tests.addrs import POOL_WETH_USDC_500, POOL_WETH_USDC_3000
 from tests.live.sol_utils import MOCK_TOKEN_SOL, compile_sol_file, compile_sol_source, deploy, ensure_solc
 from tests.test_aggregator import USDC, WETH
-
-# This live test was written against the legacy stack-oriented Program /
-# pydefi.vm.program.* helpers, deleted in the SSA migration.  Skip the entire
-# file via pytestmark so collection succeeds; the legacy names are stubbed
-# below so module/class bodies that reference them load cleanly.  pytestmark
-# prevents any test from actually running and dereferencing the stubs.
-pytestmark = pytest.mark.skip(reason="legacy stack-API removed; pending SSA rewrite")
-
-_legacy_stub: Any = lambda *_a, **_kw: b""  # noqa: E731
-Patch = _legacy_stub  # legacy class — stub as callable so Patch() doesn't fail at parse
-assert_ge = assert_le = balance_of = call = dup = jump = jumpi = _legacy_stub
-load_reg = patch_value = pop = push_addr = push_bytes = push_u256 = _legacy_stub
-ret_slice = ret_u256 = revert_if = self_addr = store_reg = sub = swap = _legacy_stub
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -194,143 +183,84 @@ class TestDeFiVMFork:
     # Stack / register instructions
     # ------------------------------------------------------------------
 
-    async def test_push_and_store_load_register(self, ctx):
-        """PUSH_U256 / STORE_REG / LOAD_REG — basic register round-trip."""
+    async def test_store_load_register(self, ctx):
+        """store_reg / load_reg round-trip a value through memory."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        program = push_u256(0xDEADBEEF) + store_reg(0) + load_reg(0) + pop()
+        prog = Program()
+        prog.store_reg(0, 0xDEADBEEF)
+        _ = prog.load_reg(0)  # side-effect check: program compiles and runs
+        prog.stop()
+        program = prog.build(disable_constant_folding=True)
 
-        tx = await vm.functions.execute(program).transact({"from": deployer})
-        receipt = await w3.eth.get_transaction_receipt(tx)
-        assert receipt["status"] == 1
-
-    async def test_dup_swap_pop(self, ctx):
-        """DUP, SWAP, POP instructions execute without revert."""
-        w3 = ctx["w3"]
-        vm = ctx["vm"]
-        deployer = ctx["deployer"]
-
-        program = push_u256(1) + push_u256(2) + dup() + swap() + pop() + pop() + pop()
         tx = await vm.functions.execute(program).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
     # ------------------------------------------------------------------
-    # Control flow
+    # Assertions
     # ------------------------------------------------------------------
 
-    # jump() / jumpi() each emit PUSH2 hi lo JUMP/JUMPI = 4 bytes.
-    _JUMP_INSTR_SIZE = 4
-
-    async def test_jump_forward(self, ctx):
-        """JUMP skips over a subsequent unknown opcode that would otherwise revert."""
-        w3 = ctx["w3"]
+    async def test_assert_triggers_with_message(self, ctx):
+        """assert_(0, msg) reverts with an Error(string) payload."""
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        push_part = push_u256(1)  # 33 bytes (value stays on stack; consumed by pop_part)
-        bad_byte = bytes([0xFF])  # unknown opcode — would revert if reached
-        jumpdest = bytes([0x5B])  # JUMPDEST required by EVM at every jump target
-        pop_part = pop()
-
-        # Target must point to the JUMPDEST byte that follows the bad opcode.
-        target = len(push_part) + self._JUMP_INSTR_SIZE + len(bad_byte)  # 33 + 4 + 1 = 38
-        jump_part = jump(target)
-
-        program = push_part + jump_part + bad_byte + jumpdest + pop_part
-        tx = await vm.functions.execute(program).transact({"from": deployer})
-        receipt = await w3.eth.get_transaction_receipt(tx)
-        assert receipt["status"] == 1
-
-    async def test_jumpi_taken(self, ctx):
-        """JUMPI jumps when the condition is non-zero."""
-        w3 = ctx["w3"]
-        vm = ctx["vm"]
-        deployer = ctx["deployer"]
-
-        push_part = push_u256(1)  # 33 bytes — non-zero condition
-        bad_byte = bytes([0xFF])
-        jumpdest = bytes([0x5B])  # JUMPDEST required at jump target
-
-        # Target must point to the JUMPDEST byte that follows the bad opcode.
-        target = len(push_part) + self._JUMP_INSTR_SIZE + len(bad_byte)  # 33 + 4 + 1 = 38
-        jumpi_part = jumpi(target)
-
-        program = push_part + jumpi_part + bad_byte + jumpdest
-        tx = await vm.functions.execute(program).transact({"from": deployer})
-        receipt = await w3.eth.get_transaction_receipt(tx)
-        assert receipt["status"] == 1
-
-    async def test_jumpi_not_taken(self, ctx):
-        """JUMPI does not jump when the condition is zero."""
-        w3 = ctx["w3"]
-        vm = ctx["vm"]
-        deployer = ctx["deployer"]
-
-        push_part = push_u256(0)  # condition = False (33 bytes)
-        # EVM only validates the jump destination when the condition is non-zero;
-        # with condition=0 JUMPI simply falls through.  Any destination is safe here.
-        UNUSED_TARGET = 0
-        jumpi_part = jumpi(UNUSED_TARGET)
-        skip_pop = pop()  # pops the dummy 99 when condition is False
-
-        program = push_u256(99) + push_part + jumpi_part + skip_pop
-
-        tx = await vm.functions.execute(program).transact({"from": deployer})
-        receipt = await w3.eth.get_transaction_receipt(tx)
-        assert receipt["status"] == 1
-
-    async def test_revert_if_triggers(self, ctx):
-        """REVERT_IF causes a revert when condition is non-zero."""
-        vm = ctx["vm"]
-        deployer = ctx["deployer"]
-
-        program = push_u256(1) + revert_if("slippage exceeded")
+        prog = Program()
+        prog.assert_(0, "slippage exceeded")
+        prog.stop()
         with pytest.raises((ContractLogicError, Web3RPCError)):
-            await vm.functions.execute(program).transact({"from": deployer})
+            await vm.functions.execute(prog.build(disable_constant_folding=True)).transact({"from": deployer})
 
-    async def test_revert_if_no_trigger(self, ctx):
-        """REVERT_IF does nothing when condition is zero."""
+    async def test_assert_passes_when_nonzero(self, ctx):
+        """assert_(nonzero, msg) does not revert."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        program = push_u256(0) + revert_if("should not trigger")
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        prog.assert_(1, "should not trigger")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build(disable_constant_folding=True)).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
     async def test_assert_ge_pass(self, ctx):
-        """ASSERT_GE passes when a >= b."""
+        """assert_ge passes when a >= b."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        # push b=100, push a=200 -> assert a >= b -> ok
-        program = push_u256(100) + push_u256(200) + assert_ge("min not met")
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        prog.assert_ge(200, 100, "min not met")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build(disable_constant_folding=True)).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
     async def test_assert_ge_fail(self, ctx):
-        """ASSERT_GE reverts when a < b."""
+        """assert_ge reverts when a < b."""
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        program = push_u256(200) + push_u256(100) + assert_ge("min not met")
+        prog = Program()
+        prog.assert_ge(100, 200, "min not met")
+        prog.stop()
         with pytest.raises((ContractLogicError, Web3RPCError)):
-            await vm.functions.execute(program).transact({"from": deployer})
+            await vm.functions.execute(prog.build(disable_constant_folding=True)).transact({"from": deployer})
 
     async def test_assert_le_pass(self, ctx):
-        """ASSERT_LE passes when a <= b."""
+        """assert_le passes when a <= b."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        program = push_u256(200) + push_u256(100) + assert_le("max exceeded")
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        prog.assert_le(100, 200, "max exceeded")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build(disable_constant_folding=True)).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
@@ -338,53 +268,45 @@ class TestDeFiVMFork:
     # Introspection
     # ------------------------------------------------------------------
 
-    async def test_self_balance(self, ctx):
-        """SELF_ADDR + BALANCE_OF gives the VM contract's own ETH balance."""
+    async def test_self_eth_balance(self, ctx):
+        """eth_balance(self_addr()) — the VM contract's own ETH balance."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        # SELF_ADDR pushes address(this); push_u256(0) = ETH token; BALANCE_OF pops token then account
-        program = self_addr() + push_u256(0) + balance_of() + pop()
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        _ = prog.eth_balance(prog.self_addr())
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-    async def test_balance_of_weth(self, ctx):
-        """BALANCE_OF can read WETH balance of a mainnet whale."""
+    async def test_erc20_balance_of_weth_whale(self, ctx):
+        """erc20_balance_of(WETH, whale) reads WETH balance of a mainnet address."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        program = push_addr(WHALE) + push_addr(WETH.address) + balance_of() + pop()
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        _ = prog.erc20_balance_of(WETH.address, WHALE)
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
     async def test_delta_balance_weth(self, ctx):
-        """SUB computes a zero balance delta when no transfer occurs.
-
-        Pattern: balance_of (pre) → balance_of (post) → sub
-        """
+        """Compute a zero balance delta when no transfer occurs (pre - post == 0)."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
-        # Stack after each step:
-        #   push WHALE + WETH + BALANCE_OF → [pre_bal]
-        #   push WHALE + WETH + BALANCE_OF → [pre_bal, post_bal]
-        #   sub → [post_bal - pre_bal]  (== 0 here since no transfer happened)
-        program = (
-            push_addr(WHALE)
-            + push_addr(WETH.address)
-            + balance_of()
-            + push_addr(WHALE)
-            + push_addr(WETH.address)
-            + balance_of()
-            + sub()
-            + pop()
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        pre = prog.erc20_balance_of(WETH.address, WHALE)
+        post = prog.erc20_balance_of(WETH.address, WHALE)
+        delta = prog.sub(post, pre)  # saturating; == 0 since no transfer happened
+        prog.assert_(prog.is_zero(delta), "expected zero delta")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
@@ -399,78 +321,32 @@ class TestDeFiVMFork:
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
+        calldata = bytes(keccak(b"getFortyTwo()")[:4])
 
-        selector = keccak(b"getFortyTwo()")[:4]
-        calldata = bytes(selector)
-
-        program = (
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(calldata)
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        success = prog.call_contract(adapter, calldata)
+        prog.assert_(success)
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-    async def test_ret_u256_from_adapter(self, ctx):
-        """RET_U256 reads a uint256 from the last call's returndata."""
+    async def test_returndata_word_from_adapter(self, ctx):
+        """returndata_word(0) reads a uint256 from the last call's returndata."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
+        calldata = bytes(keccak(b"getFortyTwo()")[:4])
 
-        selector = keccak(b"getFortyTwo()")[:4]
-        calldata = bytes(selector)
-
-        program = (
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(calldata)
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-            + ret_u256(0)
-            + pop()
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
-        receipt = await w3.eth.get_transaction_receipt(tx)
-        assert receipt["status"] == 1
-
-    async def test_ret_slice(self, ctx):
-        """RET_SLICE extracts a bytes chunk from the last call's returndata."""
-        w3 = ctx["w3"]
-        vm = ctx["vm"]
-        deployer = ctx["deployer"]
-        adapter = ctx["adapter_address"]
-
-        from eth_utils import keccak
-
-        selector = keccak(b"getFortyTwo()")[:4]
-        calldata = bytes(selector)
-
-        program = (
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(calldata)
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-            + ret_slice(0, 32)
-            + pop()
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        success = prog.call_contract(adapter, calldata)
+        prog.assert_(success)
+        result = prog.returndata_word(0)
+        prog.assert_(prog.eq(result, 42), "expected 42")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
@@ -479,37 +355,26 @@ class TestDeFiVMFork:
     # ------------------------------------------------------------------
 
     async def test_patch_u256_and_call(self, ctx):
-        """PATCH_U256 mutates a calldata template before calling the adapter."""
+        """patches={offset: const} mutates a calldata template before CALL."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
-        # Use a dummy 4-byte selector that doesn't match any explicit function,
-        # so the call is routed to MockAdapter.fallback() which emits Called and echoes calldata.
+        # Use a dummy selector → routed to MockAdapter.fallback() which emits
+        # Called(sender, value, data) and echoes calldata.
         selector = b"\xde\xad\xbe\xef"
-        template = bytearray(selector + b"\x00" * 32)
+        template = bytes(selector + b"\x00" * 32)
 
-        program = (
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(bytes(template))
-            + push_u256(0xABCD)
-            + patch_value(4, 32)
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        success = prog.call_contract(adapter, template, patches={4: 0xABCD})
+        prog.assert_(success)
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-        # Verify PATCH_U256 actually wrote 0xABCD by decoding the Called event.
-        # MockAdapter.fallback() emits Called(sender, value, data) and echoes calldata.
+        # Verify the patch wrote 0xABCD by decoding the Called event.
         called_topic = keccak(b"Called(address,uint256,bytes)")
         adapter_log = None
         for log in receipt["logs"]:
@@ -517,48 +382,32 @@ class TestDeFiVMFork:
                 adapter_log = log
                 break
         assert adapter_log is not None, "Expected Called event from adapter"
-        # ABI layout of data: sender(32) + value(32) + offset(32) + length(32) + calldata
         encoded = bytes(adapter_log["data"])
         calldata_len = int.from_bytes(encoded[96:128], "big")
         received_calldata = encoded[128 : 128 + calldata_len]
-        expected_calldata = selector + (0xABCD).to_bytes(32, "big")
-        assert received_calldata == expected_calldata
+        assert received_calldata == selector + (0xABCD).to_bytes(32, "big")
 
     async def test_patch_addr(self, ctx):
-        """PATCH_ADDR writes a 20-byte address into a calldata template."""
+        """A 32-byte MSTORE patch with a uint160 value writes a right-aligned address."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
-        # Use a dummy 4-byte selector to trigger MockAdapter.fallback()
-        # which emits Called(sender, value, data) and echoes calldata.
         selector = b"\xca\xfe\xba\xbe"
-        template = bytearray(selector + b"\x00" * 32)
+        template = bytes(selector + b"\x00" * 32)
 
-        # patch_offset=16: write the 20-byte address at byte 16 of the buffer,
-        # which fills the right half of the 32-byte ABI slot starting at offset 4.
-        patch_offset = 4 + 12
-
-        program = (
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(bytes(template))
-            + push_addr(adapter)
-            + patch_value(patch_offset, 20)
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        # patches={4: addr} MSTOREs 32 bytes at offset 4 with the uint160 address
+        # right-aligned: 12 leading zeros then the 20-byte address.  Equivalent
+        # to legacy patch_value(4 + 12, 20).
+        prog = Program()
+        success = prog.call_contract(adapter, template, patches={4: prog.addr(adapter)})
+        prog.assert_(success)
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-        # Verify PATCH_ADDR wrote the address bytes at the correct offset.
         called_topic = keccak(b"Called(address,uint256,bytes)")
         adapter_log = None
         for log in receipt["logs"]:
@@ -569,292 +418,116 @@ class TestDeFiVMFork:
         encoded = bytes(adapter_log["data"])
         calldata_len = int.from_bytes(encoded[96:128], "big")
         received_calldata = encoded[128 : 128 + calldata_len]
-        # Expected: selector + 12 zero bytes + 20-byte address (raw byte-for-byte patch)
-        expected_calldata = selector + b"\x00" * 12 + adapter
-        assert received_calldata == expected_calldata
+        assert received_calldata == selector + b"\x00" * 12 + adapter
 
     # ------------------------------------------------------------------
     # Chained actions (calldata surgery)
     # ------------------------------------------------------------------
 
     async def test_chained_calls_patch_u256(self, ctx):
-        """Chain two adapter calls by patching calldata with the previous output.
-
-        Surgery approach 1 — ret_u256 + patch_u256:
-          double(5) → 10, then patch template double(0) → double(10) → 20.
-        The final retdata is verified in-program using ASSERT_GE / ASSERT_LE.
-        """
+        """Chain two adapter calls; second call's input = first call's output."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        from eth_utils import keccak
-
         double_sel = keccak(b"double(uint256)")[:4]
         calldata1 = double_sel + (5).to_bytes(32, "big")
-        template2 = double_sel + (0).to_bytes(32, "big")  # placeholder; patched at runtime
+        template2 = double_sel + (0).to_bytes(32, "big")
 
-        program = (
-            # --- Call 1: double(5) → retdata = abi.encode(10) ---
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0
-            + push_bytes(calldata1)
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-            # --- Calldata surgery: embed call-1 output into call-2 template ---
-            # Push retLen/retOffset first so they sit below the call-2 buffer on stack
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for call 2
-            + push_bytes(template2)  # argsOffset, argsLen above retOffset/retLen
-            + ret_u256(0)  # push 10 from retdata
-            + patch_value(4, 32)  # patch template2[4..36] = 10; leaves [argsOffset, argsLen, retOffset, retLen]
-            # --- Call 2: double(10) → retdata = abi.encode(20) ---
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-            # --- In-program assertion: result == 20 ---
-            + push_u256(20)
-            + ret_u256(0)
-            + assert_ge("result below expected")
-            + push_u256(20)
-            + ret_u256(0)
-            + assert_le("result above expected")
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        # Call 1: double(5) → retdata = 10
+        s1 = prog.call_contract(adapter, calldata1)
+        prog.assert_(s1)
+        amount = prog.returndata_word(0)
+        # Call 2: double(amount) — patch template2 at offset 4 with `amount`
+        s2 = prog.call_contract(adapter, template2, patches={4: amount})
+        prog.assert_(s2)
+        # Final assertion: result == 20
+        result = prog.returndata_word(0)
+        prog.assert_(prog.eq(result, 20), "expected 20")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
     async def test_chained_calls_multi_patch_u256(self, ctx):
-        """Chain two adapter calls patching the first calldata slot of a two-argument template.
-
-        Surgery approach 1 — ret_u256 + patch_u256:
-          double(7) → 14, then patch first slot of addInputs(0, 3) → addInputs(14, 3) → 17.
-        """
+        """Chain into a 2-arg template, patching only the first slot."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
-
-        from eth_utils import keccak
 
         double_sel = keccak(b"double(uint256)")[:4]
         add_sel = keccak(b"addInputs(uint256,uint256)")[:4]
-
         calldata1 = double_sel + (7).to_bytes(32, "big")
-        # Template: addInputs(0, 3) — first arg is a placeholder patched at runtime.
+        # Template: addInputs(0, 3) — first slot patched at runtime.
         template2 = add_sel + (0).to_bytes(32, "big") + (3).to_bytes(32, "big")
 
-        program = (
-            # --- Call 1: double(7) → retdata = abi.encode(14) ---
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0
-            + push_bytes(calldata1)
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-            # --- Calldata surgery: embed call-1 output into the first arg of call-2 ---
-            # Push retLen/retOffset first so they sit below the call-2 buffer on stack
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for call 2
-            + push_bytes(template2)  # argsOffset, argsLen above retOffset/retLen
-            + ret_u256(0)  # push 14
-            + patch_value(4, 32)  # patch template2[4..36] = 14; leaves [argsOffset, argsLen, retOffset, retLen]
-            # --- Call 2: addInputs(14, 3) → retdata = abi.encode(17) ---
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-            # --- In-program assertion: result == 17 ---
-            + push_u256(17)
-            + ret_u256(0)
-            + assert_ge("result below expected")
-            + push_u256(17)
-            + ret_u256(0)
-            + assert_le("result above expected")
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        s1 = prog.call_contract(adapter, calldata1)
+        prog.assert_(s1)
+        amount = prog.returndata_word(0)  # 14
+        s2 = prog.call_contract(adapter, template2, patches={4: amount})
+        prog.assert_(s2)
+        # addInputs(14, 3) == 17
+        result = prog.returndata_word(0)
+        prog.assert_(prog.eq(result, 17), "expected 17")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
-
-    async def test_chained_calls_ret_slice(self, ctx):
-        """Chain two adapter calls by forwarding a raw calldata slice.
-
-        Surgery approach 2 — ret_slice used directly as calldata:
-          encodeDouble(5) returns the ABI calldata for double(5).
-          ret_slice extracts that payload and feeds it straight into the next CALL,
-          so double(5) is invoked without any additional patching.  Result: 10.
-        """
-        w3 = ctx["w3"]
-        vm = ctx["vm"]
-        deployer = ctx["deployer"]
-        adapter = ctx["adapter_address"]
-
-        from eth_utils import keccak
-
-        # encodeDouble(uint256) returns bytes memory.
-        # ABI layout of its returndata:
-        #   [0..32)  offset of bytes value = 0x20
-        #   [32..64) length of inner bytes = 36 (4-byte selector + 32-byte arg)
-        #   [64..100) inner bytes = double(uint256) selector + abi.encode(x)
-        encode_double_sel = keccak(b"encodeDouble(uint256)")[:4]
-        calldata1 = encode_double_sel + (5).to_bytes(32, "big")
-
-        program = (
-            # --- Call 1: encodeDouble(5) → retdata carries calldata for double(5) ---
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0
-            + push_bytes(calldata1)
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-            # --- Surgery: extract the inner bytes as a new buffer ---
-            # Push retLen/retOffset first so they sit below the slice buffer on stack
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for call 2
-            # retdata[64..100] = selector(4) + abi.encode(5) = calldata for double(5)
-            + ret_slice(64, 36)  # argsOffset, argsLen above retOffset/retLen
-            # --- Call 2: double(5) using the slice from call-1's returndata ---
-            + push_u256(0)
-            + push_addr(adapter)
-            + bytes([0x5A])
-            + call(require_success=True)
-            + pop()
-            # --- In-program assertion: result == 10 ---
-            + push_u256(10)
-            + ret_u256(0)
-            + assert_ge("result below expected")
-            + push_u256(10)
-            + ret_u256(0)
-            + assert_le("result above expected")
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
-        receipt = await w3.eth.get_transaction_receipt(tx)
-        assert receipt["status"] == 1
-
-    # ------------------------------------------------------------------
-    # Safety / limits
-    # ------------------------------------------------------------------
-
-    async def test_unknown_opcode_reverts(self, ctx):
-        """An unrecognised opcode causes a revert."""
-        vm = ctx["vm"]
-        deployer = ctx["deployer"]
-
-        program = bytes([0xFF])
-        with pytest.raises((ContractLogicError, Web3RPCError)):
-            await vm.functions.execute(program).transact({"from": deployer})
-
-    async def test_stack_overflow_reverts(self, ctx):
-        """Pushing more than 1024 values onto the EVM stack must revert."""
-        vm = ctx["vm"]
-        deployer = ctx["deployer"]
-
-        # The EVM allows up to 1024 stack items; 1025 PUSH1 instructions overflow it.
-        program = bytes([0x60, 0x00]) * 1025  # 1025x PUSH1 0x00
-        with pytest.raises((ContractLogicError, Web3RPCError)):
-            await vm.functions.execute(program).transact({"from": deployer})
 
     # ------------------------------------------------------------------
     # call_contract_abi with Patch (high-level ABI builder)
     # ------------------------------------------------------------------
 
     async def test_call_contract_abi_patch_single_uint256(self, ctx):
-        """call_contract_abi with a single Patch arg auto-detects the calldata offset.
-
-        Pushes the patch value (7) before the call so Patch() picks it up from the
-        stack, then calls double(7) via the high-level ABI builder.  Verifies the
-        on-chain result equals 14.
-
-        Keep the sequence in a single Program to preserve Program-level data-section
-        handling; avoid concatenating separate Program.build() outputs when relying
-        on embedded data.
-        """
+        """call_contract_abi with a Value handle for the uint256 arg auto-patches it."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        program = (
-            Program()
-            ._emit(push_u256(7))  # patch value consumed by Patch()
-            .call_contract_abi(
-                adapter,
-                "function double(uint256 x) external pure returns (uint256)",
-                Patch(),
-            )
-            .pop()
-            ._emit(push_u256(14))
-            ._emit(ret_u256(0))
-            ._emit(assert_ge("result below 14"))
-            ._emit(push_u256(14))
-            ._emit(ret_u256(0))
-            ._emit(assert_le("result above 14"))
-            .build()
+        prog = Program()
+        amount = prog.const(7)
+        success = prog.call_contract_abi(
+            adapter,
+            "function double(uint256 x) external pure returns (uint256)",
+            amount,
         )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog.assert_(success)
+        prog.assert_(prog.eq(prog.returndata_word(0), 14), "expected 14")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build(disable_constant_folding=True)).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
     async def test_call_contract_abi_patch_two_uint256_args(self, ctx):
-        """call_contract_abi with two Patch args patches both calldata slots.
-
-        Pushes 11 then 6 (so 6 is TOS = first patch, 11 is second patch), then
-        calls addInputs(6, 11) via the high-level ABI builder.  Verifies the
-        on-chain result equals 17.
-
-        Keep the sequence in a single Program to preserve Program-level data-section
-        handling; avoid concatenating separate Program.build() outputs when relying
-        on embedded data.
-        """
+        """call_contract_abi with two Value args patches both calldata slots."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        program = (
-            Program()
-            ._emit(push_u256(11))  # second patch value (deepest)
-            ._emit(push_u256(6))  # first patch value (TOS)
-            .call_contract_abi(
-                adapter,
-                "function addInputs(uint256 a, uint256 b) external pure returns (uint256)",
-                Patch(),
-                Patch(),
-            )
-            .pop()
-            ._emit(push_u256(17))
-            ._emit(ret_u256(0))
-            ._emit(assert_ge("result below 17"))
-            ._emit(push_u256(17))
-            ._emit(ret_u256(0))
-            ._emit(assert_le("result above 17"))
-            .build()
+        prog = Program()
+        a = prog.const(6)
+        b = prog.const(11)
+        success = prog.call_contract_abi(
+            adapter,
+            "function addInputs(uint256 a, uint256 b) external pure returns (uint256)",
+            a,
+            b,
         )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog.assert_(success)
+        prog.assert_(prog.eq(prog.returndata_word(0), 17), "expected 17")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build(disable_constant_folding=True)).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
     async def test_call_contract_abi_patch_chained(self, ctx):
-        """Chain two calls: first via static call_contract_abi, second with a Patch.
-
-        double(5) → 10 pushed onto stack via ret_u256, then double(10) via
-        call_contract_abi with Patch().  Verifies the final result equals 20.
-
-        Keep the flow in a single Program/build step; when using
-        Program.push_bytes / Venom-managed data sections, do not concatenate
-        separately built bytecode fragments.
-        """
+        """Chain two calls: first uses a literal arg; second uses the first's result."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
@@ -862,25 +535,17 @@ class TestDeFiVMFork:
 
         double_sig = "function double(uint256 x) external pure returns (uint256)"
 
-        program = (
-            Program()
-            # Call 1: double(5) → retdata = 10
-            .call_contract_abi(adapter, double_sig, 5)
-            .pop()
-            ._emit(ret_u256(0))  # push 10 from retdata (patch value for call 2)
-            # Call 2: double(10) using Patch — 10 is at TOS
-            .call_contract_abi(adapter, double_sig, Patch())
-            .pop()
-            # Verify result == 20
-            ._emit(push_u256(20))
-            ._emit(ret_u256(0))
-            ._emit(assert_ge("result below 20"))
-            ._emit(push_u256(20))
-            ._emit(ret_u256(0))
-            ._emit(assert_le("result above 20"))
-            .build()
-        )
-        tx = await vm.functions.execute(program).transact({"from": deployer})
+        prog = Program()
+        # Call 1: double(5) → 10  (literal arg, no Value handle)
+        s1 = prog.call_contract_abi(adapter, double_sig, 5)
+        prog.assert_(s1)
+        amount = prog.returndata_word(0)
+        # Call 2: double(amount) → 20  (Value handle becomes a runtime patch)
+        s2 = prog.call_contract_abi(adapter, double_sig, amount)
+        prog.assert_(s2)
+        prog.assert_(prog.eq(prog.returndata_word(0), 20), "expected 20")
+        prog.stop()
+        tx = await vm.functions.execute(prog.build()).transact({"from": deployer})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
@@ -964,7 +629,10 @@ class TestApproveProxyFork:
         bal_recipient_before = await token_a.functions.balanceOf(recipient).call()
         bal_vm_before = await token_a.functions.balanceOf(vm_address).call()
 
-        program = Program().call_contract(token_a_address, ERC20.fns.transfer(recipient, AMOUNT).data).pop().build()
+        prog = Program()
+        prog.call_contract(token_a_address, ERC20.fns.transfer(recipient, AMOUNT).data)
+        prog.stop()
+        program = prog.build()
         deposits = [{"token": token_a_address, "amount": AMOUNT}]
 
         tx = await proxy.functions.execute(program, deposits).transact({"from": user})
@@ -1000,14 +668,11 @@ class TestApproveProxyFork:
         bal_a_recipient_before = await token_a.functions.balanceOf(recipient).call()
         bal_b_recipient_before = await token_b.functions.balanceOf(recipient).call()
 
-        program = (
-            Program()
-            .call_contract(token_a_address, ERC20.fns.transfer(recipient, AMOUNT_A).data)
-            .pop()
-            .call_contract(token_b_address, ERC20.fns.transfer(recipient, AMOUNT_B).data)
-            .pop()
-            .build()
-        )
+        prog = Program()
+        prog.call_contract(token_a_address, ERC20.fns.transfer(recipient, AMOUNT_A).data)
+        prog.call_contract(token_b_address, ERC20.fns.transfer(recipient, AMOUNT_B).data)
+        prog.stop()
+        program = prog.build()
         deposits = [
             {"token": token_a_address, "amount": AMOUNT_A},
             {"token": token_b_address, "amount": AMOUNT_B},
@@ -1030,7 +695,7 @@ class TestApproveProxyFork:
         proxy = proxy_ctx["proxy"]
         user = proxy_ctx["user"]
 
-        program = push_u256(0) + pop()
+        program = Program().build()  # empty no-op program
         tx = await proxy.functions.execute(program, []).transact({"from": user})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
@@ -1051,9 +716,10 @@ class TestApproveProxyFork:
         tx = await token_a.functions.approve(proxy_address, APPROVE_AMOUNT).transact({"from": user})
         await w3.eth.get_transaction_receipt(tx)
 
-        program = (
-            Program().call_contract(token_a_address, ERC20.fns.transfer(recipient, DEPOSIT_AMOUNT).data).pop().build()
-        )
+        prog = Program()
+        prog.call_contract(token_a_address, ERC20.fns.transfer(recipient, DEPOSIT_AMOUNT).data)
+        prog.stop()
+        program = prog.build()
         deposits = [{"token": token_a_address, "amount": DEPOSIT_AMOUNT}]
 
         with pytest.raises((ContractLogicError, Web3RPCError)):
@@ -1078,7 +744,7 @@ class TestApproveProxyFork:
 
         vm_balance_before = await w3.eth.get_balance(vm_address)
 
-        program = push_u256(0) + pop()
+        program = Program().build()  # empty no-op program
         tx = await proxy.functions.execute(program, []).transact({"from": user, "value": ETH_VALUE})
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1

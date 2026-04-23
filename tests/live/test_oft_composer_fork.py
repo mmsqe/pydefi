@@ -21,8 +21,8 @@ Run with::
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
 
 import pytest
 import solcx
@@ -32,17 +32,56 @@ from web3 import AsyncWeb3, Web3
 from web3.exceptions import ContractLogicError, Web3RPCError
 
 from pydefi.types import Address
+from pydefi.vm import Program
 from tests.live.sol_utils import compile_sol_file, deploy, ensure_solc
 
-# This live test was written against the legacy stack-oriented
-# pydefi.vm.program.* helpers, deleted in the SSA migration.  Skip the entire
-# file via pytestmark so collection succeeds; the legacy names are stubbed
-# below so module/class bodies that reference them load cleanly.  pytestmark
-# prevents any test from actually running and dereferencing the stubs.
-pytestmark = pytest.mark.skip(reason="legacy stack-API removed; pending SSA rewrite")
 
-_legacy_stub: Any = lambda *_a, **_kw: b""  # noqa: E731
-call = load_reg = patch_value = pop = push_addr = push_bytes = push_u256 = store_reg = _legacy_stub
+def _start_program() -> tuple[Program, "object", "object"]:
+    """Start a compose program and consume the two prologue stack params.
+
+    Returns ``(prog, from_or_source, amount)`` where the two Value handles
+    correspond to the OFT ``_from`` address (R0) and ``amountLD`` (R1)
+    that the composer prologue pushes onto the stack before dispatch.
+    R0 / R1 are also pre-populated so later code can re-fetch via
+    ``prog.load_reg(0)`` / ``prog.load_reg(1)``.
+    """
+    prog = Program()
+    from_val = prog.stack_param()  # TOS = _from (OFT) / sourceDomain (CCTP)
+    amount_val = prog.stack_param()  # 2nd = amountLD / amountReceived
+    prog.store_reg(0, from_val)
+    prog.store_reg(1, amount_val)
+    return prog, from_val, amount_val
+
+
+def _compose_single_call(target_address: Address, calldata: bytes, *, value: int = 0) -> bytes:
+    """Build a compose program that issues a single external call.
+
+    Matches legacy ``call(require_success=True)`` semantics: a failed sub-call
+    propagates a revert to the outer ``lzCompose`` / ``receiveAndExecute``.
+    """
+    prog, _from_val, _amount_val = _start_program()
+    success = prog.call_contract(target_address, calldata, value=value)
+    prog.assert_(success)
+    prog.stop()
+    return prog.build()
+
+
+def _compose_multi_call(calls: Sequence[tuple[Address, bytes]]) -> bytes:
+    """Build a compose program that issues N external calls in sequence."""
+    prog, _from_val, _amount_val = _start_program()
+    for target, calldata in calls:
+        success = prog.call_contract(target, calldata)
+        prog.assert_(success)
+    prog.stop()
+    return prog.build()
+
+
+def _compose_noop() -> bytes:
+    """Build a minimal no-op compose program (prologue stores only)."""
+    prog, _from_val, _amount_val = _start_program()
+    prog.stop()
+    return prog.build()
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -324,24 +363,6 @@ class TestOFTComposerFork:
     """Fork-level tests for OFTComposer.sol backed by DeFiVM on a local Anvil fork."""
 
     # ------------------------------------------------------------------
-    # Helper: build a single-CALL DeFiVM snippet (no OFT param setup)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _call_target(target_address: str, calldata: bytes, value: int = 0) -> bytes:
-        """Return DeFiVM instructions for one external call (discards success flag)."""
-        return (
-            push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(calldata)
-            + push_u256(value)
-            + push_addr(target_address)
-            + bytes([0x5A])  # GAS — forward all remaining gas
-            + call()  # requireSuccess=True → reverts on failure; pushes success flag
-            + pop()  # discard success flag
-        )
-
-    # ------------------------------------------------------------------
     # Basic single-call compose
     # ------------------------------------------------------------------
 
@@ -358,9 +379,7 @@ class TestOFTComposerFork:
         target = ctx["target"]
 
         calldata = target.fns.execute(b"hello").data
-        # The composer pre-pushes amountLD and _from onto the stack.
-        # Save them to R0/_from and R1/amountLD so the stack is clean for the call.
-        program = store_reg(0) + store_reg(1) + self._call_target(target_address, calldata)
+        program = _compose_single_call(target_address, calldata)
         amount_ld = 10**18
         message = make_compose_message(nonce=1, src_eid=30101, amount_ld=amount_ld, program=program)
 
@@ -402,12 +421,7 @@ class TestOFTComposerFork:
 
         calldata_a = target.fns.execute(b"call_a").data
         calldata_b = target.fns.execute(b"call_b").data
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + self._call_target(target_address, calldata_a)
-            + self._call_target(target_address, calldata_b)
-        )
+        program = _compose_multi_call([(target_address, calldata_a), (target_address, calldata_b)])
         amount_ld = 5 * 10**17
         message = make_compose_message(nonce=2, src_eid=30101, amount_ld=amount_ld, program=program)
 
@@ -452,18 +466,7 @@ class TestOFTComposerFork:
         calldata = target.fns.execute(b"with_eth").data
         # Pass eth_amount as the call value; DeFiVM forwards it from its own balance
         # (received via vm.execute{value: msg.value}).
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(calldata)
-            + push_u256(eth_amount)  # value for sub-call
-            + push_addr(target_address)
-            + bytes([0x5A])  # GAS — forward all remaining gas
-            + call()
-            + pop()
-        )
+        program = _compose_single_call(target_address, calldata, value=eth_amount)
         message = make_compose_message(nonce=3, src_eid=30101, amount_ld=amount_ld, program=program)
 
         # Simulate OFT bridge: mint tokens to the composer before lzCompose is called.
@@ -503,7 +506,7 @@ class TestOFTComposerFork:
         amount_ld = 777 * 10**18
         guid = b"\xde\xad" + b"\x00" * 30
         calldata = target.fns.execute(b"event_test").data
-        program = store_reg(0) + store_reg(1) + self._call_target(target_address, calldata)
+        program = _compose_single_call(target_address, calldata)
         message = make_compose_message(nonce=4, src_eid=30184, amount_ld=amount_ld, program=program)
 
         # Simulate OFT bridge: mint tokens to the composer before lzCompose is called.
@@ -553,28 +556,13 @@ class TestOFTComposerFork:
         #   [68:100] data content (32 zero bytes -- will be patched with amountLD)
         template = target.fns.execute(b"\x00" * 32).data
 
-        # Program:
-        #   Stack start: [amountLD, _from]  (_from on top)
-        #   STORE_REG 0 -> R0 = _from;   stack: [amountLD]
-        #   STORE_REG 1 -> R1 = amountLD; stack: []
-        #   PUSH_BYTES template -> buf 0; stack: [0]
-        #   LOAD_REG 1  -> stack: [0, amountLD]
-        #   PATCH_U256 68 -> pops amountLD (top) and bufIdx 0; patches; stack: [0]
-        #   push value=0, push to, push gasLimit=0 -> CALL
-        program = (
-            store_reg(0)  # R0 = _from
-            + store_reg(1)  # R1 = amountLD
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(template)  # argsOffset, argsLen above retOffset/retLen
-            + load_reg(1)  # push amountLD
-            + patch_value(68, 32)  # patch amountLD at offset 68; leaves [argsOffset, argsLen, retOffset, retLen]
-            + push_u256(0)  # value=0
-            + push_addr(target_address)  # to
-            + bytes([0x5A])  # GAS — forward all remaining gas
-            + call()
-            + pop()
-        )
+        # Patch amountLD (stored in R1 by the prologue) into offset 68 of the
+        # calldata buffer before calling target.execute().
+        prog, _from_val, amount_val = _start_program()
+        success = prog.call_contract(target_address, template, patches={68: amount_val})
+        prog.assert_(success)
+        prog.stop()
+        program = prog.build()
         message = make_compose_message(nonce=5, src_eid=30101, amount_ld=amount_ld, program=program)
 
         # Simulate OFT bridge: mint tokens to the composer before lzCompose is called.
@@ -611,32 +599,18 @@ class TestOFTComposerFork:
         target_address = ctx["target_address"]
         target = ctx["target"]
 
-        # Same calldata template; we'll patch the 20-byte address at offset 68.
+        # Same calldata template; patch the 20-byte address into data[12..31].
         template = target.fns.execute(b"\x00" * 32).data
 
-        # Program:
-        #   STORE_REG 0 -> R0 = _from   (pop from top)
-        #   STORE_REG 1 -> R1 = amountLD
-        #   PUSH_BYTES template -> buf; stack: [argsOffset, argsLen, ...]
-        #   LOAD_REG 0  -> stack: [_from, argsOffset, ...]
-        #   PATCH_ADDR 80 -> MSTORE(argsOffset+68, _from): writes 12 zeros at data[0..11]
-        #                    then 20-byte address at data[12..31]; MSTORE starts at
-        #                    offset 68 (= 80-12), safely past the length field at [36..67]
-        #   CALL
-        program = (
-            store_reg(0)  # R0 = _from
-            + store_reg(1)  # R1 = amountLD
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(template)  # argsOffset, argsLen above retOffset/retLen
-            + load_reg(0)  # push _from
-            + patch_value(80, 20)  # MSTORE at buf+68: data[0..11]=0x00*12, data[12..31]=_from
-            + push_u256(0)  # value=0
-            + push_addr(target_address)  # to
-            + bytes([0x5A])  # GAS — forward all remaining gas
-            + call()
-            + pop()
-        )
+        # Patch _from (R0 from prologue, a uint160 address) into offset 68.
+        # SSA patches always MSTORE 32 bytes at the slot start, which writes
+        # 12 zero bytes then the 20-byte address — equivalent to the legacy
+        # patch_value(80, 20) which used mstore_off = 80 - 12 = 68.
+        prog, from_val, _amount_val = _start_program()
+        success = prog.call_contract(target_address, template, patches={68: from_val})
+        prog.assert_(success)
+        prog.stop()
+        program = prog.build()
         amount_ld = 10**18
         message = make_compose_message(nonce=6, src_eid=30101, amount_ld=amount_ld, program=program)
 
@@ -672,7 +646,7 @@ class TestOFTComposerFork:
         deployer = ctx["deployer"]
         oft_address = ctx["oft_address"]
 
-        program = store_reg(0) + store_reg(1)  # minimal no-op program
+        program = _compose_noop()  # minimal no-op program
         message = make_compose_message(nonce=7, src_eid=30101, amount_ld=10**18, program=program)
 
         with pytest.raises((ContractLogicError, Web3RPCError)):
@@ -706,19 +680,8 @@ class TestOFTComposerFork:
 
         calldata_ok = target.fns.execute(b"before_fail").data
         # First call succeeds; second call (to RevertingTarget) always reverts.
-        # DeFiVM's requireSuccess=True causes the whole execute() to revert.
-        program = (
-            store_reg(0)
-            + store_reg(1)
-            + self._call_target(target_address, calldata_ok)  # succeeds, pops success
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(b"")  # empty calldata for fallback
-            + push_u256(0)
-            + push_addr(reverting_address)
-            + bytes([0x5A])
-            + call()  # requireSuccess=True; target reverts -> DeFiVM reverts
-        )
+        # require_success=True on the second call causes the whole execute() to revert.
+        program = _compose_multi_call([(target_address, calldata_ok), (reverting_address, b"")])
         amount_ld = 10**18
         message = make_compose_message(nonce=8, src_eid=30101, amount_ld=amount_ld, program=program)
 
@@ -756,7 +719,7 @@ class TestOFTComposerFork:
         random_oft = w3.eth.account.create().address
 
         calldata = target.fns.execute(b"random_oft").data
-        program = store_reg(0) + store_reg(1) + self._call_target(target_address, calldata)
+        program = _compose_single_call(target_address, calldata)
         # amount_ld=0 skips token transfer; this test only verifies there is no OFT whitelist.
         message = make_compose_message(nonce=9, src_eid=30101, amount_ld=0, program=program)
 
@@ -892,21 +855,9 @@ class TestOFTComposerFork:
         await oft.fns.mint(composer_address, token_amount).transact(w3, deployer)
         assert await oft.fns.balanceOf(composer_address).call(w3) == pre_composer + token_amount
 
-        # Build calldata for token.transfer(fresh_recipient, token_amount).
         # After the composer's token transfer, DeFiVM holds the tokens and can use them.
         vm_forward_calldata = oft.fns.transfer(fresh_recipient, token_amount).data
-        program = (
-            store_reg(0)  # R0 = _from (OFT address)
-            + store_reg(1)  # R1 = amountLD
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(vm_forward_calldata)  # push calldata buffer
-            + push_u256(0)  # value = 0 ETH
-            + push_addr(oft_address)  # call the OFT token contract
-            + bytes([0x5A])  # GAS — forward all remaining gas
-            + call()
-            + pop()  # discard success flag
-        )
+        program = _compose_single_call(oft_address, vm_forward_calldata)
         message = make_compose_message(nonce=10, src_eid=30101, amount_ld=token_amount, program=program)
 
         tx = await endpoint.fns.deliverCompose(
@@ -966,20 +917,9 @@ class TestOFTComposerFork:
         await token.fns.mint(composer_address, token_amount).transact(w3, deployer)
         assert await token.fns.balanceOf(composer_address).call(w3) == token_amount
 
-        # Build calldata for token.transfer(fresh_recipient, token_amount).
+        # Call the underlying ERC-20 contract (resolved by adapter.token()).
         vm_forward_calldata = token.fns.transfer(fresh_recipient, token_amount).data
-        program = (
-            store_reg(0)  # R0 = _from (adapter address)
-            + store_reg(1)  # R1 = amountLD
-            + push_u256(0)
-            + push_u256(0)  # retLen=0, retOffset=0 for CALL
-            + push_bytes(vm_forward_calldata)  # push calldata buffer
-            + push_u256(0)  # value = 0 ETH
-            + push_addr(token_address)  # call the underlying ERC-20 contract
-            + bytes([0x5A])  # GAS — forward all remaining gas
-            + call()
-            + pop()  # discard success flag
-        )
+        program = _compose_single_call(token_address, vm_forward_calldata)
         message = make_compose_message(nonce=11, src_eid=30101, amount_ld=token_amount, program=program)
 
         tx = await endpoint.fns.deliverCompose(
