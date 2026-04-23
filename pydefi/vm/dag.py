@@ -35,16 +35,14 @@ def build_execution_program_for_dag(
     min_final_out: int = 0,
 ) -> Program:
     """Build an execution program from a :class:`RouteDAG`."""
-    payload = dag.to_dict()
-    actions = payload["actions"]
-    if not actions:
+    if not dag.actions:
         raise ValueError("build_execution_program_for_dag: route DAG must contain at least one action")
 
     prog = Program()
     final_out = _build_dag_actions(
         prog,
         prog.const(amount_in),
-        actions,
+        dag.actions,
         vm_address=vm_address,
         terminal_recipient=recipient,
     )
@@ -66,16 +64,14 @@ def build_quote_program_for_dag(
     Returns ``amountOut`` via ``RETURN(0, 32)`` so callers reading from
     ``eth_call`` returndata see the final output amount.
     """
-    payload = dag.to_dict()
-    actions = payload["actions"]
-    if not actions:
+    if not dag.actions:
         raise ValueError("build_quote_program_for_dag: route DAG must contain at least one action")
 
     prog = Program()
     final_out = _build_dag_quote_actions(
         prog,
         prog.const(amount_in),
-        actions,
+        dag.actions,
         quoter_address=quoter_address,
     )
     if min_final_out > 0:
