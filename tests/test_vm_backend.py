@@ -290,3 +290,112 @@ def test_venom_program_no_plan_for_mismatched_stack_literal_patch_case():
     program.push_u256(1).push_u256(2).call_with_patches(HexBytes("0x" + "91" * 20), calldata, [(28, 4)])
     assert program.has_pending_venom_plan is False
     assert program.pending_venom_plan_kind is None
+
+
+# ---------------------------------------------------------------------------
+# Venom vs manual EVM behavioral parity
+# ---------------------------------------------------------------------------
+
+
+def _manual_build(p: Program) -> bytes:
+    """Return the bytecode for *p* forced through the manual materialization path.
+
+    ``build()`` leaves the pending plan intact when Venom succeeds, so we can
+    snapshot and materialize without disturbing the original program.
+    """
+    snap = Program._snapshot(p)
+    snap._materialize_plan_to_manual()
+    return snap.build()
+
+
+@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
+def test_call_contract_venom_manual_evm_parity():
+    """Venom-compiled and manual call_contract produce identical EVM results."""
+    target = HexBytes("0x" + "c1" * 20)
+    calldata = bytes.fromhex("a9059cbb") + b"\x00" * 64
+
+    p = Program().call_contract(target, calldata)
+    assert p.has_pending_venom_plan
+
+    venom_bytecode = p.build()
+    manual_bytecode = _manual_build(p)
+
+    assert venom_bytecode != manual_bytecode, "expected bytecodes to differ in structure"
+
+    venom_result = mini_evm(venom_bytecode + RETURN_TOP)
+    manual_result = mini_evm(manual_bytecode + RETURN_TOP)
+
+    assert not venom_result.is_error
+    assert not manual_result.is_error
+    assert venom_result.output == manual_result.output
+
+
+@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
+def test_call_contract_no_require_success_venom_manual_evm_parity():
+    """require_success=False: both paths leave the raw success flag on stack."""
+    target = HexBytes("0x" + "c2" * 20)
+    calldata = b"\xde\xad\xbe\xef"
+
+    p = Program().call_contract(target, calldata, require_success=False)
+    assert p.has_pending_venom_plan
+
+    venom_result = mini_evm(p.build() + RETURN_TOP)
+    manual_result = mini_evm(_manual_build(p) + RETURN_TOP)
+
+    assert not venom_result.is_error
+    assert not manual_result.is_error
+    assert venom_result.output == manual_result.output
+
+
+@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
+def test_call_with_patches_empty_venom_manual_evm_parity():
+    """call_with_patches with no patches: both paths produce identical results."""
+    target = HexBytes("0x" + "c3" * 20)
+    template = bytes.fromhex("12345678") + b"\x00" * 64
+
+    p = Program().call_with_patches(target, template, [])
+    assert p.has_pending_venom_plan
+
+    venom_result = mini_evm(p.build() + RETURN_TOP)
+    manual_result = mini_evm(_manual_build(p) + RETURN_TOP)
+
+    assert not venom_result.is_error
+    assert not manual_result.is_error
+    assert venom_result.output == manual_result.output
+
+
+@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
+def test_call_with_patches_single_u256_venom_manual_evm_parity():
+    """Single uint256 patch: both paths agree on success flag after patching."""
+    target = HexBytes("0x" + "c4" * 20)
+    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
+    patch_val = 10**18
+
+    p = Program().push_u256(patch_val).call_with_patches(target, template, [(4, 32)])
+    assert p.has_pending_venom_plan
+
+    venom_result = mini_evm(p.build() + RETURN_TOP)
+    manual_result = mini_evm(_manual_build(p) + RETURN_TOP)
+
+    assert not venom_result.is_error
+    assert not manual_result.is_error
+    assert venom_result.output == manual_result.output
+
+
+@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
+def test_call_with_patches_two_patches_venom_manual_evm_parity():
+    """Two patches (uint256 + address): both paths agree on success flag."""
+    target = HexBytes("0x" + "c5" * 20)
+    template = bytes.fromhex("a9059cbb") + b"\x00" * 64
+    addr_val = int.from_bytes(HexBytes("0x" + "ab" * 20), "big")
+    amount_val = 999
+
+    p = Program().push_u256(addr_val).push_u256(amount_val).call_with_patches(target, template, [(4, 32), (36, 20)])
+    assert p.has_pending_venom_plan
+
+    venom_result = mini_evm(p.build() + RETURN_TOP)
+    manual_result = mini_evm(_manual_build(p) + RETURN_TOP)
+
+    assert not venom_result.is_error
+    assert not manual_result.is_error
+    assert venom_result.output == manual_result.output
