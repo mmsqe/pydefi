@@ -6,7 +6,7 @@ import pytest
 from hexbytes import HexBytes
 
 from pydefi.types import BasePool, RouteDAG, SwapProtocol, Token
-from pydefi.vm import Label, Program, Value, build_execution_program_for_dag, build_quote_program_for_dag
+from pydefi.vm import Program, Value, build_execution_program_for_dag, build_quote_program_for_dag
 from tests.conftest import mini_evm
 
 # Common test address — mini_evm makes any CALL succeed.
@@ -234,55 +234,6 @@ class TestAssert:
         p.assert_le(p.const(10), p.const(3))
         p.stop()
         _ = _run_assert_revert(p, disable_constant_folding=True)
-
-
-# ---------------------------------------------------------------------------
-# Control flow
-# ---------------------------------------------------------------------------
-
-
-class TestControlFlow:
-    def test_jump_unconditional(self):
-        p = Program()
-        end = p.label("end")
-        skipped = p.label("skipped")
-        p.jump(end)  # terminates entry block
-        # Body of skipped — never reached
-        p.goto(skipped)
-        p.return_word(p.const(99))
-        # Body of end
-        p.goto(end)
-        p.return_word(p.const(42))
-        assert _run_int(p) == 42
-
-    def test_branch_taken_true(self):
-        p = Program()
-        p.store_reg(0, p.const(1))
-        true_bb = p.label("true_branch")
-        false_bb = p.label("false_branch")
-        p.branch(p.load_reg(0), true=true_bb, false=false_bb)
-        p.goto(false_bb)
-        p.return_word(p.const(0))
-        p.goto(true_bb)
-        p.return_word(p.const(42))
-        assert _run_int(p, disable_constant_folding=True) == 42
-
-    def test_branch_taken_false(self):
-        p = Program()
-        p.store_reg(0, p.const(0))
-        true_bb = p.label("true_branch")
-        false_bb = p.label("false_branch")
-        p.branch(p.load_reg(0), true=true_bb, false=false_bb)
-        p.goto(false_bb)
-        p.return_word(p.const(7))
-        p.goto(true_bb)
-        p.return_word(p.const(42))
-        assert _run_int(p, disable_constant_folding=True) == 7
-
-    def test_label_returns_handle(self):
-        end = Program().label("end")
-        assert isinstance(end, Label)
-        assert end.name == "end"
 
 
 # ---------------------------------------------------------------------------

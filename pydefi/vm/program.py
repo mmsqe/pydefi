@@ -75,7 +75,7 @@ from vyper.evm.assembler.instructions import Label as _AsmLabel
 from vyper.evm.assembler.symbols import SYMBOL_SIZE
 from vyper.evm.opcodes import OPCODES
 from vyper.venom import generate_assembly_experimental, run_passes_on
-from vyper.venom.basicblock import IRBasicBlock, IRLabel, IRLiteral, IRVariable
+from vyper.venom.basicblock import IRLabel, IRLiteral, IRVariable
 from vyper.venom.builder import VenomBuilder
 from vyper.venom.context import IRContext
 
@@ -109,23 +109,6 @@ class Value:
 
     def __repr__(self) -> str:
         return f"Value({self._op!r})"
-
-
-class Label:
-    """Opaque handle to a basic block (jump target).
-
-    Created by :meth:`Program.label`.  Use :meth:`Program.jump`,
-    :meth:`Program.branch`, or :meth:`Program.goto` to direct control flow.
-    """
-
-    __slots__ = ("_bb", "name")
-
-    def __init__(self, bb: IRBasicBlock, name: str) -> None:
-        self._bb = bb
-        self.name = name
-
-    def __repr__(self) -> str:
-        return f"Label({self.name!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -726,43 +709,6 @@ class Program:
         b_op = self._to_operand(b)
         not_gt = self._builder.iszero(self._builder.gt(a_op, b_op))
         self.assert_(self._wrap(not_gt), msg)
-
-    # ------------------------------------------------------------------
-    # Control flow
-    # ------------------------------------------------------------------
-
-    def label(self, name: str) -> Label:
-        """Create a fresh basic block and return its :class:`Label`.
-
-        Does NOT switch the insertion point — call :meth:`goto` to start
-        emitting into the new block.  This separation lets you create a label
-        that you'll jump to from multiple places before populating its body.
-
-        The block is appended to the function immediately so that it can be
-        referenced by :meth:`jump` / :meth:`branch` before being populated.
-        """
-        bb = self._builder.create_block(name)
-        self._builder.append_block(bb)
-        return Label(bb, name)
-
-    def goto(self, target: Label) -> None:
-        """Switch the insertion point to *target*'s basic block.
-
-        The previously-current block must already be terminated (e.g. via
-        :meth:`jump`, :meth:`branch`, :meth:`stop`, …).
-        """
-        self._builder.set_block(target._bb)
-
-    def jump(self, target: Label) -> None:
-        """Terminate the current block with an unconditional ``jmp`` to *target*."""
-        self._builder.jmp(target._bb.label)
-
-    def branch(self, cond: ValueLike, *, true: Label, false: Label) -> None:
-        """Terminate the current block with conditional ``jnz``.
-
-        Jumps to *true* if ``cond != 0``, else to *false*.
-        """
-        self._builder.jnz(self._to_operand(cond), true._bb.label, false._bb.label)
 
     # ------------------------------------------------------------------
     # Termination
