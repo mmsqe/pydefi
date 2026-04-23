@@ -4,6 +4,7 @@ from hexbytes import HexBytes
 from pydefi.types import RouteDAG, Token
 from pydefi.vm import build_execution_program_for_dag, build_quote_program_for_dag
 from pydefi.vm.builder import (
+    _FRAGMENT_DATA_SRC_PLACEHOLDER,
     IRContext,
     IRLabel,
     Patch,
@@ -12,6 +13,7 @@ from pydefi.vm.builder import (
     _compile_venom_ctx,
     _pad32,
     _venom_alloc_and_copy,
+    compile_venom_call_contract_fragment,
     compile_venom_call_contract_probe,
     compile_venom_call_with_patches_probe,
     venom_is_available,
@@ -225,149 +227,33 @@ def test_call_contract_abi_patch_evm_behavior():
 
 
 # ---------------------------------------------------------------------------
-# Venom plan state introspection
+# Venom fragment compilation
 # ---------------------------------------------------------------------------
 
 
-def test_venom_program_plan_state_for_call_contract():
-    program = Program.create()
-    if not venom_is_available():
-        pytest.skip("Venom backend unavailable")
-
-    assert program.has_pending_venom_plan is False
-    assert program.pending_venom_plan_kind is None
-
-    program.call_contract(HexBytes("0x" + "9d" * 20), b"\x12\x34")
-    assert program.has_pending_venom_plan is True
-    assert program.pending_venom_plan_kind == "call_contract"
-
-
-def test_venom_program_plan_clears_when_mutated_after_call_contract():
-    program = Program.create()
-    if not venom_is_available():
-        pytest.skip("Venom backend unavailable")
-
-    program.call_contract(HexBytes("0x" + "9e" * 20), b"\x12\x34")
-    assert program.has_pending_venom_plan is True
-
-    # Trailing POP is now represented in the pending Venom plan.
-    program.pop()
-    assert program.has_pending_venom_plan is True
-    assert program.pending_venom_plan_kind == "call_contract"
-
-    # Any extra emission after planned call+pop forces materialization.
-    program.push_u256(1)
-    assert program.has_pending_venom_plan is False
-    assert program.pending_venom_plan_kind is None
-
-
-def test_venom_program_plan_state_for_empty_call_with_patches():
-    program = Program.create()
-    if not venom_is_available():
-        pytest.skip("Venom backend unavailable")
-
-    program.call_with_patches(HexBytes("0x" + "9f" * 20), b"\xaa\xbb", [])
-    assert program.has_pending_venom_plan is True
-    assert program.pending_venom_plan_kind == "call_with_patches"
-
-
-def test_venom_program_plan_for_stack_literal_patch_case():
-    program = Program.create()
-    if not venom_is_available():
-        pytest.skip("Venom backend unavailable")
-
-    # push_u256 now emits directly to _buf, so _is_pristine() is False when
-    # call_with_patches is reached — Venom plan is not set; CODECOPY fallback runs.
-    # Use a valid patch descriptor (offset=28, size=4 → mstore_off=0).
-    calldata = b"\xaa\xbb\xcc\xdd" + b"\x00" * 28  # 32-byte calldata
-    program.push_u256(123).call_with_patches(HexBytes("0x" + "90" * 20), calldata, [(28, 4)])
-    assert program.has_pending_venom_plan is False
-    assert program.pending_venom_plan_kind is None
-
-
-def test_venom_program_no_plan_for_mismatched_stack_literal_patch_case():
-    program = Program.create()
-    if not venom_is_available():
-        pytest.skip("Venom backend unavailable")
-
-    # push_u256 emits directly, so _is_pristine() is False — Venom plan not set.
-    # Use a valid patch descriptor (offset=28, size=4 → mstore_off=0).
-    calldata = b"\xaa\xbb\xcc\xdd" + b"\x00" * 28  # 32-byte calldata
-    program.push_u256(1).push_u256(2).call_with_patches(HexBytes("0x" + "91" * 20), calldata, [(28, 4)])
-    assert program.has_pending_venom_plan is False
-    assert program.pending_venom_plan_kind is None
-
-
-# ---------------------------------------------------------------------------
-# Venom vs manual EVM behavioral parity
-# ---------------------------------------------------------------------------
-
-
-def _manual_build(p: Program) -> bytes:
-    """Return the bytecode for *p* forced through the manual materialization path.
-
-    ``build()`` leaves the pending plan intact when Venom succeeds, so we can
-    snapshot and materialize without disturbing the original program.
-    """
-    snap = Program._snapshot(p)
-    snap._materialize_plan_to_manual()
-    return snap.build()
+@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
+def test_venom_fragment_strips_return_and_finds_placeholder():
+    """compile_venom_call_contract_fragment strips RETURN, leaves CALL as last instruction."""
+    target = HexBytes("0x" + "9d" * 20)
+    calldata = b"\x12\x34\x56\x78"
+    code_frag, fixup_pos = compile_venom_call_contract_fragment(target, calldata)
+    # Fragment must end with CALL opcode (0xF1).
+    assert code_frag[-1] == 0xF1, f"expected CALL (0xF1) at end, got 0x{code_frag[-1]:02x}"
+    # Fixup position points to 4 zeroed bytes (placeholder for data section offset).
+    assert code_frag[fixup_pos : fixup_pos + 4] == b"\x00\x00\x00\x00"
+    # Original sentinel must not appear in fragment (was zeroed out).
+    ph_bytes = _FRAGMENT_DATA_SRC_PLACEHOLDER.to_bytes(4, "big")
+    assert ph_bytes not in bytes(code_frag)
 
 
 @pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_call_contract_venom_manual_evm_parity():
-    """Venom-compiled and manual call_contract produce identical EVM results."""
-    target = HexBytes("0x" + "c1" * 20)
-    calldata = bytes.fromhex("a9059cbb") + b"\x00" * 64
-
-    p = Program().call_contract(target, calldata)
-    assert p.has_pending_venom_plan
-
-    venom_bytecode = p.build()
-    manual_bytecode = _manual_build(p)
-
-    assert venom_bytecode != manual_bytecode, "expected bytecodes to differ in structure"
-
-    venom_result = mini_evm(venom_bytecode + RETURN_TOP)
-    manual_result = mini_evm(manual_bytecode + RETURN_TOP)
-
-    assert not venom_result.is_error
-    assert not manual_result.is_error
-    assert venom_result.output == manual_result.output
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_call_contract_no_require_success_venom_manual_evm_parity():
-    """require_success=False: both paths leave the raw success flag on stack."""
-    target = HexBytes("0x" + "c2" * 20)
-    calldata = b"\xde\xad\xbe\xef"
-
-    p = Program().call_contract(target, calldata, require_success=False)
-    assert p.has_pending_venom_plan
-
-    venom_result = mini_evm(p.build() + RETURN_TOP)
-    manual_result = mini_evm(_manual_build(p) + RETURN_TOP)
-
-    assert not venom_result.is_error
-    assert not manual_result.is_error
-    assert venom_result.output == manual_result.output
-
-
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
-def test_call_with_patches_empty_venom_manual_evm_parity():
-    """call_with_patches with no patches: both paths produce identical results."""
-    target = HexBytes("0x" + "c3" * 20)
-    template = bytes.fromhex("12345678") + b"\x00" * 64
-
-    p = Program().call_with_patches(target, template, [])
-    assert p.has_pending_venom_plan
-
-    venom_result = mini_evm(p.build() + RETURN_TOP)
-    manual_result = mini_evm(_manual_build(p) + RETURN_TOP)
-
-    assert not venom_result.is_error
-    assert not manual_result.is_error
-    assert venom_result.output == manual_result.output
+def test_venom_fragment_evm_behavior():
+    """call_contract via Venom fragment leaves success on stack and does not error."""
+    target = HexBytes("0x" + "9e" * 20)
+    calldata = b"\x12\x34\x56\x78"
+    result = mini_evm(Program().call_contract(target, calldata).pop().build())
+    assert not result.is_error
+    assert result.output == b""
 
 
 @pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")

@@ -172,8 +172,7 @@ two separate destinations using arithmetic and composition::
 from __future__ import annotations
 
 import struct
-from copy import deepcopy
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from eth_abi.abi import encode_with_hooks
 
@@ -217,7 +216,6 @@ from pydefi.vm.program import (
     patch_value,
     pop,
     push_addr,
-    push_bytes,
     push_u256,
     ret_slice,
     ret_u256,
@@ -357,7 +355,6 @@ class Program:
         self._fixups: list[tuple[int, str]] = []  # (u16 offset in _buf, label name)
         self._data_sections: list[bytes] = []  # raw data appended after code at build time
         self._data_fixups: list[tuple[int, int]] = []  # (u32 offset in _buf, data_section_index)
-        self._venom_plan: dict[str, object] | None = None
 
     @classmethod
     def create(cls) -> "Program":
@@ -369,8 +366,6 @@ class Program:
     # ------------------------------------------------------------------
 
     def _emit(self, data: bytes) -> "Program":
-        if self._venom_plan is not None:
-            self._materialize_plan_to_manual()
         self._buf.extend(data)
         return self
 
@@ -383,109 +378,7 @@ class Program:
         snap._fixups.extend(source._fixups)
         snap._data_sections.extend(source._data_sections)
         snap._data_fixups.extend(source._data_fixups)
-        snap._venom_plan = deepcopy(source._venom_plan)
         return snap
-
-    def _is_pristine(self) -> bool:
-        return (
-            len(self._buf) == 0
-            and not self._labels
-            and not self._fixups
-            and not self._data_sections
-            and not self._data_fixups
-        )
-
-    @property
-    def has_pending_venom_plan(self) -> bool:
-        """Return True if this program is pending Venom-plan compilation."""
-        return self._venom_plan is not None
-
-    @property
-    def pending_venom_plan_kind(self) -> str | None:
-        """Return the pending plan kind, or None when no Venom plan is active."""
-        if self._venom_plan is None:
-            return None
-        kind = self._venom_plan.get("kind")
-        return str(kind) if kind is not None else None
-
-    def _build_venom_plan(self) -> bytes | None:
-        """Compile the pending Venom plan via the Venom backend; return None for unknown kinds."""
-        plan = self._venom_plan
-        if plan is None:
-            return None
-        kind = plan.get("kind")
-        to = cast(Address, plan["to"])
-        calldata = cast(bytes, plan["calldata"])
-        value = cast(int, plan["value"])
-        gas = cast(int, plan["gas"])
-        require_success = cast(bool, plan["require_success"])
-        return_success = not bool(plan.get("drop_result"))
-        if kind == "call_contract":
-            return compile_venom_call_contract_probe(
-                to,
-                calldata,
-                value=value,
-                gas=gas,
-                require_success=require_success,
-                return_success=return_success,
-            )
-        if kind == "call_with_patches":
-            return compile_venom_call_with_patches_probe(
-                to,
-                calldata,
-                patches=cast(list[tuple[int, int]], plan["patches"]),
-                patch_values=cast(list[int], plan["patch_values"]),
-                value=value,
-                gas=gas,
-                require_success=require_success,
-                return_success=return_success,
-            )
-        return None
-
-    def _emit_call_tail(self, to: Address, value: int, gas: int, require_success: bool, drop_result: bool) -> None:
-        self._buf.extend(push_u256(value))
-        self._buf.extend(push_addr(to))
-        self._buf.extend(gas_opcode() if gas == 0 else push_u256(gas))
-        self._buf.extend(call(require_success))
-        if drop_result:
-            self._buf.extend(pop())
-
-    def _materialize_plan_to_manual(self) -> None:
-        if self._venom_plan is None:
-            return
-        plan = self._venom_plan
-        self._venom_plan = None
-        kind = plan.get("kind")
-        to = cast(Address, plan["to"])
-        value = cast(int, plan["value"])
-        gas = cast(int, plan["gas"])
-        require_success = cast(bool, plan["require_success"])
-        drop_result = bool(plan.get("drop_result"))
-        if kind == "call_contract":
-            calldata = cast(bytes, plan["calldata"])
-            self._buf.extend(push_u256(0))
-            self._buf.extend(push_u256(0))
-            self._buf.extend(push_bytes(calldata))
-            self._emit_call_tail(to, value, gas, require_success, drop_result)
-            return
-        if kind == "call_with_patches":
-            calldata = cast(bytes, plan["calldata"])
-            patches = cast(list[tuple[int, int]], plan["patches"])
-            patch_values = plan.get("patch_values")
-            if isinstance(patch_values, list):
-                for pv in reversed(patch_values):
-                    self._buf.extend(push_u256(int(pv)))
-            self._buf.extend(push_bytes(calldata))
-            for offset, size in patches:
-                if not (0 < size <= 32):
-                    raise ValueError(f"call_with_patches: patch size {size!r} not supported; expected 0 < size <= 32")
-                self._buf.extend(bytes([0x90]))  # SWAP1
-                self._buf.extend(bytes([0x91]))  # SWAP2
-                self._buf.extend(patch_value(offset, size))
-            self._buf.extend(bytes([0x90, 0x60, 0x00, 0x90, 0x60, 0x00, 0x92]))
-            self._emit_call_tail(to, value, gas, require_success, drop_result)
-            return
-        raise ValueError(f"unknown venom plan kind: {kind!r}")
 
     # ------------------------------------------------------------------
     # Label management
@@ -513,16 +406,12 @@ class Program:
         """Emit PUSH_U256."""
         if n < 0:
             raise ValueError(f"push_u256: value must be non-negative, got {n}")
-        if self._venom_plan is not None:
-            self._materialize_plan_to_manual()
         return self._emit(push_u256(n))
 
     def push_addr(self, a: Address) -> "Program":
         """Emit PUSH_ADDR."""
         if len(a) != 20:
             raise ValueError(f"push_addr: bad address length: {a!r}")
-        if self._venom_plan is not None:
-            self._materialize_plan_to_manual()
         return self._emit(push_addr(a))
 
     def push_bytes(self, data: bytes) -> "Program":
@@ -556,10 +445,6 @@ class Program:
         """
         if len(data) > 0xFFFF:
             raise ValueError(f"push_bytes: data too large ({len(data)} bytes, max 65535)")
-        # Flush any pending Venom state so the data section + CODECOPY sequence
-        # is emitted in the correct order (after any preceding pushes).
-        if self._venom_plan is not None:
-            self._materialize_plan_to_manual()
         blen = len(data)
         blen_padded = (blen + 31) & ~31
 
@@ -613,12 +498,6 @@ class Program:
 
     def pop(self) -> "Program":
         """Emit POP."""
-        if self._venom_plan is not None and self._venom_plan.get("kind") in {
-            "call_contract",
-            "call_with_patches",
-        }:
-            self._venom_plan["drop_result"] = True
-            return self
         return self._emit(pop())
 
     def load_reg(self, i: int) -> "Program":
@@ -935,29 +814,60 @@ class Program:
         Returns:
             ``self`` for chaining.
         """
-        if self._venom_plan is None and self._is_pristine():
-            self._venom_plan = {
-                "kind": "call_contract",
-                "to": to,
-                "calldata": bytes(calldata),
-                "value": value,
-                "gas": gas,
-                "require_success": require_success,
-                "drop_result": False,
-            }
-            return self
-
-        if self._venom_plan is not None:
-            self._materialize_plan_to_manual()
-        return (
-            self._emit(push_u256(0))  # retSize
-            ._emit(push_u256(0))  # retOffset
-            .push_bytes(calldata)  # argsOffset (TOS), argsLen — CODECOPY via Program.push_bytes
-            ._emit(push_u256(value))
-            ._emit(push_addr(to))
-            ._emit(gas_opcode() if gas == 0 else push_u256(gas))
-            ._emit(call(require_success))
+        if not venom_is_available():
+            return (
+                self._emit(push_u256(0))  # retSize
+                ._emit(push_u256(0))  # retOffset
+                .push_bytes(calldata)  # argsOffset (TOS), argsLen — CODECOPY via Program.push_bytes
+                ._emit(push_u256(value))
+                ._emit(push_addr(to))
+                ._emit(gas_opcode() if gas == 0 else push_u256(gas))
+                ._emit(call(require_success))
+            )
+        code_frag, fixup_pos = compile_venom_call_contract_fragment(
+            to,
+            calldata,
+            value=value,
+            gas=gas,
         )
+        # Fragment ends at CALL — success flag is already on the EVM stack.
+        blen_padded = (len(calldata) + 31) & ~31
+        data = calldata.ljust(blen_padded, b"\x00") if blen_padded > len(calldata) else bytes(calldata)
+        ds_index = len(self._data_sections)
+        self._data_sections.append(data)
+        base = len(self._buf)
+        self._buf.extend(code_frag)
+        self._data_fixups.append((base + fixup_pos, ds_index))
+        if require_success:
+            # Inline revert-on-failure (15 bytes, absolute PUSH2 jumps).
+            # Stack entering check: [success]
+            #   DUP1 ISZERO PUSH2<revert> JUMPI PUSH2<skip> JUMP
+            #   JUMPDEST PUSH0 DUP1 REVERT JUMPDEST
+            pos = len(self._buf)
+            revert_addr = pos + 10  # JUMPDEST of revert block
+            skip_addr = pos + 14  # JUMPDEST after revert block
+            self._buf.extend(
+                bytes(
+                    [
+                        0x80,  # DUP1
+                        0x15,  # ISZERO
+                        0x61,
+                        revert_addr >> 8,
+                        revert_addr & 0xFF,  # PUSH2 <revert_addr>
+                        0x57,  # JUMPI
+                        0x61,
+                        skip_addr >> 8,
+                        skip_addr & 0xFF,  # PUSH2 <skip_addr>
+                        0x56,  # JUMP
+                        0x5B,  # JUMPDEST (revert)
+                        0x5F,  # PUSH0
+                        0x80,  # DUP1
+                        0xFD,  # REVERT
+                        0x5B,  # JUMPDEST (skip)
+                    ]
+                )
+            )
+        return self
 
     def call_contract_abi(
         self,
@@ -1149,23 +1059,10 @@ class Program:
         Raises:
             ValueError: If any patch *size* is not in the range ``(0, 32]``.
         """
-        if self._venom_plan is None and self._is_pristine() and not patches:
-            self._venom_plan = {
-                "kind": "call_with_patches",
-                "to": to,
-                "calldata": bytes(calldata),
-                "patches": [],
-                "patch_values": [],
-                "value": value,
-                "gas": gas,
-                "require_success": require_success,
-                "drop_result": False,
-            }
-            return self
+        if not patches:
+            return self.call_contract(to, calldata, value=value, gas=gas, require_success=require_success)
 
-        if self._venom_plan is not None:
-            self._materialize_plan_to_manual()
-
+        # Non-empty patches: values come from the EVM stack at runtime — manual path.
         # Push calldata buffer; patch values remain below it on the stack.
         # Stack: [argsOffset(TOS), argsLen(2nd), val1(3rd), …, valN(2+N)]
         self.push_bytes(calldata)  # CODECOPY via Program.push_bytes
@@ -1209,13 +1106,8 @@ class Program:
         Returns:
             ``self`` for chaining.
         """
-        # Flush self's pending Venom state into _buf first so bytes stay in order.
-        if self._venom_plan is not None:
-            self._materialize_plan_to_manual()
         # Snapshot other so extend() never mutates its argument.
         src = Program._snapshot(other)
-        if src._venom_plan is not None:
-            src._materialize_plan_to_manual()
         # Pre-validate label collisions before mutating internal state to
         # avoid leaving this Program instance in a partially-updated state.
         for name in src._labels:
@@ -1285,13 +1177,6 @@ class Program:
         Raises :exc:`ValueError` if any label referenced in a jump has not
         been defined, or if a label's target offset does not fit in 16 bits.
         """
-        if self._venom_plan is not None:
-            result = self._build_venom_plan()
-            assert result is not None, (
-                "unknown _venom_plan kind; only call_contract and call_with_patches are supported"
-            )
-            return result
-
         buf = bytearray(self._buf)
         for fixup_offset, name in self._fixups:
             if name not in self._labels:
@@ -1302,7 +1187,10 @@ class Program:
             struct.pack_into(">H", buf, fixup_offset, target)
         # Patch CODECOPY source offsets: each data section starts immediately
         # after the code section, with sections laid out consecutively.
+        # A STOP (0x00) byte is inserted before data so execution never falls
+        # into raw calldata bytes if the program has no explicit terminator.
         if self._data_fixups:
+            buf.append(0x00)  # STOP
             code_end = len(buf)
             section_starts: list[int] = []
             pos = code_end
@@ -1325,10 +1213,6 @@ class Program:
 
     def __len__(self) -> int:
         """Return the current (unresolved) byte length of the program."""
-        if self._venom_plan is not None:
-            snap = Program._snapshot(self)
-            snap._materialize_plan_to_manual()
-            return len(snap._buf)
         return len(self._buf)
 
     def __repr__(self) -> str:
@@ -1381,6 +1265,136 @@ def _compile_venom_ctx(ctx: IRContext) -> bytes:  # type: ignore[name-defined]
     asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)  # type: ignore[misc,attr-defined]
     bytecode, _ = generate_bytecode(asm)  # type: ignore[misc]
     return bytecode
+
+
+#: Sentinel value used as the CODECOPY src placeholder in Venom fragment IR.
+#: After compilation, the emitted PUSH4/PUSH32 carrying this value is detected
+#: and replaced with ``\x00\x00\x00\x00`` so Program._data_fixups can patch it
+#: at build() time with the actual absolute data section offset.
+_FRAGMENT_DATA_SRC_PLACEHOLDER: int = 0xDEAD_BEEF
+
+
+def _venom_alloc_copy_fragment(builder: "VenomBuilder", blen_padded: int) -> Any:  # type: ignore[name-defined]
+    """Like _venom_alloc_and_copy but uses a sentinel constant for the CODECOPY src.
+
+    No data section is created in the IRContext.  The sentinel is detected and
+    replaced in _extract_fragment_and_fixup so Program._data_fixups can supply
+    the real offset at build() time.
+    """
+    fp = builder.mload(0x40)
+    default_fp = builder.mul(builder.iszero(fp), 0x280)
+    base_fp = builder.or_(fp, default_fp)
+    builder.codecopy(base_fp, _FRAGMENT_DATA_SRC_PLACEHOLDER, blen_padded)
+    builder.mstore(0x40, builder.add(base_fp, blen_padded))
+    return base_fp
+
+
+def _extract_fragment_and_fixup(code_bytes: bytes) -> tuple[bytearray, int]:
+    """Strip the trailing MSTORE+RETURN sequence from Venom output and locate the CODECOPY placeholder.
+
+    The fragment is compiled with ``require_success=False``, so Venom terminates with:
+
+        mstore(0, success)   →  PUSH0 MSTORE  or  PUSH1 0x00 MSTORE
+        return_(0, 32)       →  PUSH1 0x20 PUSH0 RETURN  or  PUSH1 0x20 PUSH1 0x00 RETURN
+
+    Stripping this suffix leaves ``CALL`` as the last instruction, so the EVM
+    success flag stays on the stack after the fragment executes.
+
+    The placeholder ``_FRAGMENT_DATA_SRC_PLACEHOLDER`` (0xDEADBEEF) is located as
+    either PUSH4 (0x63) or PUSH32 (0x7f) immediate, replaced with ``\\x00\\x00\\x00\\x00``
+    so ``Program._data_fixups`` can patch the actual data-section offset at build() time.
+
+    Returns:
+        (code_frag, fixup_pos) where fixup_pos is the byte index of the 4-byte
+        placeholder within code_frag (already zeroed).
+
+    Raises:
+        RuntimeError: If the expected suffix or sentinel placeholder is not found.
+    """
+    buf = bytearray(code_bytes)
+    # Venom always appends a fallback revert block (JUMPDEST PUSH0 DUP1 REVERT = 5B 5F 80 FD)
+    # after RETURN, even when require_success is not used.  Strip the full trailing sequence:
+    #   mstore(0, success)  +  return_(0, 32)  +  fallback-revert-block
+    # Venom may emit PUSH0 (0x5F) or PUSH1 0x00 (0x60 0x00) for zero operands.
+    _REVERT_TAIL = bytes([0x5B, 0x5F, 0x80, 0xFD])  # JUMPDEST PUSH0 DUP1 REVERT
+    _RETURN_SUFFIXES = (
+        bytes([0x5F, 0x52, 0x60, 0x20, 0x5F, 0xF3]) + _REVERT_TAIL,  # PUSH0 MSTORE PUSH1 32 PUSH0 RETURN
+        bytes([0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3])
+        + _REVERT_TAIL,  # PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+        bytes([0x5F, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3]) + _REVERT_TAIL,  # PUSH0 MSTORE PUSH1 32 PUSH1 0 RETURN
+        bytes([0x60, 0x00, 0x52, 0x60, 0x20, 0x5F, 0xF3]) + _REVERT_TAIL,  # PUSH1 0 MSTORE PUSH1 32 PUSH0 RETURN
+    )
+    code = bytes(buf)
+    stripped = False
+    for suffix in _RETURN_SUFFIXES:
+        if code.endswith(suffix):
+            buf = buf[: -len(suffix)]
+            stripped = True
+            break
+    if not stripped:
+        raise RuntimeError(f"_extract_fragment_and_fixup: unrecognised MSTORE+RETURN suffix: {code[-8:].hex()}")
+    # Find and zero the CODECOPY sentinel placeholder.
+    ph_bytes = _FRAGMENT_DATA_SRC_PLACEHOLDER.to_bytes(4, "big")  # DE AD BE EF
+    push4_pat = bytes([0x63]) + ph_bytes
+    idx = bytes(buf).find(push4_pat)
+    if idx != -1:
+        fixup_pos = idx + 1
+        buf[fixup_pos : fixup_pos + 4] = b"\x00\x00\x00\x00"
+        return buf, fixup_pos
+    push32_pat = bytes([0x7F]) + bytes(28) + ph_bytes
+    idx = bytes(buf).find(push32_pat)
+    if idx != -1:
+        fixup_pos = idx + 29
+        buf[fixup_pos : fixup_pos + 4] = b"\x00\x00\x00\x00"
+        return buf, fixup_pos
+    raise RuntimeError(f"_extract_fragment_and_fixup: CODECOPY placeholder 0x{ph_bytes.hex()} not found in fragment")
+
+
+def compile_venom_call_contract_fragment(
+    to: Address,
+    calldata: bytes,
+    *,
+    value: int = 0,
+    gas: int = 0,
+) -> tuple[bytes, int]:
+    """Compile a composable Venom call fragment for use in Program.call_contract.
+
+    Unlike compile_venom_call_contract_probe, this function produces a fragment
+    (no RETURN terminator, no data section) that can be embedded inside a larger
+    Program.  The CODECOPY src uses a sentinel constant (_FRAGMENT_DATA_SRC_PLACEHOLDER)
+    instead of a label-relative offset; the caller registers the calldata as a
+    data section and records a fixup so build() patches the correct offset.
+
+    The trailing ``MSTORE(0, success) + RETURN`` generated by Venom is stripped by
+    ``_extract_fragment_and_fixup``.  After stripping, ``CALL`` is the last instruction
+    so the EVM success flag is left on the stack for the caller.
+
+    ``require_success`` checking is intentionally omitted here — Program.call_contract
+    emits a compact inline revert block when ``require_success=True``.
+
+    Returns:
+        (code_frag, fixup_pos): code_frag ends at CALL with success on EVM stack;
+        fixup_pos is the byte index of the 4-byte placeholder for the data section offset.
+    """
+    _require_venom_imports()
+    blen = len(calldata)
+    blen_padded = (blen + 31) & ~31
+    ctx = IRContext()  # type: ignore[operator]
+    fn = ctx.create_function("main")
+    ctx.entry_function = fn
+    builder = VenomBuilder(ctx, fn)  # type: ignore[operator]
+    base_fp = _venom_alloc_copy_fragment(builder, blen_padded)
+    gas_operand = builder.gas() if gas == 0 else gas
+    to_int = int.from_bytes(bytes(to), "big")
+    success = builder.call(gas_operand, to_int, value, base_fp, blen, 0, 0)
+    # Always skip require_success inside Venom — Program.call_contract handles it inline
+    # so the fragment stays composable (no revert block appended after RETURN).
+    builder.mstore(0, success)  # type: ignore[arg-type]
+    builder.return_(0, 32)  # type: ignore[arg-type]  # stripped by _extract_fragment_and_fixup
+    code_bytes = _compile_venom_ctx(ctx)
+    code_frag, fixup_pos = _extract_fragment_and_fixup(code_bytes)
+    # After stripping, CALL is the last instruction: success is left on the EVM stack.
+    return bytes(code_frag), fixup_pos
 
 
 def _venom_alloc_and_copy(builder: VenomBuilder, label: IRLabel, blen_padded: int) -> Any:  # type: ignore[name-defined]
