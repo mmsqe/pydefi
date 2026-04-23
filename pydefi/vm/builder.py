@@ -815,31 +815,28 @@ class Program:
         self._buf.extend(code_frag)
         self._data_fixups.append((base + fixup_pos, ds_index))
         if require_success:
-            # Inline revert-on-failure (15 bytes, absolute PUSH2 jumps).
+            # Inline revert-on-failure (11 bytes, PC-relative jump).
+            # Mirrors the pattern used by program.call() so the check stays correct
+            # after Program.compose() shifts code offsets.
             # Stack entering check: [success]
-            #   DUP1 ISZERO PUSH2<revert> JUMPI PUSH2<skip> JUMP
-            #   JUMPDEST PUSH0 DUP1 REVERT JUMPDEST
-            pos = len(self._buf)
-            revert_addr = pos + 10  # JUMPDEST of revert block
-            skip_addr = pos + 14  # JUMPDEST after revert block
+            #   DUP1 PC PUSH1 9 ADD JUMPI → jump to JUMPDEST if success≠0
+            #   PUSH1 0 DUP1 REVERT       ← taken when success=0
+            #   JUMPDEST                  ← success=1 lands here; [success] remains
+            # PC is at byte 1; JUMPDEST is at byte 10; distance = 9.
             self._buf.extend(
                 bytes(
                     [
                         0x80,  # DUP1
-                        0x15,  # ISZERO
-                        0x61,
-                        revert_addr >> 8,
-                        revert_addr & 0xFF,  # PUSH2 <revert_addr>
-                        0x57,  # JUMPI
-                        0x61,
-                        skip_addr >> 8,
-                        skip_addr & 0xFF,  # PUSH2 <skip_addr>
-                        0x56,  # JUMP
-                        0x5B,  # JUMPDEST (revert)
-                        0x5F,  # PUSH0
+                        0x58,  # PC
+                        0x60,
+                        0x09,  # PUSH1 9
+                        0x01,  # ADD  → PC+9 = abs position of JUMPDEST
+                        0x57,  # JUMPI  (jump if success≠0)
+                        0x60,
+                        0x00,  # PUSH1 0
                         0x80,  # DUP1
                         0xFD,  # REVERT
-                        0x5B,  # JUMPDEST (skip)
+                        0x5B,  # JUMPDEST
                     ]
                 )
             )

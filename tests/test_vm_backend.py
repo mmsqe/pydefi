@@ -247,6 +247,30 @@ def test_venom_fragment_evm_behavior():
     assert result.output == b""
 
 
+def test_call_contract_composed_require_success_pc_relative():
+    """require_success check uses PC-relative jumps and stays correct after compose."""
+    target = HexBytes("0x" + "9f" * 20)
+    calldata = b"\x12\x34\x56\x78"
+    # Compose: push_u256 preamble + call_contract.  The preamble shifts the
+    # require_success block away from offset 0 — absolute addresses would break.
+    preamble = Program().push_u256(42)
+    call_prog = Program().call_contract(target, calldata).pop()
+    result = mini_evm((preamble + call_prog)._emit(RETURN_TOP).build())
+    assert not result.is_error
+    assert int.from_bytes(result.output, "big") == 42
+
+
+def test_call_contract_two_calls_composed_require_success():
+    """Two consecutive call_contracts in one program: both require_success checks fire."""
+    t1 = HexBytes("0x" + "a1" * 20)
+    t2 = HexBytes("0x" + "a2" * 20)
+    result = mini_evm(
+        Program().call_contract(t1, b"\x11\x22\x33\x44").pop().call_contract(t2, b"\x55\x66\x77\x88").pop().build()
+    )
+    assert not result.is_error
+    assert result.output == b""
+
+
 def test_call_with_patches_single_u256_venom_manual_evm_parity():
     """Single uint256 patch: both paths agree on success flag after patching."""
     target = HexBytes("0x" + "c4" * 20)
