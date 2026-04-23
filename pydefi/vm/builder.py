@@ -183,6 +183,16 @@ from eth_contract.contract import ContractFunction
 from hexbytes import HexBytes
 from vyper.compiler.phases import generate_bytecode
 from vyper.compiler.settings import OptimizationLevel, VenomOptimizationFlags
+from vyper.evm.assembler.instructions import (
+    CONST,
+    DATA_ITEM,
+    PUSH_OFST,
+    PUSHLABEL,
+    DataHeader,
+    Label,
+)
+from vyper.evm.assembler.symbols import SYMBOL_SIZE
+from vyper.evm.opcodes import OPCODES
 from vyper.venom import generate_assembly_experimental, run_passes_on
 from vyper.venom.basicblock import IRLabel
 from vyper.venom.builder import VenomBuilder
@@ -191,12 +201,8 @@ from vyper.venom.context import IRContext
 from pydefi.types import Address
 from pydefi.vm.abi import emit_abi_encode, emit_abi_encode_packed
 from pydefi.vm.program import (
-    _DUP3,
-    _PUSH4,
-    OP_CODECOPY,
     OP_JUMPDEST,
     REQUIRE_SUCCESS_BLOCK,
-    _push_imm,
     add,
     assert_ge,
     assert_le,
@@ -210,7 +216,6 @@ from pydefi.vm.program import (
     dup,
     dup_n,
     eq,
-    fp_init,
     gas_opcode,
     gt,
     iszero,
@@ -388,7 +393,10 @@ class Program:
         self._labels: dict[str, int] = {}
         self._fixups: list[tuple[int, str]] = []  # (u16 offset in _buf, label name)
         self._data_sections: list[bytes] = []  # raw data appended after code at build time
-        self._data_fixups: list[tuple[int, int]] = []  # (u32 offset in _buf, data_section_index)
+        # (offset in _buf, data_section_index, fixup_size_bytes) — fixup_size is
+        # 4 for hand-rolled push_bytes (PUSH4 placeholder) and SYMBOL_SIZE for
+        # Venom-emitted PUSH_OFST placeholders.
+        self._data_fixups: list[tuple[int, int, int]] = []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -449,25 +457,13 @@ class Program:
         Unlike the standalone :func:`~pydefi.vm.program.push_bytes` which embeds
         data inline as ``PUSH32``/``MSTORE`` chains, this version appends *data*
         as a data section after the code and emits a single ``CODECOPY`` sequence.
-        The code overhead is ~32 bytes regardless of data size, making it O(1)
-        in bytecode growth for the code section.
+        The code overhead is constant (~30 bytes) regardless of data size, making
+        it O(1) in bytecode growth for the code section.
 
-        CODECOPY sequence emitted (~ 32 bytes fixed overhead):
-
-        .. code-block:: text
-
-            fp_init()                    # → [base_fp]
-            PUSH<n> blen_padded          # [blen_padded, base_fp]
-            PUSH4 <code_offset>          # [code_offset, blen_padded, base_fp]  ← fixup at build()
-            DUP3                         # [base_fp, code_offset, blen_padded, base_fp]
-            CODECOPY                     # mem[base_fp..+blen_padded] = code[code_offset..]; [base_fp]
-            DUP1                         # [base_fp, base_fp]
-            PUSH<n> blen_padded          # [blen_padded, base_fp, base_fp]
-            ADD                          # [new_fp, base_fp]
-            PUSH1 0x40                   # [0x40, new_fp, base_fp]
-            MSTORE                       # mem[0x40] = new_fp; [base_fp]
-            PUSH<n> blen                 # [blen, base_fp]
-            SWAP1                        # [base_fp=argsOffset, blen=argsLen]
+        Implementation: the CODECOPY sequence is compiled by Venom — see
+        :func:`compile_venom_push_bytes_fragment`.  The Venom fragment uses an
+        :class:`IRLabel` placeholder for the data-section source operand, which
+        :meth:`build` patches with the actual absolute offset.
 
         The *data* in the appended section is zero-padded to a 32-byte boundary
         so that the copied region is fully initialised.
@@ -481,32 +477,12 @@ class Program:
         ds_index = len(self._data_sections)
         self._data_sections.append(data.ljust(blen_padded, b"\x00") if blen_padded > blen else data)
 
-        # Emit CODECOPY sequence.
-        # Step 1: compute base_fp (free-memory pointer, defaulting to 0x280).
-        self._buf.extend(fp_init())
-
-        # Step 2: push CODECOPY arguments — size, then src offset (fixup), then dest (DUP3).
-        imm_padded = _push_imm(blen_padded)
-        self._buf.extend(imm_padded)  # PUSH<n> blen_padded  (size)
-        self._buf.append(_PUSH4)  # PUSH4 opcode
-        fixup_pos = len(self._buf)  # position of the 4-byte placeholder
-        self._buf.extend(b"\x00\x00\x00\x00")  # placeholder for code_offset
-        self._buf.append(_DUP3)  # DUP3 → base_fp as destOffset
-        self._buf.append(OP_CODECOPY)  # CODECOPY(dest=base_fp, src=code_offset, size=blen_padded)
-
-        self._data_fixups.append((fixup_pos, ds_index))
-
-        # Step 3: advance free-memory pointer by blen_padded.
-        self._buf.append(0x80)  # DUP1
-        self._buf.extend(imm_padded)  # PUSH<n> blen_padded
-        self._buf.append(0x01)  # ADD
-        self._buf.extend(b"\x60\x40")  # PUSH1 0x40
-        self._buf.append(0x52)  # MSTORE — mem[0x40] = new_fp; [base_fp]
-
-        # Step 4: leave [argsOffset(TOS), argsLen(below)].
-        self._buf.extend(_push_imm(blen))  # PUSH<n> blen
-        self._buf.append(0x90)  # SWAP1 → [base_fp=argsOffset, blen=argsLen]
-
+        # Compile via Venom and splice the fragment in; record a fixup so build()
+        # patches the data-section offset into the placeholder.
+        code_frag, fixup_pos = compile_venom_push_bytes_fragment(blen)
+        base = len(self._buf)
+        self._buf.extend(code_frag)
+        self._data_fixups.append((base + fixup_pos, ds_index, SYMBOL_SIZE))
         return self
 
     def dup(self) -> "Program":
@@ -856,7 +832,8 @@ class Program:
         self._data_sections.append(data)
         base = len(self._buf)
         self._buf.extend(code_frag)
-        self._data_fixups.append((base + fixup_pos, ds_index))
+        # SYMBOL_SIZE-byte fixup: Venom emits PUSH<SYMBOL_SIZE> for label-resolved offsets.
+        self._data_fixups.append((base + fixup_pos, ds_index, SYMBOL_SIZE))
         if require_success:
             # Append the same PC-relative revert block used by program.call(require_success=True).
             # PC-relative so the check stays correct after Program.compose() shifts code offsets.
@@ -1115,8 +1092,8 @@ class Program:
         for fixup_off, name in src._fixups:
             self._fixups.append((fixup_off + buf_offset, name))
         self._data_sections.extend(src._data_sections)
-        for fixup_pos, ds_idx in src._data_fixups:
-            self._data_fixups.append((fixup_pos + buf_offset, ds_idx + ds_offset))
+        for fixup_pos, ds_idx, fixup_size in src._data_fixups:
+            self._data_fixups.append((fixup_pos + buf_offset, ds_idx + ds_offset, fixup_size))
         return self
 
     def __add__(self, other: "Program") -> "Program":
@@ -1205,8 +1182,13 @@ class Program:
         for ds in self._data_sections:
             section_starts.append(pos)
             pos += len(ds)
-        for fixup_pos, ds_idx in self._data_fixups:
-            struct.pack_into(">I", buf, fixup_pos, section_starts[ds_idx])
+        for fixup_pos, ds_idx, fixup_size in self._data_fixups:
+            target = section_starts[ds_idx]
+            if target >> (fixup_size * 8) != 0:
+                raise ValueError(
+                    f"Program: data-section offset {target} does not fit in {fixup_size}-byte fixup at {fixup_pos}"
+                )
+            buf[fixup_pos : fixup_pos + fixup_size] = target.to_bytes(fixup_size, "big")
         for ds in self._data_sections:
             buf.extend(ds)
         # Wrap in _BuiltBytecode so any `+` concatenation raises and forces the
@@ -1235,116 +1217,190 @@ class Program:
 # ---------------------------------------------------------------------------
 
 
-def _pad32(data: bytes) -> bytes:
-    """Return *data* zero-padded to the next 32-byte boundary."""
-    return data.ljust((len(data) + 31) & ~31, b"\x00")
+#: Name used for the dummy data-section IRLabel that holds the CODECOPY source
+#: placeholder.  Each compile uses a fresh IRLabel object so multiple fragments
+#: in the same process never alias.
+_FRAGMENT_PLACEHOLDER_LABEL_NAME: str = "pydefi_call_data_placeholder"
 
 
-def _compile_venom_ctx(ctx: IRContext) -> bytes:
-    """Run the standard Venom pipeline on *ctx* and return the compiled bytecode."""
-    flags = VenomOptimizationFlags(  # type: ignore[call-arg]
-        level=OptimizationLevel.NONE,  # type: ignore[attr-defined]
-        disable_mem2var=True,
-        disable_load_elimination=True,
-        disable_dead_store_elimination=True,
-    )
-    run_passes_on(ctx, flags, disable_mem_checks=True)  # type: ignore[misc]
-    asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.NONE)  # type: ignore[misc,attr-defined]
-    bytecode, _ = generate_bytecode(asm)  # type: ignore[misc]
-    return bytecode
+def _asm_item_size(item: object) -> int:
+    """Return the byte size that *item* contributes when assembled to EVM bytecode.
+
+    Mirrors :func:`vyper.evm.assembler.core._assembly_to_evm` for the asm item
+    types Venom emits in our IR.  Used by :func:`_locate_push_ofst` to compute
+    byte positions without re-assembling.
+    """
+    if item == "DEBUG" or isinstance(item, (CONST, DataHeader)):
+        return 0
+    if isinstance(item, PUSHLABEL):
+        return 1 + SYMBOL_SIZE
+    if isinstance(item, Label):
+        return 1  # JUMPDEST
+    if isinstance(item, PUSH_OFST):
+        if isinstance(item.label, Label):
+            return 1 + SYMBOL_SIZE
+        # CONSTREF PUSH_OFST has variable length (depends on the const value);
+        # we never emit it, but raise loudly if Venom ever does.
+        raise NotImplementedError(f"_asm_item_size: CONSTREF PUSH_OFST not supported: {item!r}")
+    if isinstance(item, int):
+        return 1
+    if isinstance(item, str):
+        up = item.upper()
+        if up.startswith("PUSH") and up != "PUSH":
+            return 1  # opcode byte; immediates are separate int items in the asm list
+        if up.startswith("DUP") or up.startswith("SWAP"):
+            return 1
+        if up in OPCODES:
+            return 1
+        raise ValueError(f"_asm_item_size: unrecognised asm string item: {item!r}")
+    if isinstance(item, DATA_ITEM):
+        if isinstance(item.data, bytes):
+            return len(item.data)
+        if isinstance(item.data, Label):
+            return SYMBOL_SIZE
+        raise ValueError(f"_asm_item_size: unrecognised DATA_ITEM payload: {item.data!r}")
+    raise ValueError(f"_asm_item_size: unknown asm item type: {type(item).__name__}")
 
 
-#: Sentinel value used as the CODECOPY src placeholder in Venom fragment IR.
-#: After compilation, the emitted PUSH4/PUSH32 carrying this value is detected
-#: and replaced with ``\x00\x00\x00\x00`` so Program._data_fixups can patch it
-#: at build() time with the actual absolute data section offset.
-_FRAGMENT_DATA_SRC_PLACEHOLDER: int = 0xDEAD_BEEF
+def _locate_push_ofst(asm: list, target_label: IRLabel) -> int:
+    """Return the byte offset of the ``PUSH_OFST(target_label, 0)`` immediate.
+
+    Scans *asm* once, tracking the byte position that each item will occupy in
+    the final bytecode.  Returns the position of the immediate (i.e. the byte
+    just after the ``PUSH<SYMBOL_SIZE>`` opcode), which is where
+    :meth:`Program.build` will patch the resolved data-section offset.
+
+    Matches by label *name* — Venom asm wraps :class:`IRLabel` names in the
+    assembler-level :class:`vyper.evm.assembler.instructions.Label` type, so
+    object identity / ``==`` between the two doesn't hold; the underlying
+    string name is the stable identifier.
+
+    Raises:
+        RuntimeError: If zero or more than one matching PUSH_OFST is found.
+    """
+    target_name = target_label.value
+    pos = 0
+    found = -1
+    for item in asm:
+        if (
+            isinstance(item, PUSH_OFST)
+            and isinstance(item.label, Label)
+            and item.label.label == target_name
+        ):
+            if found != -1:
+                raise RuntimeError(
+                    f"_locate_push_ofst: multiple PUSH_OFST({target_name!r}) found in asm "
+                    f"(first at byte {found}, second at byte {pos + 1})"
+                )
+            found = pos + 1  # +1 to skip the PUSH<SYMBOL_SIZE> opcode byte
+        pos += _asm_item_size(item)
+    if found < 0:
+        raise RuntimeError(f"_locate_push_ofst: PUSH_OFST({target_name!r}) not found in asm")
+    return found
 
 
-def _venom_alloc_copy_fragment(builder: VenomBuilder, blen_padded: int) -> Any:
-    """Like _venom_alloc_and_copy but uses a sentinel constant for the CODECOPY src.
+def _venom_alloc_copy_fragment(
+    builder: VenomBuilder,
+    blen_padded: int,
+    placeholder_label: IRLabel,
+) -> Any:
+    """Emit fp_init + CODECOPY-from-*placeholder_label* + advance FP into *builder*.
 
-    No data section is created in the IRContext.  The sentinel is detected and
-    replaced in _extract_fragment_and_fixup so Program._data_fixups can supply
-    the real offset at build() time.
+    *placeholder_label* must already be registered as a data section in the
+    enclosing IRContext so Venom can resolve ``builder.offset(0, label)``.
     """
     fp = builder.mload(0x40)  # type: ignore[arg-type]
     default_fp = builder.mul(builder.iszero(fp), 0x280)
     base_fp = builder.or_(fp, default_fp)
-    builder.codecopy(base_fp, _FRAGMENT_DATA_SRC_PLACEHOLDER, blen_padded)
+    data_src = builder.offset(0, placeholder_label)
+    builder.codecopy(base_fp, data_src, blen_padded)
     builder.mstore(0x40, builder.add(base_fp, blen_padded))  # type: ignore[arg-type]
     return base_fp
 
 
-def _extract_fragment_and_fixup(code_bytes: bytes) -> tuple[bytearray, int]:
-    """Truncate Venom output after CALL and zero the CODECOPY sentinel placeholder.
+_OP_CALL: int = 0xF1
+_OP_REVERT: int = 0xFD
 
-    Walks the bytecode opcode-by-opcode (correctly skipping ``PUSH<n>``
-    immediates) to locate two positions:
 
-    1. The unique ``CALL`` instruction — the fragment is truncated at
-       ``call_pos + 1`` so the EVM success flag is left on the stack.
-       Everything Venom appends afterwards (``mstore(0, success)``,
-       ``return_(0, 32)``, fallback revert block) is discarded.
-    2. The ``PUSH4`` / ``PUSH32`` whose immediate matches
-       ``_FRAGMENT_DATA_SRC_PLACEHOLDER`` — the 4-byte payload is zeroed so
-       ``Program._data_fixups`` can patch the actual data-section offset at
-       build() time.
+def _compile_fragment_ctx(
+    ctx: IRContext,
+    placeholder_label: IRLabel,
+    truncate_opcode: int,
+    truncate_mode: str,
+    *,
+    fragment_name: str,
+) -> tuple[bytes, int]:
+    """Compile *ctx* with Venom and extract a composable fragment.
 
-    Opcode walking — rather than naive byte search or hand-coded suffix
-    patterns — avoids false matches inside ``PUSH`` literals (the target
-    address may contain 0xF1, the calldata may contain 0xDEADBEEF) and
-    tolerates Venom layout changes in the trailing epilogue.
+    Runs the Venom pipeline, locates the ``PUSH_OFST(placeholder_label, 0)``
+    immediate via the asm list, truncates the bytecode at *truncate_opcode*
+    using *truncate_mode*, and zeros the SYMBOL_SIZE-byte placeholder so the
+    caller's :class:`Program._data_fixups` can patch it at build() time.
 
-    Returns:
-        (code_frag, fixup_pos) where fixup_pos is the byte index of the 4-byte
-        placeholder within code_frag (already zeroed).
+    Shared helper for :func:`compile_venom_call_contract_fragment` and
+    :func:`compile_venom_push_bytes_fragment` — they only differ in IR
+    construction and the truncation anchor.
+
+    Venom optimization is enabled (``OptimizationLevel.GAS``).  The fragment
+    extraction is layout-agnostic — the placeholder is found by label name
+    via the asm walk in :func:`_locate_push_ofst`, and truncation anchors on
+    the unique CALL/REVERT opcode rather than fixed byte patterns — so any
+    instruction reordering the optimizer performs is safe.
+    """
+    flags = VenomOptimizationFlags(  # type: ignore[call-arg]
+        level=OptimizationLevel.GAS,  # type: ignore[attr-defined]
+    )
+    run_passes_on(ctx, flags, disable_mem_checks=True)  # type: ignore[misc]
+    asm = generate_assembly_experimental(ctx, optimize=OptimizationLevel.GAS)  # type: ignore[misc,attr-defined]
+    bytecode, _ = generate_bytecode(asm)  # type: ignore[misc]
+
+    fixup_pos = _locate_push_ofst(asm, placeholder_label)
+    code_frag = _truncate_at_opcode(bytecode, truncate_opcode, mode=truncate_mode)
+    if fixup_pos + SYMBOL_SIZE > len(code_frag):
+        raise RuntimeError(
+            f"{fragment_name}: PUSH_OFST at byte {fixup_pos} falls past the truncated code length ({len(code_frag)})"
+        )
+    code_frag[fixup_pos : fixup_pos + SYMBOL_SIZE] = b"\x00" * SYMBOL_SIZE
+    return bytes(code_frag), fixup_pos
+
+
+def _truncate_at_opcode(code_bytes: bytes, opcode: int, *, mode: str) -> bytearray:
+    """Truncate *code_bytes* at an opcode boundary.
+
+    Walks opcodes (correctly skipping ``PUSH<n>`` immediates) so an ``opcode``
+    byte that appears inside a PUSH literal is not mistaken for an instruction.
+
+    Args:
+        opcode: The opcode byte to anchor on (e.g. 0xF1 for CALL, 0xFD for REVERT).
+        mode: ``"after_last"`` keeps everything up to and including the last
+            occurrence of *opcode*; ``"before_first"`` keeps everything up to
+            but **excluding** the first occurrence.
 
     Raises:
-        RuntimeError: If CALL or the sentinel placeholder is not found, or if
-            the sentinel appears after CALL (would indicate a layout we don't
-            understand).
+        RuntimeError: If no instance of *opcode* is found.
+        ValueError: If *mode* is unrecognised.
     """
-    OP_CALL = 0xF1
-    OP_PUSH4 = 0x63
-    OP_PUSH32 = 0x7F
-    sentinel = _FRAGMENT_DATA_SRC_PLACEHOLDER.to_bytes(4, "big")
-
-    call_pos = -1
-    fixup_pos = -1
+    if mode not in ("after_last", "before_first"):
+        raise ValueError(f"_truncate_at_opcode: bad mode {mode!r}")
     n = len(code_bytes)
+    last = -1
+    first = -1
     i = 0
     while i < n:
         op = code_bytes[i]
-        if op == OP_CALL:
-            call_pos = i
+        if op == opcode:
+            if first == -1:
+                first = i
+            last = i
             i += 1
         elif 0x60 <= op <= 0x7F:  # PUSH1..PUSH32
-            imm = op - 0x5F
-            if op == OP_PUSH4 and code_bytes[i + 1 : i + 5] == sentinel:
-                fixup_pos = i + 1
-            elif (
-                op == OP_PUSH32 and code_bytes[i + 1 : i + 29] == bytes(28) and code_bytes[i + 29 : i + 33] == sentinel
-            ):
-                fixup_pos = i + 29
-            i += 1 + imm
+            i += 1 + (op - 0x5F)
         else:
             i += 1
-
-    if call_pos < 0:
-        raise RuntimeError("_extract_fragment_and_fixup: CALL opcode not found in fragment")
-    if fixup_pos < 0:
-        raise RuntimeError(
-            f"_extract_fragment_and_fixup: CODECOPY placeholder 0x{sentinel.hex()} not found in fragment"
-        )
-    if fixup_pos > call_pos:
-        raise RuntimeError(
-            f"_extract_fragment_and_fixup: sentinel at byte {fixup_pos} appears after CALL at byte {call_pos}"
-        )
-
-    buf = bytearray(code_bytes[: call_pos + 1])
-    buf[fixup_pos : fixup_pos + 4] = b"\x00\x00\x00\x00"
-    return buf, fixup_pos
+    anchor = last if mode == "after_last" else first
+    if anchor < 0:
+        raise RuntimeError(f"_truncate_at_opcode: opcode 0x{opcode:02x} not found in compiled fragment")
+    return bytearray(code_bytes[: anchor + 1] if mode == "after_last" else code_bytes[:anchor])
 
 
 def compile_venom_call_contract_fragment(
@@ -1356,22 +1412,35 @@ def compile_venom_call_contract_fragment(
 ) -> tuple[bytes, int]:
     """Compile a composable Venom call fragment for use in Program.call_contract.
 
-    Unlike compile_venom_call_contract_probe, this function produces a fragment
-    (no RETURN terminator, no data section) that can be embedded inside a larger
-    Program.  The CODECOPY src uses a sentinel constant (_FRAGMENT_DATA_SRC_PLACEHOLDER)
-    instead of a label-relative offset; the caller registers the calldata as a
-    data section and records a fixup so build() patches the correct offset.
+    Produces a code fragment ending at ``CALL`` (success on the EVM stack) with
+    the CODECOPY source operand emitted as a Venom-resolved label reference
+    (``PUSH<SYMBOL_SIZE>``).  The placeholder bytes are zeroed in the returned
+    fragment so :class:`Program._data_fixups` can patch the actual data-section
+    offset at build() time.
 
-    The trailing ``MSTORE(0, success) + RETURN`` generated by Venom is stripped by
-    ``_extract_fragment_and_fixup``.  After stripping, ``CALL`` is the last instruction
-    so the EVM success flag is left on the stack for the caller.
+    Implementation:
 
-    ``require_success`` checking is intentionally omitted here — Program.call_contract
-    emits a compact inline revert block when ``require_success=True``.
+    1. Register a dummy data section in the IRContext under a fresh
+       :class:`IRLabel`; its content is irrelevant — only its label is used as
+       a resolution target by ``builder.offset(0, label)``.
+    2. Emit the fp_init / CODECOPY / CALL sequence; Venom resolves the
+       PUSH_OFST(label, 0) operand at compile time.
+    3. After compilation, locate the resolved PUSH_OFST in the asm by walking
+       the asm list (tracking byte positions exactly as
+       :func:`vyper.evm.assembler.core._assembly_to_evm` does) and zero the
+       SYMBOL_SIZE-byte immediate.
+    4. Truncate everything after the last CALL — the
+       ``mstore(0, success); return_(0, 32)`` epilogue and Venom's fallback
+       revert block are discarded along with the dummy data section.
+
+    ``require_success`` checking is intentionally omitted; Program.call_contract
+    appends a PC-relative revert block when require_success=True so the
+    fragment itself stays compose-friendly.
 
     Returns:
-        (code_frag, fixup_pos): code_frag ends at CALL with success on EVM stack;
-        fixup_pos is the byte index of the 4-byte placeholder for the data section offset.
+        (code_frag, fixup_pos): code_frag ends at CALL with success on the
+        EVM stack; fixup_pos is the byte index of the SYMBOL_SIZE-byte
+        placeholder for the data-section offset.
     """
     if len(to) != 20:
         raise ValueError(f"bad address length: {to!r}")
@@ -1381,164 +1450,98 @@ def compile_venom_call_contract_fragment(
         raise ValueError(f"gas must be non-negative, got {gas}")
     blen = len(calldata)
     blen_padded = (blen + 31) & ~31
+
     ctx = IRContext()  # type: ignore[operator]
+    placeholder_label = IRLabel(_FRAGMENT_PLACEHOLDER_LABEL_NAME, is_symbol=True)  # type: ignore[operator]
+    ctx.append_data_section(placeholder_label)
+    # Dummy payload — content doesn't matter, only the label position does.
+    # Use a single byte so Venom emits a small data section that gets truncated
+    # off along with the post-CALL epilogue.
+    ctx.append_data_item(b"\x00")
+
     fn = ctx.create_function("main")
     ctx.entry_function = fn
     builder = VenomBuilder(ctx, fn)  # type: ignore[operator]
-    base_fp = _venom_alloc_copy_fragment(builder, blen_padded)
+    base_fp = _venom_alloc_copy_fragment(builder, blen_padded, placeholder_label)
     gas_operand = builder.gas() if gas == 0 else gas
     to_int = int.from_bytes(bytes(to), "big")
     success = builder.call(gas_operand, to_int, value, base_fp, blen, 0, 0)
-    # Always skip require_success inside Venom — Program.call_contract handles it inline
-    # so the fragment stays composable (no revert block appended after RETURN).
+    # Force a basic-block terminator so Venom doesn't insert one we'd have to guess at.
     builder.mstore(0, success)  # type: ignore[arg-type]
-    builder.return_(0, 32)  # type: ignore[arg-type]  # stripped by _extract_fragment_and_fixup
-    code_bytes = _compile_venom_ctx(ctx)
-    code_frag, fixup_pos = _extract_fragment_and_fixup(code_bytes)
-    # After stripping, CALL is the last instruction: success is left on the EVM stack.
-    return bytes(code_frag), fixup_pos
+    builder.return_(0, 32)  # type: ignore[arg-type]  # truncated by _extract_fragment
+
+    return _compile_fragment_ctx(
+        ctx,
+        placeholder_label,
+        _OP_CALL,
+        "after_last",
+        fragment_name="compile_venom_call_contract_fragment",
+    )
 
 
-def _venom_alloc_and_copy(builder: VenomBuilder, label: IRLabel, blen_padded: int) -> Any:
-    """Emit fp_init + CODECOPY from *label* into memory[base_fp..+blen_padded], advance FP.
+#: Name used for the dummy data-section IRLabel that holds the push_bytes
+#: CODECOPY source placeholder.  Distinct from _FRAGMENT_PLACEHOLDER_LABEL_NAME
+#: so the two fragments are unambiguous if they ever co-exist in one IRContext.
+_PUSH_BYTES_PLACEHOLDER_LABEL_NAME: str = "pydefi_push_bytes_placeholder"
 
-    Returns the ``base_fp`` SSA value for use in subsequent builder instructions.
+
+def compile_venom_push_bytes_fragment(blen: int) -> tuple[bytes, int]:
+    """Compile a composable Venom push_bytes fragment for use in Program.push_bytes.
+
+    Produces a code fragment that, when executed, copies ``blen_padded`` bytes
+    from the program's data section into free memory and leaves
+    ``[argsOffset(TOS), argsLen]`` on the EVM stack — same stack effect as the
+    hand-rolled version.  The CODECOPY src operand is emitted via a Venom
+    ``PUSH_OFST(label, 0)``; the placeholder bytes are zeroed in the returned
+    fragment so :class:`Program._data_fixups` can patch the actual data-section
+    offset at build() time.
+
+    Truncation strategy: Venom requires a basic-block terminator, so we emit
+    ``revert(base_fp, blen)`` whose lowering is::
+
+        PUSH blen          # second arg (length)
+        PUSH base_fp       # first arg (offset, TOS)
+        REVERT
+
+    The fragment is then truncated **before** the first ``REVERT`` opcode,
+    which discards the REVERT instruction itself but preserves the two PUSHes
+    on the stack — yielding ``[base_fp(=argsOffset, TOS), blen(=argsLen)]``,
+    exactly the contract the caller expects.  Venom's fallback revert block
+    appears later in the output and is also discarded by the truncation.
+
+    Args:
+        blen: Logical length of the data (not zero-padded).
+
+    Returns:
+        (code_frag, fixup_pos): code_frag ends just before the REVERT opcode
+        with [argsOffset, argsLen] on the EVM stack; fixup_pos is the byte
+        index of the SYMBOL_SIZE-byte placeholder for the data-section offset.
     """
-    fp = builder.mload(0x40)
-    default_fp = builder.mul(builder.iszero(fp), 0x280)
-    base_fp = builder.or_(fp, default_fp)
-    data_src = builder.offset(0, label)
-    builder.codecopy(base_fp, data_src, blen_padded)
-    builder.mstore(0x40, builder.add(base_fp, blen_padded))
-    return base_fp
-
-
-def compile_venom_call_contract_probe(
-    to: Address,
-    calldata: bytes,
-    *,
-    value: int = 0,
-    gas: int = 0,
-    require_success: bool = True,
-    return_success: bool = True,
-) -> bytes:
-    """Compile a Venom runtime that executes CALL with static calldata.
-
-    The calldata is stored in a Venom readonly data section and copied into
-    memory via ``dloadbytes`` before CALL. The runtime returns the CALL success
-    flag as a 32-byte word.
-    """
-    if len(to) != 20:
-        raise ValueError(f"call_contract_probe: bad address length: {to!r}")
-    if value < 0:
-        raise ValueError(f"call_contract_probe: value must be non-negative, got {value}")
-    if gas < 0:
-        raise ValueError(f"call_contract_probe: gas must be non-negative, got {gas}")
-    if len(calldata) > 0xFFFF:
-        raise ValueError(f"call_contract_probe: calldata too large ({len(calldata)} bytes, max 65535)")
-
-    blen = len(calldata)
+    if blen < 0:
+        raise ValueError(f"compile_venom_push_bytes_fragment: blen must be non-negative, got {blen}")
+    if blen > 0xFFFF:
+        raise ValueError(f"compile_venom_push_bytes_fragment: blen too large ({blen} bytes, max 65535)")
     blen_padded = (blen + 31) & ~31
 
     ctx = IRContext()  # type: ignore[operator]
-    call_payload_label = IRLabel("pydefi_call_payload", is_symbol=True)  # type: ignore[operator]
-    ctx.append_data_section(call_payload_label)
-    ctx.append_data_item(_pad32(calldata))
+    placeholder_label = IRLabel(_PUSH_BYTES_PLACEHOLDER_LABEL_NAME, is_symbol=True)  # type: ignore[operator]
+    ctx.append_data_section(placeholder_label)
+    ctx.append_data_item(b"\x00")  # dummy; truncated off
 
     fn = ctx.create_function("main")
     ctx.entry_function = fn
     builder = VenomBuilder(ctx, fn)  # type: ignore[operator]
+    base_fp = _venom_alloc_copy_fragment(builder, blen_padded, placeholder_label)
+    # revert(offset, length) lowers to PUSH length; PUSH offset; REVERT.
+    # Truncating before REVERT leaves the two PUSHes' values on the stack.
+    builder.revert(base_fp, blen)  # type: ignore[arg-type]
 
-    base_fp = _venom_alloc_and_copy(builder, call_payload_label, blen_padded)
-
-    gas_operand = builder.gas() if gas == 0 else gas
-    to_int = int.from_bytes(bytes(to), "big")
-    success = builder.call(gas_operand, to_int, value, base_fp, blen, 0, 0)
-    if require_success:
-        builder.assert_(success)
-
-    if return_success:
-        builder.mstore(0, success)
-        builder.return_(0, 32)
-    else:
-        builder.return_(0, 0)
-
-    return _compile_venom_ctx(ctx)
+    return _compile_fragment_ctx(
+        ctx,
+        placeholder_label,
+        _OP_REVERT,
+        "before_first",
+        fragment_name="compile_venom_push_bytes_fragment",
+    )
 
 
-def compile_venom_call_with_patches_probe(
-    to: Address,
-    calldata: bytes,
-    *,
-    patches: list[tuple[int, int]],
-    patch_values: list[int],
-    value: int = 0,
-    gas: int = 0,
-    require_success: bool = True,
-    return_success: bool = True,
-) -> bytes:
-    """Compile a Venom runtime that applies multiple calldata patches before CALL.
-
-    Each patch/value pair is applied in order using the same MSTORE target rule
-    as ``patch_value`` in the manual builder:
-
-    ``mstore_ptr = argsOffset + (offset + size - 32)``
-    """
-    if len(to) != 20:
-        raise ValueError(f"call_with_patches_probe: bad address length: {to!r}")
-    if len(patches) != len(patch_values):
-        raise ValueError(
-            f"call_with_patches_probe: patches/value count mismatch: {len(patches)} patch(es), "
-            f"{len(patch_values)} value(s)"
-        )
-    if any(v < 0 for v in patch_values):
-        raise ValueError("call_with_patches_probe: patch values must be non-negative")
-    if value < 0:
-        raise ValueError(f"call_with_patches_probe: value must be non-negative, got {value}")
-    if gas < 0:
-        raise ValueError(f"call_with_patches_probe: gas must be non-negative, got {gas}")
-    if len(calldata) > 0xFFFF:
-        raise ValueError(f"call_with_patches_probe: calldata too large ({len(calldata)} bytes, max 65535)")
-
-    normalized_offsets: list[int] = []
-    for offset, size in patches:
-        if not (0 < size <= 32):
-            raise ValueError(f"call_with_patches_probe: patch size {size!r} not supported; expected 0 < size <= 32")
-        mstore_off = offset + size - 32
-        if mstore_off < 0:
-            raise ValueError(
-                f"call_with_patches_probe: offset {offset} is too small for size {size}; "
-                f"MSTORE target {mstore_off} would be negative"
-            )
-        normalized_offsets.append(mstore_off)
-
-    blen = len(calldata)
-    blen_padded = (blen + 31) & ~31
-
-    ctx = IRContext()  # type: ignore[operator]
-    patches_payload_label = IRLabel("pydefi_patches_payload", is_symbol=True)  # type: ignore[operator]
-    ctx.append_data_section(patches_payload_label)
-    ctx.append_data_item(_pad32(calldata))
-
-    fn = ctx.create_function("main")
-    ctx.entry_function = fn
-    builder = VenomBuilder(ctx, fn)  # type: ignore[operator]
-
-    base_fp = _venom_alloc_and_copy(builder, patches_payload_label, blen_padded)
-
-    for mstore_off, pv in zip(normalized_offsets, patch_values):
-        builder.mstore(builder.add(base_fp, mstore_off), pv)
-
-    gas_operand = builder.gas() if gas == 0 else gas
-    to_int = int.from_bytes(bytes(to), "big")
-    success = builder.call(gas_operand, to_int, value, base_fp, blen, 0, 0)
-    if require_success:
-        builder.assert_(success)
-
-    if return_success:
-        builder.mstore(0, success)
-        builder.return_(0, 32)
-    else:
-        builder.return_(0, 0)
-
-    return _compile_venom_ctx(ctx)

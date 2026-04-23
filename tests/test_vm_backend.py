@@ -5,21 +5,20 @@ from hexbytes import HexBytes
 
 from pydefi.types import BasePool, RouteDAG, SwapProtocol, Token
 from pydefi.vm import build_execution_program_for_dag, build_quote_program_for_dag
-from pydefi.vm.builder import (
-    _FRAGMENT_DATA_SRC_PLACEHOLDER,
-    IRContext,
-    IRLabel,
-    Patch,
-    Program,
-    VenomBuilder,
+from vyper.evm.assembler.symbols import SYMBOL_SIZE
+from vyper.venom.basicblock import IRLabel
+from vyper.venom.builder import VenomBuilder
+from vyper.venom.context import IRContext
+
+from pydefi.vm.builder import Patch, Program, compile_venom_call_contract_fragment
+from pydefi.vm.program import add, pop
+from tests._venom_probes import (
     _compile_venom_ctx,
     _pad32,
     _venom_alloc_and_copy,
-    compile_venom_call_contract_fragment,
     compile_venom_call_contract_probe,
     compile_venom_call_with_patches_probe,
 )
-from pydefi.vm.program import add, pop
 from tests.conftest import RETURN_TOP, mini_evm
 
 # ---------------------------------------------------------------------------
@@ -203,8 +202,8 @@ class TestCallContract:
     def test_fragment_ends_with_call_opcode(self):
         code_frag, fixup_pos = compile_venom_call_contract_fragment(self.TARGET, self.CALLDATA)
         assert code_frag[-1] == 0xF1, f"expected CALL (0xF1), got 0x{code_frag[-1]:02x}"
-        assert code_frag[fixup_pos : fixup_pos + 4] == b"\x00\x00\x00\x00"
-        assert _FRAGMENT_DATA_SRC_PLACEHOLDER.to_bytes(4, "big") not in bytes(code_frag)
+        # SYMBOL_SIZE-byte placeholder zeroed by build()-time fixup.
+        assert code_frag[fixup_pos : fixup_pos + SYMBOL_SIZE] == b"\x00" * SYMBOL_SIZE
 
     def test_require_success_pc_relative_after_compose(self):
         """require_success JUMPI stays correct when call_contract is shifted by a preamble."""
