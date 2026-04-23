@@ -274,57 +274,57 @@ class TestCallContract:
 
 
 # ---------------------------------------------------------------------------
-# call_contract_abi (ABI-encoded calldata builder)
+# Template-based ABI calldata
 # ---------------------------------------------------------------------------
 
 
-class TestCallContractAbi:
-    """``call_contract_abi`` is a one-shot wrapper kept for convenience; for
-    repeated calls with the same signature prefer :meth:`Program.template`
-    (see tests/test_program_templates.py)."""
+class TestCallWithTemplate:
+    """Build calldata via :meth:`Program.template` and pass the resulting
+    :class:`CalldataPayload` to :meth:`call_contract`. Covers static args,
+    runtime :class:`Value` placeholders, and the optional ``function`` keyword.
+    """
 
     def test_static_args_no_patches(self):
         p = Program()
-        success = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, 10**18)
+        xfer = p.template("transfer(address to, uint256 amount)")
+        success = p.call_contract(_TARGET, xfer(to=_TARGET, amount=10**18))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_function_keyword_optional(self):
         p = Program()
-        s1 = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, 1)
-        p.assert_(s1)
-        s2 = p.call_contract_abi(_TARGET, "function transfer(address,uint256)", _TARGET, 2)
-        p.return_word(s2)
+        bare = p.template("transfer(address to, uint256 amount)")
+        qualified = p.template("function transfer(address to, uint256 amount)")
+        assert bare.signature == qualified.signature
+        p.assert_(p.call_contract(_TARGET, bare(to=_TARGET, amount=1)))
+        s = p.call_contract(_TARGET, qualified(to=_TARGET, amount=2))
+        p.return_word(s)
         assert _run_int(p) == 1
 
     def test_no_args(self):
         p = Program()
-        # Template equivalent: p.template("ping()")() — no-arg signatures
-        # produce a selector-only 4-byte payload with no patches.
-        success = p.call_contract_abi(_TARGET, "ping()")
+        ping = p.template("ping()")
+        success = p.call_contract(_TARGET, ping())
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_value_placeholder_uint256(self):
-        # Runtime Value placeholder via call_contract_abi — kept for coverage
-        # of the encode_with_hooks path.
         p = Program()
         amount = p.const(0xDEADBEEF)
-        success = p.call_contract_abi(_TARGET, "set(uint256)", amount)
+        set_tmpl = p.template("set(uint256 v)")
+        success = p.call_contract(_TARGET, set_tmpl(v=amount))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_value_placeholder_address(self):
         p = Program()
         addr = p.addr(_TARGET)
-        success = p.call_contract_abi(_TARGET, "ping(address)", addr)
+        ping = p.template("ping(address a)")
+        success = p.call_contract(_TARGET, ping(a=addr))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_mixed_static_and_value(self):
-        # Migrated to the template API: recipient is a static literal, amount
-        # is a runtime Value. The template form is equivalent and reads more
-        # naturally than positional args threaded through call_contract_abi.
         p = Program()
         amount = p.const(7)
         xfer = p.template("transfer(address to, uint256 amount)")
@@ -334,8 +334,9 @@ class TestCallContractAbi:
 
     def test_arity_mismatch_rejected(self):
         p = Program()
-        with pytest.raises(ValueError, match="expected 2"):
-            p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET)
+        xfer = p.template("transfer(address,uint256)")
+        with pytest.raises(TypeError, match="takes 2 positional argument"):
+            xfer(_TARGET)
 
 
 # ---------------------------------------------------------------------------
