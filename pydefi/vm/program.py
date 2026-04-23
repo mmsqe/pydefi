@@ -164,6 +164,200 @@ class _ValuePlaceholder:
         return _ABI_PLACEHOLDERS.get(self.abi_type, 0)
 
 
+class _SlotRecorder:
+    """Encoding-time hook that records the calldata offset of a named slot
+    (without holding a runtime value). Used by :class:`CalldataTemplate` to
+    build a parameter-name → offset map once at template construction time.
+    """
+
+    __slots__ = ("abi_type", "offset")
+
+    def __init__(self, abi_type: str) -> None:
+        self.abi_type = abi_type
+        self.offset: int | None = None
+
+    def __call__(self, ctx: "EncodingContext") -> object:
+        self.offset = 4 + ctx.offset
+        return _ABI_PLACEHOLDERS.get(self.abi_type, 0)
+
+
+class CalldataPayload:
+    """Bundled ``(blob, patches)`` pair produced by :class:`CalldataTemplate`.
+
+    :meth:`Program.call_contract` accepts this in place of a raw ``bytes``
+    payload: the blob goes through the normal data-section + CODECOPY path
+    (with dedup) and the patches are MSTORE'd over the 32-byte slots.
+    """
+
+    __slots__ = ("blob", "patches")
+
+    def __init__(self, blob: bytes, patches: "dict[int, ValueLike]") -> None:
+        self.blob = blob
+        self.patches = patches
+
+
+class CalldataTemplate:
+    """Reusable ABI calldata template.
+
+    Build once from a signature, invoke many times with different argument
+    values. Each invocation produces a :class:`CalldataPayload` whose blob
+    bytes are identical across invocations (the parameter slots hold zero
+    placeholders) — :class:`Program`'s blob dedup cache reuses one data
+    section across every invocation of the same template.
+
+    Example::
+
+        xfer = p.template("transfer(address,uint256)")
+        for recipient, amount in rows:
+            p.call_contract(weth, xfer(recipient, amount))
+    """
+
+    __slots__ = ("_signature", "_param_types", "_param_names", "_blob", "_name_to_offset")
+
+    def __init__(self, signature: str, names: "list[str] | None" = None) -> None:
+        normalised = signature if signature.lstrip().startswith("function ") else "function " + signature
+        fn = ContractFunction.from_abi(normalised)
+        self._signature = fn.signature
+        self._param_types: list[str] = list(fn.input_types)
+
+        # Prefer names from the ABI sig (Solidity style:
+        # ``transfer(address to, uint256 amount)``); fall back to *names*
+        # kwarg; else the params are positional-only.
+        abi_names = [inp.get("name") or "" for inp in fn.abi["inputs"]]
+        if names is not None:
+            if len(names) != len(self._param_types):
+                raise ValueError(f"template: {len(self._param_types)} parameters but {len(names)} names provided")
+            self._param_names: list[str] = list(names)
+        elif all(abi_names):
+            self._param_names = abi_names
+        else:
+            self._param_names = []
+
+        # Pre-encode a zero-template and capture per-param byte offsets.
+        recorders = [_SlotRecorder(t) for t in self._param_types]
+        encoded = encode_with_hooks(self._param_types, recorders)
+        self._blob = bytes(fn.selector) + encoded
+        self._name_to_offset: dict[str, int] = {}
+        for i, rec in enumerate(recorders):
+            if rec.offset is None:
+                raise ValueError(
+                    f"template: failed to record offset for parameter {i} "
+                    f"({self._param_types[i]}) in signature {signature!r} — "
+                    "dynamic types are not yet supported"
+                )
+            if self._param_names:
+                self._name_to_offset[self._param_names[i]] = rec.offset
+
+    @property
+    def signature(self) -> str:
+        return self._signature
+
+    @property
+    def param_types(self) -> "list[str]":
+        return list(self._param_types)
+
+    @property
+    def param_names(self) -> "list[str]":
+        return list(self._param_names)
+
+    def __call__(self, *args: "ValueLike", **kwargs: "ValueLike") -> CalldataPayload:
+        n = len(self._param_types)
+        if args and kwargs:
+            raise TypeError("template: pass positional args or kwargs, not both")
+        if args:
+            if len(args) != n:
+                raise TypeError(f"template {self._signature!r} takes {n} positional argument(s), got {len(args)}")
+            values = list(args)
+        else:
+            if not self._param_names:
+                raise TypeError(
+                    f"template {self._signature!r} has no parameter names; "
+                    "call with positional args or provide names= when creating it"
+                )
+            extra = [k for k in kwargs if k not in self._param_names]
+            if extra:
+                raise TypeError(f"template {self._signature!r} got unexpected keyword argument(s): {extra}")
+            missing = [n for n in self._param_names if n not in kwargs]
+            if missing:
+                raise TypeError(f"template {self._signature!r} missing keyword argument(s): {missing}")
+            values = [kwargs[name] for name in self._param_names]
+
+        # Build patches from the pre-recorded offsets. Slots whose values
+        # encode to zero (e.g. literal 0) don't need patching — the blob
+        # already has zeros there.
+        patches: dict[int, ValueLike] = {}
+        for i, (abi_type, val) in enumerate(zip(self._param_types, values)):
+            if isinstance(val, Value):
+                # Offset comes from the i-th recorder order, which matches
+                # encoding order.
+                if self._param_names:
+                    offset = self._name_to_offset[self._param_names[i]]
+                else:
+                    offset = _recompute_offset_for_slot(self._param_types, i)
+                patches[offset] = val
+                continue
+            # Static Python value — coerce to a 32-byte-slot int and MSTORE
+            # as a patch. The blob stays identical across invocations so
+            # :class:`Program`'s blob dedup cache keeps them sharing one
+            # data section.
+            slot_int = _static_value_to_slot_int(val, abi_type)
+            if slot_int != 0:
+                if self._param_names:
+                    offset = self._name_to_offset[self._param_names[i]]
+                else:
+                    offset = _recompute_offset_for_slot(self._param_types, i)
+                patches[offset] = slot_int
+        return CalldataPayload(self._blob, patches)
+
+
+def _recompute_offset_for_slot(param_types: "list[str]", slot_idx: int) -> int:
+    """Byte offset of *slot_idx* in static-ABI-encoded calldata (selector + args).
+
+    Only supports static 32-byte types. Dynamic types aren't supported by
+    :class:`CalldataTemplate` yet.
+    """
+    return 4 + 32 * slot_idx
+
+
+def _static_value_to_slot_int(val: object, abi_type: str) -> int:
+    """Coerce a static Python value for *abi_type* into the 256-bit integer
+    an MSTORE over its calldata slot would write.
+
+    Handles the types common in DeFi call signatures: address, bool, uintN,
+    intN, bytesN. Dynamic types and tuples aren't supported — the template
+    itself already refuses to be built from a signature whose slots include
+    them.
+    """
+    if isinstance(val, bool):
+        # bool is a subclass of int in Python — check it first.
+        return int(val)
+    if isinstance(val, int):
+        if val < 0:
+            # Two's-complement for signed integer types.
+            if abi_type.startswith("int"):
+                return val & ((1 << 256) - 1)
+            raise ValueError(f"template: negative int {val} for non-signed type {abi_type!r}")
+        return val
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        b = bytes(val)
+        if abi_type == "address":
+            if len(b) != 20:
+                raise ValueError(f"template: address literal must be 20 bytes, got {len(b)}")
+            return int.from_bytes(b, "big")
+        if abi_type.startswith("bytes") and abi_type != "bytes":
+            # bytesN is left-aligned in its 32-byte slot.
+            n = int(abi_type[5:])
+            if len(b) != n:
+                raise ValueError(f"template: {abi_type} literal must be {n} bytes, got {len(b)}")
+            return int.from_bytes(b.ljust(32, b"\x00"), "big")
+        raise ValueError(f"template: bytes literal for type {abi_type!r} not supported")
+    if isinstance(val, str) and abi_type == "address":
+        # Accept 0x-prefixed hex address strings, matching eth_abi's semantics.
+        hex_ = val[2:] if val.startswith(("0x", "0X")) else val
+        return int(hex_, 16)
+    raise TypeError(f"template: unsupported static value {val!r} ({type(val).__name__}) for ABI type {abi_type!r}")
+
+
 def _asm_item_size(item: object) -> int:
     """Byte size that *item* contributes when assembled to EVM bytecode.
 
@@ -292,6 +486,10 @@ class Program:
         self._ctx.entry_function = self._fn
         self._builder = VenomBuilder(self._ctx, self._fn)  # type: ignore[operator]
         self._data_section_counter = 0  # for unique label names
+        # Dedup identical calldata blobs — same bytes → same data section →
+        # same IRLabel. Saves bytecode size when the same template is reused
+        # across many call_contract / template invocations.
+        self._blob_labels: dict[bytes, IRLabel] = {}
 
     # ------------------------------------------------------------------
     # Operand coercion
@@ -512,11 +710,16 @@ class Program:
             raise ValueError(f"calldata too large ({len(calldata)} bytes, max 65535)")
         blen = len(calldata)
         blen_padded = (blen + 31) & ~31
+        padded = _pad32(calldata)
 
-        label = IRLabel(f"pydefi_calldata_{self._data_section_counter}", is_symbol=True)  # type: ignore[operator]
-        self._data_section_counter += 1
-        self._ctx.append_data_section(label)
-        self._ctx.append_data_item(_pad32(calldata))
+        # Dedup: identical blobs share one data section.
+        label = self._blob_labels.get(padded)
+        if label is None:
+            label = IRLabel(f"pydefi_calldata_{self._data_section_counter}", is_symbol=True)  # type: ignore[operator]
+            self._data_section_counter += 1
+            self._ctx.append_data_section(label)
+            self._ctx.append_data_item(padded)
+            self._blob_labels[padded] = label
 
         # base_fp = mem[0x40] | (iszero(mem[0x40]) * 0x280)  — defaults to 0x280
         fp = self._builder.mload(IRLiteral(0x40))  # type: ignore[arg-type]
@@ -541,10 +744,27 @@ class Program:
     # External calls
     # ------------------------------------------------------------------
 
+    def template(self, signature: str, *, names: "list[str] | None" = None) -> CalldataTemplate:
+        """Build a reusable ABI calldata template.
+
+        The returned :class:`CalldataTemplate` encodes a zero-filled blob once
+        and records per-parameter byte offsets. Invoking it produces a
+        :class:`CalldataPayload` whose blob is identical across invocations,
+        so :meth:`call_contract`'s blob dedup cache reuses one data section
+        regardless of how many times the template is called.
+
+        Example::
+
+            xfer = p.template("transfer(address to, uint256 amount)")
+            for recipient, amount in rows:
+                p.call_contract(weth, xfer(to=recipient, amount=amount))
+        """
+        return CalldataTemplate(signature, names=names)
+
     def call_contract(
         self,
         to: ValueLike,
-        calldata: bytes,
+        calldata: "bytes | CalldataPayload",
         *,
         value: ValueLike = 0,
         gas: ValueLike | None = None,
@@ -554,8 +774,12 @@ class Program:
 
         Args:
             to:        Target contract address.
-            calldata:  Pre-encoded calldata template; stored in a Venom data
-                       section and copied into memory before the call.
+            calldata:  Either pre-encoded calldata bytes, or a
+                       :class:`CalldataPayload` from a
+                       :class:`CalldataTemplate`. In the latter case, patches
+                       are auto-derived; any explicit *patches* argument is
+                       merged over the template's (caller wins on offset
+                       collision).
             value:     ETH value to forward (wei).
             gas:       Gas limit; ``None`` forwards all remaining gas.
             patches:   Optional ``{calldata_offset: value}`` overlay.  Each
@@ -566,7 +790,16 @@ class Program:
             A :class:`Value` holding the CALL success flag (1 on success,
             0 on failure).  Use :meth:`assert_` to revert on failure.
         """
-        base_fp, blen = self._alloc_calldata(calldata)
+        if isinstance(calldata, CalldataPayload):
+            merged: dict[int, ValueLike] = dict(calldata.patches)
+            if patches:
+                merged.update(patches)  # explicit patches override template
+            calldata_bytes = calldata.blob
+            patches = merged
+        else:
+            calldata_bytes = calldata
+
+        base_fp, blen = self._alloc_calldata(calldata_bytes)
 
         if patches:
             for offset, val in patches.items():
