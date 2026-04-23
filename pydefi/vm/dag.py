@@ -56,7 +56,6 @@ def build_quote_program_for_dag(
     dag: RouteDAG,
     *,
     amount_in: int,
-    min_final_out: int = 0,
     quoter_address: str | None = None,
 ) -> Program:
     """Build a quote/simulation program from a :class:`RouteDAG`.
@@ -74,8 +73,6 @@ def build_quote_program_for_dag(
         dag.actions,
         quoter_address=quoter_address,
     )
-    if min_final_out > 0:
-        prog.assert_ge(final_out, min_final_out, "slippage: out too low")
     prog.return_word(final_out)
     return prog
 
