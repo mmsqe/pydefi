@@ -34,26 +34,35 @@ from pydefi.types import ZERO_ADDRESS, Address, Hash
 from pydefi.vm import Program
 from tests.live.sol_utils import compile_sol_file, deploy, ensure_solc
 
+#: Byte length of the composer's stack-push prologue.  CCTPComposer.sol prepends
+#: ``PUSH32 amountReceived`` (33B) + ``PUSH32 sourceDomain`` (33B) before our
+#: program runs.  Pass this to ``Program.build(prefix_length=...)`` so absolute
+#: label references inside the SSA-compiled program shift to match the runtime
+#: position of the embedded program.
+_CCTP_PROLOGUE_LEN = 66
+
 
 def _compose_program(target_address: Address, target_calldata: bytes, *, value: int = 0) -> bytes:
     """Build the DeFiVM program embedded as CCTP hookData.
 
-    The composer prologue leaves ``[amountReceived, sourceDomain]`` on the
-    EVM stack before dispatching to the user program.  This helper consumes
-    those via :meth:`Program.stack_param`, stores them in R1/R0, then issues
-    a single external call to *target_address* with *target_calldata*.  On
-    CALL failure the outer ``receiveAndExecute`` reverts (matching legacy
+    The composer prologue leaves two values on the EVM stack before dispatch.
+    Venom's ``stack_param`` returns them in push order (deepest first), so the
+    first call returns ``amountReceived`` and the second returns
+    ``sourceDomain``.  We store them into R1 / R0 to match the layout
+    documented in CCTPComposer.sol.
+
+    On CALL failure the outer ``receiveAndExecute`` reverts (matching legacy
     ``call(require_success=True)``).
     """
     prog = Program()
-    source_domain = prog.stack_param()  # TOS = sourceDomain
-    amount = prog.stack_param()  # 2nd = amountReceived
+    amount = prog.stack_param()  # bottom of the two prologue PUSHes (pushed first)
+    source_domain = prog.stack_param()  # top of the two (pushed second)
     prog.store_reg(0, source_domain)
     prog.store_reg(1, amount)
     success = prog.call_contract(target_address, target_calldata, value=value)
     prog.assert_(success)
     prog.stop()
-    return prog.build()
+    return prog.build(prefix_length=_CCTP_PROLOGUE_LEN)
 
 
 # ---------------------------------------------------------------------------
