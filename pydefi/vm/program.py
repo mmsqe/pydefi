@@ -61,6 +61,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Union
 
 from eth_abi.abi import encode, encode_with_hooks
+from eth_abi.encoding import AddressEncoder, BooleanEncoder, BytesEncoder
 from eth_contract.contract import ContractFunction
 from vyper.compiler.phases import generate_bytecode
 from vyper.compiler.settings import OptimizationLevel, VenomOptimizationFlags
@@ -116,20 +117,21 @@ def _pad32(data: bytes) -> bytes:
     return data.ljust((len(data) + 31) & ~31, b"\x00")
 
 
-#: Placeholders that satisfy eth_abi's per-type encoders.  We can't use ``0``
-#: for everything — the AddressEncoder rejects ``int`` and the BytesEncoder
-#: needs ``bytes``.  Mapping covers the common static types used in DeFi
-#: function signatures; unknown types fall back to ``0`` and surface an
-#: encoding error if that's not accepted.
-_ABI_PLACEHOLDERS: dict[str, object] = {
-    "address": b"\x00" * 20,
-    "bool": False,
-    "bytes32": b"\x00" * 32,
-    "bytes20": b"\x00" * 20,
-    "bytes16": b"\x00" * 16,
-    "bytes8": b"\x00" * 8,
-    "bytes4": b"\x00" * 4,
-}
+def _placeholder_for_encoder(encoder: object) -> object:
+    """Return a value that the given ``eth_abi`` encoder will accept.
+
+    We can't use ``0`` for everything — ``AddressEncoder`` rejects ``int``
+    and ``BytesEncoder`` needs ``bytes`` of the correct width.  Unknown
+    encoders fall back to ``0`` and surface an encoding error if that's
+    not accepted.
+    """
+    if isinstance(encoder, AddressEncoder):
+        return b"\x00" * 20
+    if isinstance(encoder, BooleanEncoder):
+        return False
+    if isinstance(encoder, BytesEncoder):
+        return b"\x00" * (encoder.value_bit_size // 8)
+    return 0
 
 
 class _ValuePlaceholder:
@@ -137,9 +139,8 @@ class _ValuePlaceholder:
     ABI encoding via :func:`eth_abi.encode_with_hooks`.
     """
 
-    def __init__(self, value: Value, abi_type: str) -> None:
+    def __init__(self, value: Value) -> None:
         self.value = value
-        self.abi_type = abi_type
         self.offset: int | None = None
 
     def __call__(self, ctx: "EncodingContext") -> object:
@@ -147,7 +148,7 @@ class _ValuePlaceholder:
         # the encoded value within the args (start of its 32-byte slot for
         # static types — which is where Program.call_contract MSTOREs).
         self.offset = 4 + ctx.offset
-        return _ABI_PLACEHOLDERS.get(self.abi_type, 0)
+        return _placeholder_for_encoder(ctx.encoder)
 
 
 def _asm_item_size(item: object) -> int:
@@ -218,29 +219,24 @@ def _shift_label_pushes(asm: list, bytecode: bytes, shift: int) -> bytes:
     return bytes(buf)
 
 
-def _replace_values_with_placeholders(arg: object, abi_type: str, sink: list[_ValuePlaceholder]) -> object:
+def _replace_values_with_placeholders(arg: object, sink: list[_ValuePlaceholder]) -> object:
     """Recursively replace :class:`Value` instances with :class:`_ValuePlaceholder`.
 
-    *abi_type* is the type string for *arg* (e.g. ``"uint256"``, ``"address"``,
-    ``"(uint256,address)"`` for a struct).  Used to select an encoder-friendly
-    placeholder when the current leaf is a :class:`Value`.
+    The placeholder derives its encoder-friendly stand-in value from the
+    :class:`EncodingContext` at hook-call time, so no type annotation needs
+    to be threaded through here.
 
     Returns a fresh structure suitable for :func:`eth_abi.encode_with_hooks`.
     Non-Value leaves (int, str, bool, bytes) pass through unchanged.
-
-    Container handling: tuple/list types are walked recursively but for
-    Value leaves we currently only annotate with the outer type — sufficient
-    for the static-scalar parameter shapes pydefi uses.  Patches inside
-    nested tuples/lists fall back to the generic ``0`` placeholder.
     """
     if isinstance(arg, Value):
-        ph = _ValuePlaceholder(arg, abi_type)
+        ph = _ValuePlaceholder(arg)
         sink.append(ph)
         return ph
     if isinstance(arg, tuple):
-        return tuple(_replace_values_with_placeholders(item, "", sink) for item in arg)
+        return tuple(_replace_values_with_placeholders(item, sink) for item in arg)
     if isinstance(arg, list):
-        return [_replace_values_with_placeholders(item, "", sink) for item in arg]
+        return [_replace_values_with_placeholders(item, sink) for item in arg]
     return arg
 
 
@@ -608,9 +604,7 @@ class Program:
         # Walk the arg tree, replacing each Value with a placeholder hook that
         # records the value's calldata offset during ABI encoding.
         placeholders: list[_ValuePlaceholder] = []
-        encoded_args: list[object] = [
-            _replace_values_with_placeholders(a, t, placeholders) for a, t in zip(args, param_types)
-        ]
+        encoded_args: list[object] = [_replace_values_with_placeholders(a, placeholders) for a in args]
 
         if not placeholders:
             calldata = bytes(fn.selector) + encode(param_types, encoded_args)
