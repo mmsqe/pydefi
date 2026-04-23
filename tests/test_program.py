@@ -256,14 +256,10 @@ class TestCallContract:
         p.return_word(success)
         assert _run_int(p) == 1
 
-    def test_call_with_template(self):
-        # Preferred form: build a CalldataTemplate from an ABI signature and
-        # patch by parameter name instead of hand-computing byte offsets.
-        # Raw-patches / explicit-offset paths remain covered by
-        # test_program_templates.py.
+    def test_call_with_patches(self):
         p = Program()
-        tmpl = p.template("setValue(uint256 v)")
-        success = p.call_contract(_TARGET, tmpl(v=p.const(0xCAFEBABE)))
+        template = b"\x12\x34\x56\x78" + b"\x00" * 32
+        success = p.call_contract(_TARGET, template, patches={4: p.const(0xCAFEBABE)})
         p.return_word(success)
         assert _run_int(p) == 1
 
@@ -279,10 +275,6 @@ class TestCallContract:
 
 
 class TestCallContractAbi:
-    """``call_contract_abi`` is a one-shot wrapper kept for convenience; for
-    repeated calls with the same signature prefer :meth:`Program.template`
-    (see tests/test_program_templates.py)."""
-
     def test_static_args_no_patches(self):
         p = Program()
         success = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, 10**18)
@@ -299,15 +291,11 @@ class TestCallContractAbi:
 
     def test_no_args(self):
         p = Program()
-        # Template equivalent: p.template("ping()")() — no-arg signatures
-        # produce a selector-only 4-byte payload with no patches.
         success = p.call_contract_abi(_TARGET, "ping()")
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_value_placeholder_uint256(self):
-        # Runtime Value placeholder via call_contract_abi — kept for coverage
-        # of the encode_with_hooks path.
         p = Program()
         amount = p.const(0xDEADBEEF)
         success = p.call_contract_abi(_TARGET, "set(uint256)", amount)
@@ -322,13 +310,9 @@ class TestCallContractAbi:
         assert _run_int(p) == 1
 
     def test_mixed_static_and_value(self):
-        # Migrated to the template API: recipient is a static literal, amount
-        # is a runtime Value. The template form is equivalent and reads more
-        # naturally than positional args threaded through call_contract_abi.
         p = Program()
         amount = p.const(7)
-        xfer = p.template("transfer(address to, uint256 amount)")
-        success = p.call_contract(_TARGET, xfer(to=_TARGET, amount=amount))
+        success = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, amount)
         p.return_word(success)
         assert _run_int(p) == 1
 
