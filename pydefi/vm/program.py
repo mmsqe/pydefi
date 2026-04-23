@@ -89,31 +89,17 @@ if TYPE_CHECKING:
 # Public types
 # ---------------------------------------------------------------------------
 
-
-class Value:
-    """Opaque handle to an SSA value (an EVM word produced at runtime).
-
-    Created by methods on :class:`Program` (e.g. :meth:`Program.const`,
-    :meth:`Program.add`, :meth:`Program.call_contract`).  Pass these handles
-    as arguments to other ``Program`` methods to build a value-flow graph
-    that Venom compiles to EVM bytecode.
-
-    Users should treat :class:`Value` as opaque — direct operand access is
-    intentionally not exposed.
-    """
-
-    __slots__ = ("_op",)
-
-    def __init__(self, op: Union[IRVariable, IRLiteral]) -> None:
-        self._op = op
-
-    def __repr__(self) -> str:
-        return f"Value({self._op!r})"
-
-
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
+#: Handle to an SSA value (an EVM word produced at runtime).
+#:
+#: Returned by methods on :class:`Program` (e.g. :meth:`Program.const`,
+#: :meth:`Program.add`, :meth:`Program.call_contract`).  Pass these handles
+#: as arguments to other ``Program`` methods to build a value-flow graph
+#: that Venom compiles to EVM bytecode.
+#:
+#: Currently an alias for Venom's operand types — an ``IRVariable`` for
+#: computed values, an ``IRLiteral`` for constants.  The union is what the
+#: Venom builder accepts as an operand, so no wrapper is needed.
+Value = Union[IRVariable, IRLiteral]
 
 #: Anything acceptable in a ``Value`` slot — runtime SSA handle, plain ``int``
 #: literal, or 20-byte ``bytes`` address (interpreted as big-endian uint256).
@@ -300,12 +286,12 @@ class Program:
     def _to_operand(self, v: ValueLike) -> Union[IRVariable, IRLiteral, int]:
         """Coerce a :class:`ValueLike` into something acceptable as a Venom operand.
 
-        * :class:`Value`  → its underlying SSA / literal operand.
-        * ``int``         → Venom accepts plain ``int`` literals directly.
+        * :class:`Value` (``IRVariable`` / ``IRLiteral``) → returned as-is.
+        * ``int``            → Venom accepts plain ``int`` literals directly.
         * ``bytes`` (len 20) → big-endian ``int`` (an EVM address).
         """
-        if isinstance(v, Value):
-            return v._op
+        if isinstance(v, (IRVariable, IRLiteral)):
+            return v
         if isinstance(v, int):
             if v < 0:
                 raise ValueError(f"operand must be non-negative, got {v}")
@@ -319,9 +305,6 @@ class Program:
             return int.from_bytes(bytes(v), "big")
         raise TypeError(f"operand: unsupported type {type(v).__name__}")
 
-    def _wrap(self, op: Union[IRVariable, IRLiteral]) -> Value:
-        return Value(op)
-
     # ------------------------------------------------------------------
     # Constants
     # ------------------------------------------------------------------
@@ -332,13 +315,13 @@ class Program:
             raise ValueError(f"const: value must be non-negative, got {n}")
         if n >= 1 << 256:
             raise ValueError(f"const: value {n} does not fit in uint256")
-        return Value(IRLiteral(n))  # type: ignore[operator]
+        return IRLiteral(n)  # type: ignore[operator]
 
     def addr(self, a: "Address") -> Value:
         """Return a :class:`Value` for a 20-byte EVM address."""
         if len(a) != 20:
             raise ValueError(f"addr: address must be 20 bytes, got {len(a)}")
-        return Value(IRLiteral(int.from_bytes(bytes(a), "big")))  # type: ignore[operator]
+        return IRLiteral(int.from_bytes(bytes(a), "big"))  # type: ignore[operator]
 
     # ------------------------------------------------------------------
     # Arithmetic
@@ -361,11 +344,11 @@ class Program:
         variable is already on the stack.  Must be called before emitting
         any other value-producing instruction in the entry basic block.
         """
-        return self._wrap(self._builder.param())
+        return self._builder.param()
 
     def add(self, a: ValueLike, b: ValueLike) -> Value:
         """Wrapping uint256 ``a + b``."""
-        return self._wrap(self._builder.add(self._to_operand(a), self._to_operand(b)))
+        return self._builder.add(self._to_operand(a), self._to_operand(b))
 
     def sub(self, a: ValueLike, b: ValueLike) -> Value:
         """Saturating ``max(a - b, 0)``.
@@ -378,19 +361,19 @@ class Program:
         raw_diff = self._builder.sub(a_op, b_op)
         # not_underflow = 1 if a >= b else 0  ==  iszero(a < b)
         not_underflow = self._builder.iszero(self._builder.lt(a_op, b_op))
-        return self._wrap(self._builder.mul(raw_diff, not_underflow))
+        return self._builder.mul(raw_diff, not_underflow)
 
     def mul(self, a: ValueLike, b: ValueLike) -> Value:
         """Wrapping uint256 ``a * b``."""
-        return self._wrap(self._builder.mul(self._to_operand(a), self._to_operand(b)))
+        return self._builder.mul(self._to_operand(a), self._to_operand(b))
 
     def div(self, a: ValueLike, b: ValueLike) -> Value:
         """Unsigned ``a // b``; EVM DIV returns 0 when ``b == 0``."""
-        return self._wrap(self._builder.div(self._to_operand(a), self._to_operand(b)))
+        return self._builder.div(self._to_operand(a), self._to_operand(b))
 
     def mod(self, a: ValueLike, b: ValueLike) -> Value:
         """Unsigned ``a % b``; EVM MOD returns 0 when ``b == 0``."""
-        return self._wrap(self._builder.mod(self._to_operand(a), self._to_operand(b)))
+        return self._builder.mod(self._to_operand(a), self._to_operand(b))
 
     # ------------------------------------------------------------------
     # Comparison / boolean
@@ -398,43 +381,43 @@ class Program:
 
     def lt(self, a: ValueLike, b: ValueLike) -> Value:
         """Unsigned ``1 if a < b else 0``."""
-        return self._wrap(self._builder.lt(self._to_operand(a), self._to_operand(b)))
+        return self._builder.lt(self._to_operand(a), self._to_operand(b))
 
     def gt(self, a: ValueLike, b: ValueLike) -> Value:
         """Unsigned ``1 if a > b else 0``."""
-        return self._wrap(self._builder.gt(self._to_operand(a), self._to_operand(b)))
+        return self._builder.gt(self._to_operand(a), self._to_operand(b))
 
     def eq(self, a: ValueLike, b: ValueLike) -> Value:
         """``1 if a == b else 0``."""
-        return self._wrap(self._builder.eq(self._to_operand(a), self._to_operand(b)))
+        return self._builder.eq(self._to_operand(a), self._to_operand(b))
 
     def is_zero(self, a: ValueLike) -> Value:
         """``1 if a == 0 else 0``."""
-        return self._wrap(self._builder.iszero(self._to_operand(a)))
+        return self._builder.iszero(self._to_operand(a))
 
     # ------------------------------------------------------------------
     # Bitwise
     # ------------------------------------------------------------------
 
     def bit_and(self, a: ValueLike, b: ValueLike) -> Value:
-        return self._wrap(self._builder.and_(self._to_operand(a), self._to_operand(b)))
+        return self._builder.and_(self._to_operand(a), self._to_operand(b))
 
     def bit_or(self, a: ValueLike, b: ValueLike) -> Value:
-        return self._wrap(self._builder.or_(self._to_operand(a), self._to_operand(b)))
+        return self._builder.or_(self._to_operand(a), self._to_operand(b))
 
     def bit_xor(self, a: ValueLike, b: ValueLike) -> Value:
-        return self._wrap(self._builder.xor(self._to_operand(a), self._to_operand(b)))
+        return self._builder.xor(self._to_operand(a), self._to_operand(b))
 
     def bit_not(self, a: ValueLike) -> Value:
-        return self._wrap(self._builder.not_(self._to_operand(a)))
+        return self._builder.not_(self._to_operand(a))
 
     def shl(self, value: ValueLike, shift: ValueLike) -> Value:
         """``value << shift`` (Venom signature: ``shl(bits, val)``)."""
-        return self._wrap(self._builder.shl(self._to_operand(shift), self._to_operand(value)))
+        return self._builder.shl(self._to_operand(shift), self._to_operand(value))
 
     def shr(self, value: ValueLike, shift: ValueLike) -> Value:
         """``value >> shift`` (Venom signature: ``shr(bits, val)``)."""
-        return self._wrap(self._builder.shr(self._to_operand(shift), self._to_operand(value)))
+        return self._builder.shr(self._to_operand(shift), self._to_operand(value))
 
     # ------------------------------------------------------------------
     # Memory / Registers
@@ -445,7 +428,7 @@ class Program:
         if not 0 <= i <= 15:
             raise ValueError(f"load_reg: register index must be 0..15, got {i}")
         addr = 0x80 + i * 32
-        return self._wrap(self._builder.mload(IRLiteral(addr)))  # type: ignore[arg-type]
+        return self._builder.mload(IRLiteral(addr))  # type: ignore[arg-type]
 
     def store_reg(self, i: int, v: ValueLike) -> None:
         """Store *v* into register *i* (memory slot ``0x80 + i*32``)."""
@@ -460,15 +443,15 @@ class Program:
 
     def self_addr(self) -> Value:
         """EVM ``ADDRESS`` — the running program's own address."""
-        return self._wrap(self._builder.address())
+        return self._builder.address()
 
     def gas_left(self) -> Value:
         """EVM ``GAS`` — remaining gas."""
-        return self._wrap(self._builder.gas())
+        return self._builder.gas()
 
     def eth_balance(self, account: ValueLike) -> Value:
         """EVM ``BALANCE(account)`` — ETH balance of *account*."""
-        return self._wrap(self._builder.balance(self._to_operand(account)))
+        return self._builder.balance(self._to_operand(account))
 
     def erc20_balance_of(self, token: ValueLike, account: ValueLike) -> Value:
         """ERC-20 ``token.balanceOf(account)`` via STATICCALL.
@@ -495,7 +478,7 @@ class Program:
             32,
         )
         self._builder.assert_(success)
-        return self._wrap(self._builder.mload(scratch))
+        return self._builder.mload(scratch)
 
     # ------------------------------------------------------------------
     # Internal: free-memory and data-section helpers
@@ -588,7 +571,7 @@ class Program:
             0,
             0,
         )
-        return self._wrap(success)
+        return success
 
     def call_contract_abi(
         self,
@@ -660,7 +643,7 @@ class Program:
             raise ValueError(f"returndata_word: offset must be non-negative, got {offset}")
         scratch = self._alloc(32)
         self._builder.returndatacopy(scratch, offset, 32)
-        return self._wrap(self._builder.mload(scratch))
+        return self._builder.mload(scratch)
 
     # ------------------------------------------------------------------
     # Assertions
@@ -716,14 +699,14 @@ class Program:
         a_op = self._to_operand(a)
         b_op = self._to_operand(b)
         not_lt = self._builder.iszero(self._builder.lt(a_op, b_op))
-        self.assert_(self._wrap(not_lt), msg)
+        self.assert_(not_lt, msg)
 
     def assert_le(self, a: ValueLike, b: ValueLike, msg: str = "") -> None:
         """Revert if ``a > b`` (i.e. require ``a <= b``)."""
         a_op = self._to_operand(a)
         b_op = self._to_operand(b)
         not_gt = self._builder.iszero(self._builder.gt(a_op, b_op))
-        self.assert_(self._wrap(not_gt), msg)
+        self.assert_(not_gt, msg)
 
     # ------------------------------------------------------------------
     # Termination
