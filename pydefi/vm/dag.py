@@ -102,8 +102,8 @@ def _build_dag_actions(
                 prog,
                 current,
                 action,
-                lambda acts, r=action_recipient: (
-                    lambda p, amt: _build_dag_actions(p, amt, acts, vm_address=vm_address, terminal_recipient=r)
+                lambda p, amt, acts, r=action_recipient: _build_dag_actions(
+                    p, amt, acts, vm_address=vm_address, terminal_recipient=r
                 ),
             )
         else:
@@ -133,7 +133,7 @@ def _build_dag_quote_actions(
                 prog,
                 current,
                 action,
-                lambda acts, q=quoter_address: lambda p, amt: _build_dag_quote_actions(p, amt, acts, quoter_address=q),
+                lambda p, amt, acts: _build_dag_quote_actions(p, amt, acts, quoter_address=quoter_address),
             )
         else:
             raise ValueError(f"build_quote_program_for_dag: unsupported route action {type(action)!r}")
@@ -144,16 +144,17 @@ def _build_split(
     prog: Program,
     total_in: Value,
     split: RouteSplit,
-    leg_actions_factory: Callable[[Sequence[RouteAction]], Callable[[Program, Value], Value]],
+    build_leg: Callable[[Program, Value, Sequence[RouteAction]], Value],
 ) -> Value:
     """Compute a split: route fractions of *total_in* through each leg, sum the outputs.
 
-    *leg_actions_factory* is a callback that, given a leg's action list, returns
-    a function ``(prog, amount_in) -> amount_out`` that executes those actions.
+    *build_leg* is a callback ``(prog, amount_in, actions) -> amount_out`` that
+    emits IR for one leg's action list into *prog* and returns the leg's
+    output amount as a :class:`Value`.
     """
     if len(split.legs) == 1:
         # Fast path: single leg gets the full input.
-        return leg_actions_factory(split.legs[0].actions)(prog, total_in)
+        return build_leg(prog, total_in, split.legs[0].actions)
 
     # Runtime guard: each leg computes total_in * fraction_bps, which must fit in uint256.
     prog.assert_le(total_in, _MAX_TOTAL_IN_FOR_SPLIT, "split: total_in overflow guard")
@@ -161,6 +162,6 @@ def _build_split(
     accum: Value = prog.const(0)
     for leg in split.legs:
         leg_amount = prog.div(prog.mul(total_in, leg.fraction_bps), _BPS_DENOMINATOR)
-        leg_out = leg_actions_factory(leg.actions)(prog, leg_amount)
+        leg_out = build_leg(prog, leg_amount, leg.actions)
         accum = prog.add(accum, leg_out)
     return accum
