@@ -181,6 +181,12 @@ if TYPE_CHECKING:
 
 from eth_contract.contract import ContractFunction
 from hexbytes import HexBytes
+from vyper.compiler.phases import generate_bytecode
+from vyper.compiler.settings import OptimizationLevel, VenomOptimizationFlags
+from vyper.venom import generate_assembly_experimental, run_passes_on
+from vyper.venom.basicblock import IRLabel
+from vyper.venom.builder import VenomBuilder
+from vyper.venom.context import IRContext
 
 from pydefi.types import Address
 from pydefi.vm.abi import emit_abi_encode, emit_abi_encode_packed
@@ -227,26 +233,6 @@ from pydefi.vm.program import (
     sub,
     swap,
 )
-
-try:
-    from vyper.compiler.phases import generate_bytecode
-    from vyper.compiler.settings import OptimizationLevel, VenomOptimizationFlags
-    from vyper.venom import generate_assembly_experimental, run_passes_on
-    from vyper.venom.basicblock import IRLabel
-    from vyper.venom.builder import VenomBuilder
-    from vyper.venom.context import IRContext
-
-    _VENOM_IMPORT_ERROR: str | None = None
-except Exception as exc:  # pragma: no cover - exercised by availability checks
-    generate_bytecode = None
-    OptimizationLevel = None
-    VenomOptimizationFlags = None
-    generate_assembly_experimental = None
-    run_passes_on = None
-    VenomBuilder = None
-    IRContext = None
-    IRLabel = None
-    _VENOM_IMPORT_ERROR = str(exc)
 
 # ---------------------------------------------------------------------------
 # Patch source types
@@ -814,16 +800,6 @@ class Program:
         Returns:
             ``self`` for chaining.
         """
-        if not venom_is_available():
-            return (
-                self._emit(push_u256(0))  # retSize
-                ._emit(push_u256(0))  # retOffset
-                .push_bytes(calldata)  # argsOffset (TOS), argsLen — CODECOPY via Program.push_bytes
-                ._emit(push_u256(value))
-                ._emit(push_addr(to))
-                ._emit(gas_opcode() if gas == 0 else push_u256(gas))
-                ._emit(call(require_success))
-            )
         code_frag, fixup_pos = compile_venom_call_contract_fragment(
             to,
             calldata,
@@ -1219,33 +1195,9 @@ class Program:
         return f"Program(len={len(self._buf)}, labels={list(self._labels)!r})"
 
 
-def venom_is_available() -> bool:
-    """Return True when Vyper Venom APIs are importable in this environment."""
-    return _VENOM_IMPORT_ERROR is None
-
-
-def venom_import_error() -> str | None:
-    """Return import error details when Venom APIs are unavailable."""
-    return _VENOM_IMPORT_ERROR
-
-
 # ---------------------------------------------------------------------------
 # Venom compilation helpers (private)
 # ---------------------------------------------------------------------------
-
-
-def _require_venom_imports() -> None:
-    """Raise ImportError when Venom is unavailable; assert module globals for the type checker."""
-    if not venom_is_available():
-        raise ImportError(f"Vyper Venom APIs are unavailable: {venom_import_error()}")
-    assert IRContext is not None
-    assert IRLabel is not None
-    assert VenomBuilder is not None
-    assert VenomOptimizationFlags is not None
-    assert OptimizationLevel is not None
-    assert run_passes_on is not None
-    assert generate_assembly_experimental is not None
-    assert generate_bytecode is not None
 
 
 def _pad32(data: bytes) -> bytes:
@@ -1253,7 +1205,7 @@ def _pad32(data: bytes) -> bytes:
     return data.ljust((len(data) + 31) & ~31, b"\x00")
 
 
-def _compile_venom_ctx(ctx: IRContext) -> bytes:  # type: ignore[name-defined]
+def _compile_venom_ctx(ctx: IRContext) -> bytes:
     """Run the standard Venom pipeline on *ctx* and return the compiled bytecode."""
     flags = VenomOptimizationFlags(  # type: ignore[call-arg]
         level=OptimizationLevel.NONE,  # type: ignore[attr-defined]
@@ -1274,18 +1226,18 @@ def _compile_venom_ctx(ctx: IRContext) -> bytes:  # type: ignore[name-defined]
 _FRAGMENT_DATA_SRC_PLACEHOLDER: int = 0xDEAD_BEEF
 
 
-def _venom_alloc_copy_fragment(builder: "VenomBuilder", blen_padded: int) -> Any:  # type: ignore[name-defined]
+def _venom_alloc_copy_fragment(builder: VenomBuilder, blen_padded: int) -> Any:
     """Like _venom_alloc_and_copy but uses a sentinel constant for the CODECOPY src.
 
     No data section is created in the IRContext.  The sentinel is detected and
     replaced in _extract_fragment_and_fixup so Program._data_fixups can supply
     the real offset at build() time.
     """
-    fp = builder.mload(0x40)
+    fp = builder.mload(0x40)  # type: ignore[arg-type]
     default_fp = builder.mul(builder.iszero(fp), 0x280)
     base_fp = builder.or_(fp, default_fp)
     builder.codecopy(base_fp, _FRAGMENT_DATA_SRC_PLACEHOLDER, blen_padded)
-    builder.mstore(0x40, builder.add(base_fp, blen_padded))
+    builder.mstore(0x40, builder.add(base_fp, blen_padded))  # type: ignore[arg-type]
     return base_fp
 
 
@@ -1376,7 +1328,6 @@ def compile_venom_call_contract_fragment(
         (code_frag, fixup_pos): code_frag ends at CALL with success on EVM stack;
         fixup_pos is the byte index of the 4-byte placeholder for the data section offset.
     """
-    _require_venom_imports()
     blen = len(calldata)
     blen_padded = (blen + 31) & ~31
     ctx = IRContext()  # type: ignore[operator]
@@ -1397,7 +1348,7 @@ def compile_venom_call_contract_fragment(
     return bytes(code_frag), fixup_pos
 
 
-def _venom_alloc_and_copy(builder: VenomBuilder, label: IRLabel, blen_padded: int) -> Any:  # type: ignore[name-defined]
+def _venom_alloc_and_copy(builder: VenomBuilder, label: IRLabel, blen_padded: int) -> Any:
     """Emit fp_init + CODECOPY from *label* into memory[base_fp..+blen_padded], advance FP.
 
     Returns the ``base_fp`` SSA value for use in subsequent builder instructions.
@@ -1426,7 +1377,6 @@ def compile_venom_call_contract_probe(
     memory via ``dloadbytes`` before CALL. The runtime returns the CALL success
     flag as a 32-byte word.
     """
-    _require_venom_imports()
     if len(to) != 20:
         raise ValueError(f"call_contract_probe: bad address length: {to!r}")
     if value < 0:
@@ -1483,7 +1433,6 @@ def compile_venom_call_with_patches_probe(
 
     ``mstore_ptr = argsOffset + (offset + size - 32)``
     """
-    _require_venom_imports()
     if len(to) != 20:
         raise ValueError(f"call_with_patches_probe: bad address length: {to!r}")
     if len(patches) != len(patch_values):

@@ -42,7 +42,6 @@ from pydefi.vm.builder import (
     Patch,
     PatchSpec,
     Program,
-    venom_is_available,
 )
 from pydefi.vm.dag import build_execution_program_for_dag, build_quote_program_for_dag
 from pydefi.vm.program import (
@@ -100,7 +99,6 @@ __all__ = [
     "emit_abi_encode_packed",
     # Fluent builder
     "Program",
-    "venom_is_available",
     # Patch type aliases and Patch class
     "Patch",
     "PatchSpec",

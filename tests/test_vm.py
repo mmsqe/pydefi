@@ -32,7 +32,6 @@ from eth_utils import keccak
 
 from pydefi.types import Address, ChainId, SwapProtocol, SwapRoute, Token, TokenAmount
 from pydefi.vm import Patch, Program, emit_abi_encode, emit_abi_encode_packed
-from pydefi.vm.builder import venom_is_available
 from pydefi.vm.program import (
     OP_ADD,
     OP_AND,
@@ -314,9 +313,8 @@ class TestCallContractHelper:
         calldata = b"\xab\xcd"
         with_check = Program().call_contract(ADDR_A, calldata, require_success=True).build()
         without_check = Program().call_contract(ADDR_A, calldata, require_success=False).build()
-        # require_success=True emits a 15-byte inline revert block when using Venom.
-        if venom_is_available():
-            assert len(with_check) > len(without_check)
+        # require_success=True emits a 15-byte inline revert block.
+        assert len(with_check) > len(without_check)
         assert OP_CODECOPY in with_check
         assert OP_CODECOPY in without_check
 

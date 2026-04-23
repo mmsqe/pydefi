@@ -16,7 +16,6 @@ from pydefi.vm.builder import (
     compile_venom_call_contract_fragment,
     compile_venom_call_contract_probe,
     compile_venom_call_with_patches_probe,
-    venom_is_available,
 )
 from pydefi.vm.program import add, pop
 from tests.conftest import RETURN_TOP, mini_evm
@@ -65,7 +64,6 @@ def _push_bytes_probe(data: bytes) -> bytes:
     return _compile_venom_ctx(ctx)
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_push_bytes_probe_copies_data_into_memory():
     payload = b"\xde\xad\xbe\xef"
     result = mini_evm(_push_bytes_probe(payload))
@@ -73,14 +71,12 @@ def test_push_bytes_probe_copies_data_into_memory():
     assert int.from_bytes(result.output, "big") == int.from_bytes(payload.ljust(32, b"\x00"), "big")
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_push_bytes_probe_embeds_data_section():
     payload = b"hello venom"
     bytecode = _push_bytes_probe(payload)
     assert bytecode.endswith(payload.ljust(((len(payload) + 31) & ~31), b"\x00"))
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_compile_venom_call_contract_probe_returns_success_flag():
     target = HexBytes("0x" + "99" * 20)
     bytecode = compile_venom_call_contract_probe(target, b"\x12\x34\x56\x78")
@@ -89,13 +85,11 @@ def test_compile_venom_call_contract_probe_returns_success_flag():
     assert int.from_bytes(result.output, "big") == 1
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_compile_venom_call_contract_probe_rejects_bad_address_length():
     with pytest.raises(ValueError, match="bad address length"):
         compile_venom_call_contract_probe(HexBytes("0x1234"), b"")
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_compile_venom_call_with_patches_probe_returns_success_flag():
     target = HexBytes("0x" + "ac" * 20)
     template = bytes.fromhex("12345678") + b"\x00" * 64
@@ -110,7 +104,6 @@ def test_compile_venom_call_with_patches_probe_returns_success_flag():
     assert int.from_bytes(result.output, "big") == 1
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_compile_venom_call_with_patches_probe_matches_manual_success_semantics():
     target = HexBytes("0x" + "ad" * 20)
     template = bytes.fromhex("12345678") + b"\x00" * 64
@@ -231,7 +224,6 @@ def test_call_contract_abi_patch_evm_behavior():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_venom_fragment_strips_return_and_finds_placeholder():
     """compile_venom_call_contract_fragment strips RETURN, leaves CALL as last instruction."""
     target = HexBytes("0x" + "9d" * 20)
@@ -246,7 +238,6 @@ def test_venom_fragment_strips_return_and_finds_placeholder():
     assert ph_bytes not in bytes(code_frag)
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_venom_fragment_evm_behavior():
     """call_contract via Venom fragment leaves success on stack and does not error."""
     target = HexBytes("0x" + "9e" * 20)
@@ -256,7 +247,6 @@ def test_venom_fragment_evm_behavior():
     assert result.output == b""
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_call_with_patches_single_u256_venom_manual_evm_parity():
     """Single uint256 patch: both paths agree on success flag after patching."""
     target = HexBytes("0x" + "c4" * 20)
@@ -269,7 +259,6 @@ def test_call_with_patches_single_u256_venom_manual_evm_parity():
     assert int.from_bytes(result.output, "big") == 1
 
 
-@pytest.mark.skipif(not venom_is_available(), reason="Vyper Venom APIs are unavailable in this environment")
 def test_call_with_patches_two_patches_venom_manual_evm_parity():
     """Two patches (uint256 + address): both paths agree on success flag."""
     target = HexBytes("0x" + "c5" * 20)

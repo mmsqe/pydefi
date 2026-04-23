@@ -13,11 +13,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pytest
 from hexbytes import HexBytes
 
 from pydefi.vm import Program
-from pydefi.vm.builder import venom_is_available
 from pydefi.vm.program import call, gas_opcode, push_addr, push_bytes, push_u256
 from tests.conftest import mini_evm
 
@@ -104,10 +102,6 @@ def test_bench_call_contract_correctness():
     assert not new_r.is_error
 
 
-@pytest.mark.skipif(
-    not venom_is_available(),
-    reason="Vyper Venom APIs unavailable — both paths use identical PUSH32/MSTORE",
-)
 def test_bench_call_contract_new_cheaper_for_large_calldata():
     """CODECOPY path uses less gas than PUSH32/MSTORE for calldata ≥ 64 bytes."""
     data = bytes(range(128))
