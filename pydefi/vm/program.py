@@ -18,10 +18,13 @@ Patched call (the calldata pattern)::
     quote_ok = prog.call_contract(QUOTER, quote_calldata)
     prog.assert_(quote_ok)
     amount = prog.returndata_word(0)
+    swap_tmpl = prog.template(
+        "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin,"
+        " address[] path, address to, uint256 deadline)"
+    )
     swap_ok = prog.call_contract(
         ROUTER,
-        swap_template,
-        patches={36: amount},  # write amount into the calldata at offset 36
+        swap_tmpl(amountIn=amount, amountOutMin=0, path=PATH, to=RECIPIENT, deadline=DL),
     )
     prog.assert_(swap_ok)
     prog.stop()
@@ -48,10 +51,12 @@ an implicit ``stop`` if the current BB is still open.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Union
 
-from eth_abi.abi import encode, encode_with_hooks
+from eth_abi.abi import encode as _abi_encode
+from eth_abi.abi import encode_with_hooks
 from eth_abi.encoding import AddressEncoder, BooleanEncoder, BytesEncoder
 from eth_contract.contract import ContractFunction
 from vyper.compiler.phases import generate_bytecode
@@ -120,24 +125,53 @@ def _placeholder_for_encoder(encoder: object) -> object:
     return 0
 
 
+#: Types that occupy exactly one 32-byte head slot and can therefore be
+#: lifted out of the blob into an MSTORE patch without disturbing ``eth_abi``'s
+#: head/tail layout.  Matches ``uint{N}``, ``int{N}``, ``address``, ``bool``,
+#: and ``bytes1..bytes32``.  Deliberately excludes ``bytes``, ``string``,
+#: tuples, and arrays — those carry dynamic tails and must bake into the blob
+#: to keep offsets consistent across invocations.
+_SCALAR_STATIC_RE = re.compile(r"^(u?int\d*|address|bool|bytes([1-9]|[12]\d|3[012]))$")
+
+
+def _is_scalar_static_type(abi_type: str) -> bool:
+    return bool(_SCALAR_STATIC_RE.match(abi_type))
+
+
+def _encode_static_to_slot_int(val: object, abi_type: str) -> int:
+    """Encode *val* as its 32-byte ABI head slot and return it as a uint256.
+
+    Delegates to ``eth_abi.encode`` so every static type (signed ints,
+    addresses, bytesN padding, bool) is handled exactly as eth_abi would
+    handle it — the patched MSTORE is byte-identical to what a baked-in
+    blob would have contained.
+    """
+    # _normalise_static handles the int→20-byte address coercion that
+    # eth_abi's AddressEncoder otherwise rejects.
+    coerced = _normalise_static(val, abi_type)
+    encoded = _abi_encode([abi_type], [coerced])
+    assert len(encoded) == 32, f"expected 32-byte scalar-static encoding for {abi_type!r}, got {len(encoded)}"
+    return int.from_bytes(encoded, "big")
+
+
 class Placeholder:
-    """Marks a runtime :class:`Value` embedded in a ``call_contract_abi``
-    argument list.
+    """Encoding hook that zeros out an ABI head slot in the encoded blob and
+    remembers where to MSTORE its real value before ``CALL``.
 
-    Wrap any SSA :class:`Value` that should be patched into the encoded
-    calldata at runtime::
+    :class:`CalldataTemplate` wraps any top-level scalar-static arg (runtime
+    :class:`Value` or non-zero literal) in a ``Placeholder``, and wraps
+    runtime :class:`Value` leaves nested inside dynamic containers. The
+    encoder hook invokes ``__call__(ctx)`` at each slot position; we record
+    ``4 + ctx.offset`` (skipping the 4-byte selector) and return a
+    type-appropriate zero so ``eth_abi`` accepts the slot.
 
-        prog.call_contract_abi(
-            token, "transfer(address,uint256)", recipient, Placeholder(amount),
-        )
-
-    The ABI slot is encoded with a type-safe zero stand-in and overwritten
-    via ``mstore`` with the real value before ``CALL``.  Plain Python values
-    (``int`` / ``str`` / ``bytes`` / ``bool``) are static and don't need
-    wrapping.
+    The ``value`` field is a :data:`ValueLike` — an SSA :class:`Value`
+    handle for runtime patches, or a ``uint256`` int for literal patches.
+    Either way :meth:`Program.call_contract` pipes it through ``_to_operand``
+    when emitting the MSTORE, so the same code path handles both.
     """
 
-    def __init__(self, value: Value) -> None:
+    def __init__(self, value: ValueLike) -> None:
         self.value = value
         self.offset: int | None = None
 
@@ -147,6 +181,165 @@ class Placeholder:
         # static types — which is where Program.call_contract MSTOREs).
         self.offset = 4 + ctx.offset
         return _placeholder_for_encoder(ctx.encoder)
+
+
+class CalldataPayload:
+    """Bundled ``(blob, patches)`` pair produced by :class:`CalldataTemplate`.
+
+    :meth:`Program.call_contract` accepts this in place of a raw ``bytes``
+    payload: the blob goes through the normal data-section + CODECOPY path
+    (with dedup) and the patches are MSTORE'd over the 32-byte slots.
+    """
+
+    __slots__ = ("blob", "patches")
+
+    def __init__(self, blob: bytes, patches: "dict[int, ValueLike]") -> None:
+        self.blob = blob
+        self.patches = patches
+
+
+class CalldataTemplate:
+    """Reusable ABI calldata template.
+
+    Parse a signature once, invoke it many times with mixed static and
+    runtime values. Each invocation runs :func:`eth_abi.encode_with_hooks`
+    to produce a :class:`CalldataPayload`:
+
+    * Static Python values (``int``, ``bytes``, tuples, addresses, nested
+      arrays) are encoded directly into the blob.
+    * :class:`Value` arguments become :class:`Placeholder` hooks whose
+      calldata offsets are captured during encoding; they appear as
+      MSTORE patches applied to the in-memory buffer before ``CALL``.
+
+    Two invocations of the same template share one Venom data section
+    whenever their encoded blobs are identical (i.e. same static arg
+    values + same number and placement of Value placeholders).
+
+    Supports both static and dynamic ABI types — anything
+    ``eth_abi.encode_with_hooks`` accepts.
+
+    Example::
+
+        xfer = p.template("transfer(address to, uint256 amount)")
+        for recipient, amount in rows:
+            p.call_contract(weth, xfer(to=recipient, amount=amount))
+    """
+
+    __slots__ = ("_signature", "_selector", "_param_types", "_param_names")
+
+    def __init__(self, signature: str, names: "list[str] | None" = None) -> None:
+        normalised = signature if signature.lstrip().startswith("function ") else "function " + signature
+        fn = ContractFunction.from_abi(normalised)
+        self._signature = fn.signature
+        self._selector = bytes(fn.selector)
+        self._param_types: list[str] = list(fn.input_types)
+
+        # Prefer names from the ABI sig (Solidity style:
+        # ``transfer(address to, uint256 amount)``); fall back to *names*
+        # kwarg; else the params are positional-only.
+        abi_names = [inp.get("name") or "" for inp in fn.abi["inputs"]]
+        if names is not None:
+            if len(names) != len(self._param_types):
+                raise ValueError(f"template: {len(self._param_types)} parameters but {len(names)} names provided")
+            self._param_names: list[str] = list(names)
+        elif all(abi_names):
+            self._param_names = abi_names
+        else:
+            self._param_names = []
+
+    @property
+    def signature(self) -> str:
+        return self._signature
+
+    @property
+    def param_types(self) -> "list[str]":
+        return list(self._param_types)
+
+    @property
+    def param_names(self) -> "list[str]":
+        return list(self._param_names)
+
+    def _bind_args(self, args: tuple[object, ...], kwargs: dict[str, object]) -> list[object]:
+        """Resolve positional / kwarg input against the template signature.
+
+        Accepts either all-positional or all-kwarg form, not a mix.  For
+        kwargs, every declared param name must be supplied and no extras
+        are allowed.  The returned list is in declaration order.
+        """
+        n = len(self._param_types)
+        if args and kwargs:
+            raise TypeError("template: pass positional args or kwargs, not both")
+        if n == 0:
+            if args or kwargs:
+                raise TypeError(f"template {self._signature!r} takes no arguments")
+            return []
+        if args:
+            if len(args) != n:
+                raise TypeError(f"template {self._signature!r} takes {n} positional argument(s), got {len(args)}")
+            return list(args)
+        if not self._param_names:
+            raise TypeError(
+                f"template {self._signature!r} has no parameter names; "
+                "call with positional args or provide names= when creating it"
+            )
+        extra = [k for k in kwargs if k not in self._param_names]
+        if extra:
+            raise TypeError(f"template {self._signature!r} got unexpected keyword argument(s): {extra}")
+        missing = [nm for nm in self._param_names if nm not in kwargs]
+        if missing:
+            raise TypeError(f"template {self._signature!r} missing keyword argument(s): {missing}")
+        return [kwargs[name] for name in self._param_names]
+
+    def __call__(self, *args: object, **kwargs: object) -> CalldataPayload:
+        values = self._bind_args(args, kwargs)
+
+        # Blob dedup strategy, uniformly via :class:`Placeholder` hooks:
+        #   - Scalar-static slots (uint/int/address/bool/bytesN) with either
+        #     a runtime Value or a non-zero literal are wrapped in a
+        #     Placeholder. Its hook zeros out the head slot in the blob and
+        #     records the slot's calldata offset; the real value is MSTORE'd
+        #     before CALL. Zero literals bake a type-appropriate zero into
+        #     the blob directly — the blob already carries the right word,
+        #     so we save an MSTORE. Either way the blob stays byte-identical
+        #     across invocations that differ only in scalar-static args, so
+        #     :attr:`Program._blob_labels` shares one data section.
+        #   - Dynamic / container slots (bytes, string, T[], tuples) bake
+        #     into the blob via encode_with_hooks; nested runtime Values
+        #     still become Placeholders via _replace_values_with_placeholders.
+        placeholders: list[Placeholder] = []
+        encoded_args: list[object] = []
+        for val, t in zip(values, self._param_types):
+            if _is_scalar_static_type(t):
+                if isinstance(val, Value):
+                    ph = Placeholder(val)
+                else:
+                    slot_int = _encode_static_to_slot_int(val, t)
+                    if slot_int == 0:
+                        # Blob already zero at this slot — don't track the
+                        # Placeholder (no patch) but still let its hook run
+                        # so the encoder gets a type-correct zero stand-in.
+                        encoded_args.append(Placeholder(0))
+                        continue
+                    ph = Placeholder(slot_int)
+                placeholders.append(ph)
+                encoded_args.append(ph)
+            else:
+                encoded_args.append(_replace_values_with_placeholders(val, t, placeholders))
+        encoded = encode_with_hooks(self._param_types, encoded_args)
+        blob = self._selector + encoded
+
+        # Every Placeholder must have had its offset recorded by the encoder
+        # hook.  An unresolved one would silently leave the ABI zero stand-in
+        # in the blob at runtime and produce a subtly wrong call — fail loud.
+        unresolved = [i for i, p in enumerate(placeholders) if p.offset is None]
+        if unresolved:
+            raise ValueError(
+                f"template {self._signature!r}: failed to resolve calldata offset "
+                f"for {len(unresolved)} Placeholder(s) — possibly nested in a "
+                "tuple/list type the encoder didn't traverse with hooks"
+            )
+        patches: dict[int, ValueLike] = {p.offset: p.value for p in placeholders if p.offset is not None}
+        return CalldataPayload(blob, patches)
 
 
 def _asm_item_size(item: object) -> int:
@@ -217,13 +410,103 @@ def _shift_label_pushes(asm: list, bytecode: bytes, shift: int) -> bytes:
     return bytes(buf)
 
 
-def _collect_placeholders(arg: object, sink: list[Placeholder]) -> None:
-    """Recursively walk *arg* and append every :class:`Placeholder` to *sink*."""
-    if isinstance(arg, Placeholder):
-        sink.append(arg)
-    elif isinstance(arg, (tuple, list)):
-        for item in arg:
-            _collect_placeholders(item, sink)
+def _normalise_static(val: object, abi_type: str) -> object:
+    """Coerce user-friendly static values to shapes eth_abi accepts.
+
+    Only the *scalar* forms that pydefi users commonly pass are handled:
+    ``int`` for an ``address`` slot is turned into a 20-byte big-endian
+    ``bytes``. Everything else (including runtime :class:`Value` handles
+    and containers) passes through unchanged for downstream hooks.
+    """
+    if abi_type == "address" and isinstance(val, int) and not isinstance(val, bool):
+        if val < 0 or val >= (1 << 160):
+            raise ValueError(f"template: address literal {val} does not fit in 20 bytes")
+        return val.to_bytes(20, "big")
+    return val
+
+
+def _element_type(abi_type: str) -> str:
+    """Return the element type of an ABI array type (``T[]`` or ``T[N]``).
+
+    ``"address[]"`` → ``"address"``, ``"uint256[3]"`` → ``"uint256"``,
+    ``"bytes32[][]"`` → ``"bytes32[]"`` (strips one level only).  If
+    *abi_type* is not an array type, returns it unchanged.
+    """
+    if abi_type.endswith("]"):
+        idx = abi_type.rfind("[")
+        if idx > 0:
+            return abi_type[:idx]
+    return abi_type
+
+
+def _tuple_component_types(abi_type: str) -> list[str]:
+    """Split a tuple ABI type string ``(T1,T2,...)`` into its components.
+
+    ``"(address,uint256)"`` → ``["address", "uint256"]``,
+    ``"(address,(uint256,uint256))"`` → ``["address", "(uint256,uint256)"]``.
+    Returns ``[]`` if *abi_type* is not a tuple type.
+
+    Respects nesting — commas inside nested tuples / fixed arrays do not
+    split components at the outer level.
+    """
+    if not (abi_type.startswith("(") and abi_type.endswith(")")):
+        return []
+    inner = abi_type[1:-1]
+    parts: list[str] = []
+    depth = 0
+    cur = ""
+    for ch in inner:
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        cur += ch
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def _replace_values_with_placeholders(arg: object, abi_type: str, sink: list[Placeholder]) -> object:
+    """Recursively replace :class:`Value` instances with :class:`Placeholder`.
+
+    *abi_type* is the type string for *arg* (e.g. ``"uint256"``,
+    ``"address"``, ``"(uint256,address)"`` for a struct, ``"address[]"``
+    for a dynamic array).  Threaded down through nested tuples/lists so
+    that nested ``int`` leaves at ``address`` slots are coerced to 20-byte
+    form via :func:`_normalise_static`.
+
+    The :class:`Placeholder` itself derives its encoder-friendly stand-in
+    from :class:`EncodingContext` at hook-call time, so the type is not
+    needed to pick a type-appropriate placeholder — it is threaded here
+    only for the static-leaf normalisation path.
+
+    Returns a fresh structure suitable for :func:`eth_abi.encode_with_hooks`.
+    Non-Value leaves (int, str, bool, bytes) pass through ``_normalise_static``.
+    """
+    if isinstance(arg, Value):
+        ph = Placeholder(arg)
+        sink.append(ph)
+        return ph
+    if isinstance(arg, tuple):
+        component_types = _tuple_component_types(abi_type)
+        # Fall back to empty-string typing only if the type string didn't
+        # look like a tuple — this preserves the old behavior for callers
+        # that pass non-tuple types but still happen to use a tuple arg.
+        if len(component_types) != len(arg):
+            component_types = [""] * len(arg)
+        return tuple(_replace_values_with_placeholders(item, t, sink) for item, t in zip(arg, component_types))
+    if isinstance(arg, list):
+        elem_type = _element_type(abi_type)
+        return [_replace_values_with_placeholders(item, elem_type, sink) for item in arg]
+    # Non-Value scalar leaf: normalise before handing off to eth_abi.  This
+    # matters in nested containers too — e.g. an ``int`` in an ``address[]``
+    # element must be coerced to 20-byte bytes, same as a top-level
+    # ``address`` arg.
+    return _normalise_static(arg, abi_type)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +543,10 @@ class Program:
         self._ctx.entry_function = self._fn
         self._builder = VenomBuilder(self._ctx, self._fn)
         self._data_section_counter = 0  # for unique label names
+        # Dedup identical calldata blobs — same bytes → same data section →
+        # same IRLabel. Saves bytecode size when the same template is reused
+        # across many call_contract / template invocations.
+        self._blob_labels: dict[bytes, IRLabel] = {}
 
     # ------------------------------------------------------------------
     # Operand coercion
@@ -478,10 +765,14 @@ class Program:
             raise ValueError(f"calldata too large ({len(calldata)} bytes, max 65535)")
         blen = len(calldata)
 
-        label = IRLabel(f"pydefi_calldata_{self._data_section_counter}", is_symbol=True)
-        self._data_section_counter += 1
-        self._ctx.append_data_section(label)
-        self._ctx.append_data_item(calldata)
+        # Dedup: identical blobs share one data section.
+        label = self._blob_labels.get(calldata)
+        if label is None:
+            label = IRLabel(f"pydefi_calldata_{self._data_section_counter}", is_symbol=True)
+            self._data_section_counter += 1
+            self._ctx.append_data_section(label)
+            self._ctx.append_data_item(calldata)
+            self._blob_labels[calldata] = label
 
         base = self._alloc(blen)
         self._builder.codecopy(base, label, blen)
@@ -495,10 +786,27 @@ class Program:
     # External calls
     # ------------------------------------------------------------------
 
+    def template(self, signature: str, *, names: "list[str] | None" = None) -> CalldataTemplate:
+        """Build a reusable ABI calldata template.
+
+        The returned :class:`CalldataTemplate` encodes a zero-filled blob once
+        and records per-parameter byte offsets. Invoking it produces a
+        :class:`CalldataPayload` whose blob is identical across invocations,
+        so :meth:`call_contract`'s blob dedup cache reuses one data section
+        regardless of how many times the template is called.
+
+        Example::
+
+            xfer = p.template("transfer(address to, uint256 amount)")
+            for recipient, amount in rows:
+                p.call_contract(weth, xfer(to=recipient, amount=amount))
+        """
+        return CalldataTemplate(signature, names=names)
+
     def call_contract(
         self,
         to: ValueLike,
-        calldata: bytes,
+        calldata: "bytes | CalldataPayload",
         *,
         value: ValueLike = 0,
         gas: ValueLike | None = None,
@@ -508,8 +816,12 @@ class Program:
 
         Args:
             to:        Target contract address.
-            calldata:  Pre-encoded calldata template; stored in a Venom data
-                       section and copied into memory before the call.
+            calldata:  Either pre-encoded calldata bytes, or a
+                       :class:`CalldataPayload` from a
+                       :class:`CalldataTemplate`. In the latter case, patches
+                       are auto-derived; any explicit *patches* argument is
+                       merged over the template's (caller wins on offset
+                       collision).
             value:     ETH value to forward (wei).
             gas:       Gas limit; ``None`` forwards all remaining gas.
             patches:   Optional ``{calldata_offset: value}`` overlay.  Each
@@ -520,6 +832,11 @@ class Program:
             A :class:`Value` holding the CALL success flag (1 on success,
             0 on failure).  Use :meth:`assert_` to revert on failure.
         """
+        if isinstance(calldata, CalldataPayload):
+            # Explicit caller *patches* win on offset collision.
+            patches = {**calldata.patches, **(patches or {})}
+            calldata = calldata.blob
+
         base_fp, blen = self._alloc_calldata(calldata)
 
         if patches:
@@ -543,64 +860,6 @@ class Program:
             0,
         )
         return success
-
-    def call_contract_abi(
-        self,
-        to: ValueLike,
-        abi_sig: str,
-        *args: object,
-        value: ValueLike = 0,
-        gas: ValueLike | None = None,
-    ) -> Value:
-        """Emit a CALL with calldata built from a human-readable ABI signature.
-
-        Plain Python values (``int``, ``str`` address, ``bool``, ``bytes``,
-        nested ``tuple``/``list``) are statically encoded.  Wrap any runtime
-        :class:`Value` in :class:`Placeholder` to have it patched into the
-        encoded calldata at runtime via ``mstore`` before ``CALL``.
-
-        The ``function`` keyword in *abi_sig* is optional; both bare
-        ``"transfer(address,uint256)"`` and qualified ``"function transfer(...)"``
-        forms are accepted.
-
-        Returns:
-            A :class:`Value` holding the CALL success flag.
-        """
-        normalised = abi_sig if abi_sig.lstrip().startswith("function ") else "function " + abi_sig
-        fn = ContractFunction.from_abi(normalised)
-        param_types = fn.input_types
-
-        if len(args) != len(param_types):
-            raise ValueError(
-                f"call_contract_abi: expected {len(param_types)} argument(s) for signature {abi_sig!r}, got {len(args)}"
-            )
-
-        # Scan args for Placeholder instances — the encoder invokes each as a
-        # hook, which records its calldata offset.
-        placeholders: list[Placeholder] = []
-        for a in args:
-            _collect_placeholders(a, placeholders)
-
-        if not placeholders:
-            calldata = bytes(fn.selector) + encode(param_types, args)
-            return self.call_contract(to, calldata, value=value, gas=gas)
-
-        encoded = encode_with_hooks(param_types, args)
-        # Every Placeholder must have had its calldata offset recorded by the
-        # encoder hook.  An unresolved one would silently leave the ABI
-        # stand-in (0 / address(0) / False) in place at runtime and produce a
-        # subtly wrong call — fail loudly instead.
-        unresolved = [i for i, p in enumerate(placeholders) if p.offset is None]
-        if unresolved:
-            raise ValueError(
-                f"call_contract_abi: failed to resolve calldata offset for "
-                f"{len(unresolved)} Placeholder(s) in signature {abi_sig!r} "
-                f"— possibly nested in a tuple/list type the encoder didn't "
-                f"traverse with hooks"
-            )
-        calldata = bytes(fn.selector) + encoded
-        patches: dict[int, ValueLike] = {p.offset: p.value for p in placeholders if p.offset is not None}
-        return self.call_contract(to, calldata, value=value, gas=gas, patches=patches)
 
     # ------------------------------------------------------------------
     # Returndata
