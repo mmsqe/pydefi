@@ -112,11 +112,6 @@ ValueLike = Union[Value, int, bytes]
 # ---------------------------------------------------------------------------
 
 
-def _pad32(data: bytes) -> bytes:
-    """Return *data* zero-padded to the next 32-byte boundary."""
-    return data.ljust((len(data) + 31) & ~31, b"\x00")
-
-
 def _placeholder_for_encoder(encoder: object) -> object:
     """Return a value that the given ``eth_abi`` encoder will accept.
 
@@ -495,15 +490,15 @@ class Program:
         label = IRLabel(f"pydefi_calldata_{self._data_section_counter}", is_symbol=True)  # type: ignore[operator]
         self._data_section_counter += 1
         self._ctx.append_data_section(label)
-        self._ctx.append_data_item(_pad32(calldata))
+        self._ctx.append_data_item(calldata)
 
         # base_fp = mem[0x40] | (iszero(mem[0x40]) * 0x280)  — defaults to 0x280
         fp = self._builder.mload(IRLiteral(0x40))  # type: ignore[arg-type]
         default_fp = self._builder.mul(self._builder.iszero(fp), 0x280)
         base_fp = self._builder.or_(fp, default_fp)
-        # codecopy(base_fp, &calldata, blen_padded)
-        self._builder.codecopy(base_fp, label, blen_padded)
-        # mem[0x40] = base_fp + blen_padded
+        # codecopy(base_fp, &calldata, blen) — memory is zero-initialised, no pad needed
+        self._builder.codecopy(base_fp, label, blen)
+        # advance mem[0x40] on a 32-byte boundary
         self._builder.mstore(IRLiteral(0x40), self._builder.add(base_fp, blen_padded))  # type: ignore[arg-type]
         return base_fp, blen
 
