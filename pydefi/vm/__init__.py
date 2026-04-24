@@ -15,7 +15,7 @@ Usage::
 """
 
 from pydefi.vm.dag import build_execution_program_for_dag, build_quote_program_for_dag
-from pydefi.vm.program import Program, Value
+from pydefi.vm.program import Placeholder, Program, Value
 from pydefi.vm.swap import (
     V2_AMOUNT_OUT_OFFSET,
     V3_AMOUNT_OUT_OFFSET,
@@ -30,6 +30,7 @@ from pydefi.vm.swap import (
 )
 
 __all__ = [
+    "Placeholder",
     "Program",
     "SwapHop",
     "SwapProtocol",

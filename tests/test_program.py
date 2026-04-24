@@ -6,7 +6,13 @@ import pytest
 from hexbytes import HexBytes
 
 from pydefi.types import BasePool, RouteDAG, SwapProtocol, Token
-from pydefi.vm import Program, Value, build_execution_program_for_dag, build_quote_program_for_dag
+from pydefi.vm import (
+    Placeholder,
+    Program,
+    Value,
+    build_execution_program_for_dag,
+    build_quote_program_for_dag,
+)
 from tests.conftest import mini_evm
 
 # Common test address — mini_evm makes any CALL succeed.
@@ -294,21 +300,21 @@ class TestCallContractAbi:
     def test_value_placeholder_uint256(self):
         p = Program()
         amount = p.const(0xDEADBEEF)
-        success = p.call_contract_abi(_TARGET, "set(uint256)", amount)
+        success = p.call_contract_abi(_TARGET, "set(uint256)", Placeholder(amount))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_value_placeholder_address(self):
         p = Program()
         addr = p.addr(_TARGET)
-        success = p.call_contract_abi(_TARGET, "ping(address)", addr)
+        success = p.call_contract_abi(_TARGET, "ping(address)", Placeholder(addr))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_mixed_static_and_value(self):
         p = Program()
         amount = p.const(7)
-        success = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, amount)
+        success = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, Placeholder(amount))
         p.return_word(success)
         assert _run_int(p) == 1
 

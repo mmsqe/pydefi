@@ -36,7 +36,7 @@ from pydefi.abi.amm import UNISWAP_V3_POOL
 from pydefi.pathfinder.graph import PoolGraph, V3PoolEdge
 from pydefi.pathfinder.router import Router
 from pydefi.types import Address, TokenAmount
-from pydefi.vm import Program
+from pydefi.vm import Placeholder, Program
 from pydefi.vm.swap import build_swap_transaction
 from tests.addrs import POOL_WETH_USDC_500, POOL_WETH_USDC_3000
 from tests.live.sol_utils import MOCK_TOKEN_SOL, compile_sol_file, compile_sol_source, deploy, ensure_solc
@@ -495,7 +495,7 @@ class TestDeFiVMFork:
         success = prog.call_contract_abi(
             adapter,
             "function double(uint256 x) external pure returns (uint256)",
-            amount,
+            Placeholder(amount),
         )
         prog.assert_(success)
         prog.assert_(prog.eq(prog.returndata_word(0), 14), "expected 14")
@@ -517,8 +517,8 @@ class TestDeFiVMFork:
         success = prog.call_contract_abi(
             adapter,
             "function addInputs(uint256 a, uint256 b) external pure returns (uint256)",
-            a,
-            b,
+            Placeholder(a),
+            Placeholder(b),
         )
         prog.assert_(success)
         prog.assert_(prog.eq(prog.returndata_word(0), 17), "expected 17")
@@ -537,12 +537,12 @@ class TestDeFiVMFork:
         double_sig = "function double(uint256 x) external pure returns (uint256)"
 
         prog = Program()
-        # Call 1: double(5) → 10  (literal arg, no Value handle)
+        # Call 1: double(5) → 10  (literal arg, no Placeholder needed)
         s1 = prog.call_contract_abi(adapter, double_sig, 5)
         prog.assert_(s1)
         amount = prog.returndata_word(0)
-        # Call 2: double(amount) → 20  (Value handle becomes a runtime patch)
-        s2 = prog.call_contract_abi(adapter, double_sig, amount)
+        # Call 2: double(amount) → 20  (Placeholder-wrapped runtime patch)
+        s2 = prog.call_contract_abi(adapter, double_sig, Placeholder(amount))
         prog.assert_(s2)
         prog.assert_(prog.eq(prog.returndata_word(0), 20), "expected 20")
         prog.stop()

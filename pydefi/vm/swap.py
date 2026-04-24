@@ -16,7 +16,7 @@ from eth_contract.contract import ContractFunction
 from eth_utils import keccak
 
 from pydefi.types import Address, RouteDAG, RouteSwap, SwapProtocol, SwapRoute, SwapTransaction
-from pydefi.vm.program import Program, Value
+from pydefi.vm.program import Placeholder, Program, Value
 
 # ---------------------------------------------------------------------------
 # Pool function ABI signatures
@@ -119,7 +119,7 @@ def _build_v3_pool_swap(prog: Program, amount_in: Value, hop: SwapHop) -> Value:
         " int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes data)",
         hop.recipient,
         hop.zero_for_one,
-        amount_in,  # patched in
+        Placeholder(amount_in),
         sqrt_price_limit_x96,
         callback_data,
     )
@@ -169,7 +169,7 @@ def _build_v3_quote(prog: Program, amount_in: Value, hop: SwapHop, quoter_addres
         quoter_address,
         "function quoteExactInput(bytes path, uint256 amountIn) returns (uint256 amountOut)",
         packed_path,
-        amount_in,  # patched in
+        Placeholder(amount_in),
     )
     prog.assert_(success)
     return prog.returndata_word(0)
@@ -187,7 +187,7 @@ def _build_v2_direct_swap(prog: Program, amount_in: Value, hop: SwapHop) -> Valu
         hop.token_in,
         "function transfer(address to, uint256 amount)",
         hop.pool,
-        amount_in,
+        Placeholder(amount_in),
     )
     prog.assert_(transfer_success)
 
@@ -198,7 +198,7 @@ def _build_v2_direct_swap(prog: Program, amount_in: Value, hop: SwapHop) -> Valu
             hop.pool,
             "function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)",
             0,
-            amount_out,
+            Placeholder(amount_out),
             hop.recipient,
             b"",
         )
@@ -206,7 +206,7 @@ def _build_v2_direct_swap(prog: Program, amount_in: Value, hop: SwapHop) -> Valu
         swap_success = prog.call_contract_abi(
             hop.pool,
             "function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)",
-            amount_out,
+            Placeholder(amount_out),
             0,
             hop.recipient,
             b"",
