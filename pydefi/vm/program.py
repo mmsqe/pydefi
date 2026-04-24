@@ -502,8 +502,7 @@ class Program:
         default_fp = self._builder.mul(self._builder.iszero(fp), 0x280)
         base_fp = self._builder.or_(fp, default_fp)
         # codecopy(base_fp, &calldata, blen_padded)
-        data_src = self._builder.offset(0, label)
-        self._builder.codecopy(base_fp, data_src, blen_padded)
+        self._builder.codecopy(base_fp, label, blen_padded)
         # mem[0x40] = base_fp + blen_padded
         self._builder.mstore(IRLiteral(0x40), self._builder.add(base_fp, blen_padded))  # type: ignore[arg-type]
         return base_fp, blen
