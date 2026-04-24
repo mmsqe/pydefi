@@ -68,17 +68,15 @@ pragma solidity ^0.8.24;
  * where ``amountReceived = amount - feeExecuted`` (the actual USDC minted
  * to this contract after the relayer fee is deducted).
  *
- * A typical program begins by saving these into registers::
+ * A Python program picks them up with ``stack_param`` and threads the SSA
+ * values wherever they are needed::
  *
- *   STORE_REG 0   ; R0 = sourceDomain
- *   STORE_REG 1   ; R1 = amountReceived (USDC received, 6 decimals)
- *   ; ... use R0 and R1 anywhere later with LOAD_REG ...
+ *   from pydefi.vm.program import Program
  *
- * Python helper (``pydefi.vm.program``)::
- *
- *   from pydefi.vm.program import store_reg, ...
- *
- *   program = store_reg(0) + store_reg(1) + ...
+ *   prog = Program()
+ *   amount_received = prog.stack_param()  # bottom (pushed first)
+ *   source_domain   = prog.stack_param()  # top    (pushed second)
+ *   ; ... use amount_received / source_domain anywhere later ...
  */
 
 // ---------------------------------------------------------------------------

@@ -41,23 +41,21 @@ pragma solidity ^0.8.24;
  *   PUSH32 <amountLD>   ; 0x7F opcode + 32B → stack[0] (bottom)
  *   PUSH20 <_from>      ; 0x73 opcode + 20B → stack[1] (top)
  *
- * A typical program begins by saving these into registers::
+ * A Python program picks them up with ``stack_param`` and threads the SSA
+ * values wherever they are needed::
  *
- *   STORE_REG 0   ; R0 = _from    (OFT contract that delivered the tokens)
- *   STORE_REG 1   ; R1 = amountLD (tokens delivered, in local decimals)
- *   ; ... use R0 and R1 anywhere later with LOAD_REG ...
+ *   from pydefi.vm.program import Program
  *
- * Python helper (``pydefi.vm.program``)::
+ *   prog = Program()
+ *   amount_ld = prog.stack_param()  # bottom (pushed first)
+ *   from_addr = prog.stack_param()  # top    (pushed second)
+ *   ; ... use amount_ld / from_addr anywhere later ...
  *
- *   import struct
- *   from pydefi.vm.program import store_reg, ...
- *
- *   program = store_reg(0) + store_reg(1) + ...
  *   message = (
  *       struct.pack('>Q', nonce)        # 8 bytes  — uint64 nonce
  *       + struct.pack('>I', src_eid)    # 4 bytes  — uint32 srcEid
  *       + amount_ld.to_bytes(32, 'big') # 32 bytes — uint256 amountLD
- *       + program                       # DeFiVM bytecode
+ *       + prog.build(...)               # DeFiVM bytecode
  *   )
  */
 

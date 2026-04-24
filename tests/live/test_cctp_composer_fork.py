@@ -48,17 +48,14 @@ def _compose_program(target_address: Address, target_calldata: bytes, *, value: 
     The composer prologue leaves two values on the EVM stack before dispatch.
     Venom's ``stack_param`` returns them in push order (deepest first), so the
     first call returns ``amountReceived`` and the second returns
-    ``sourceDomain``.  We store them into R1 / R0 to match the layout
-    documented in CCTPComposer.sol.
+    ``sourceDomain``.
 
     On CALL failure the outer ``receiveAndExecute`` reverts (matching legacy
     ``call(require_success=True)``).
     """
     prog = Program()
-    amount = prog.stack_param()  # bottom of the two prologue PUSHes (pushed first)
-    source_domain = prog.stack_param()  # top of the two (pushed second)
-    prog.store_reg(0, source_domain)
-    prog.store_reg(1, amount)
+    _amount = prog.stack_param()  # bottom of the two prologue PUSHes (pushed first)
+    _source_domain = prog.stack_param()  # top of the two (pushed second)
     success = prog.call_contract(target_address, target_calldata, value=value)
     prog.assert_(success)
     prog.stop()

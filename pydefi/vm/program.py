@@ -34,14 +34,11 @@ Design notes
 appends instructions to the *current* basic block, exposed via
 ``self._builder.current_block()``.
 
-**Memory model (DELEGATECALL execution).**  Programs are run by the
-Analog-Labs interpreter via ``DELEGATECALL``, which means we manage
-free-memory ourselves rather than relying on Venom's compile-time
-``alloca``/``memtop``.  Layout matches the legacy builder:
-
-* Registers:        ``mem[0x80 + i*32]`` for ``i`` in 0..15
-* Free-mem pointer: ``mem[0x40]`` (defaults to 0x280 on first use)
-* Dynamic buffers:  start at ``mem[0x280]``
+**Memory model.**  All memory is allocated via Venom's ``alloca`` primitive
+— the allocator picks concrete offsets at compile time and packs buffers
+into non-overlapping live ranges.  There is no hand-managed free-memory
+pointer and no fixed register region; mutable slots are requested with
+:meth:`alloc_slot` and addressed via a handle returned from that call.
 
 **Calldata buffers.**  Static calldata for external calls is appended to a
 Venom data section; the body emits ``codecopy`` from the section into a
@@ -250,8 +247,8 @@ class Program:
     Methods either:
 
     * **Produce a value** — return a :class:`Value` handle.  Examples:
-      :meth:`const`, :meth:`add`, :meth:`call_contract`, :meth:`load_reg`.
-    * **Have a side effect** — return ``None``.  Examples: :meth:`store_reg`,
+      :meth:`const`, :meth:`add`, :meth:`call_contract`, :meth:`load_slot`.
+    * **Have a side effect** — return ``None``.  Examples: :meth:`store_slot`,
       :meth:`assert_`, :meth:`stop`, :meth:`jump`.
 
     Wherever a method takes a ``ValueLike`` argument, you may pass a
@@ -264,10 +261,10 @@ class Program:
     # ------------------------------------------------------------------
 
     def __init__(self) -> None:
-        self._ctx = IRContext()  # type: ignore[operator]
+        self._ctx = IRContext()
         self._fn = self._ctx.create_function("main")
         self._ctx.entry_function = self._fn
-        self._builder = VenomBuilder(self._ctx, self._fn)  # type: ignore[operator]
+        self._builder = VenomBuilder(self._ctx, self._fn)
         self._data_section_counter = 0  # for unique label names
 
     # ------------------------------------------------------------------
@@ -306,13 +303,13 @@ class Program:
             raise ValueError(f"const: value must be non-negative, got {n}")
         if n >= 1 << 256:
             raise ValueError(f"const: value {n} does not fit in uint256")
-        return IRLiteral(n)  # type: ignore[operator]
+        return IRLiteral(n)
 
     def addr(self, a: "Address") -> Value:
         """Return a :class:`Value` for a 20-byte EVM address."""
         if len(a) != 20:
             raise ValueError(f"addr: address must be 20 bytes, got {len(a)}")
-        return IRLiteral(int.from_bytes(bytes(a), "big"))  # type: ignore[operator]
+        return IRLiteral(int.from_bytes(bytes(a), "big"))
 
     # ------------------------------------------------------------------
     # Arithmetic
@@ -411,22 +408,23 @@ class Program:
         return self._builder.shr(self._to_operand(shift), self._to_operand(value))
 
     # ------------------------------------------------------------------
-    # Memory / Registers
+    # Memory slots
     # ------------------------------------------------------------------
 
-    def load_reg(self, i: int) -> Value:
-        """Load 32-byte word from register *i* (memory slot ``0x80 + i*32``)."""
-        if not 0 <= i <= 15:
-            raise ValueError(f"load_reg: register index must be 0..15, got {i}")
-        addr = 0x80 + i * 32
-        return self._builder.mload(IRLiteral(addr))  # type: ignore[arg-type]
+    def alloc_slot(self) -> IRVariable:
+        """Allocate a 32-byte memory slot and return a handle to its address.
 
-    def store_reg(self, i: int, v: ValueLike) -> None:
-        """Store *v* into register *i* (memory slot ``0x80 + i*32``)."""
-        if not 0 <= i <= 15:
-            raise ValueError(f"store_reg: register index must be 0..15, got {i}")
-        addr = 0x80 + i * 32
-        self._builder.mstore(IRLiteral(addr), self._to_operand(v))  # type: ignore[arg-type]
+        Use :meth:`store_slot` and :meth:`load_slot` to read and write it.
+        """
+        return self._builder.alloca(32)
+
+    def load_slot(self, slot: IRVariable) -> Value:
+        """Load the 32-byte word stored at *slot*."""
+        return self._builder.mload(slot)
+
+    def store_slot(self, slot: IRVariable, v: ValueLike) -> None:
+        """Store *v* (32 bytes) into *slot*."""
+        self._builder.mstore(slot, self._to_operand(v))
 
     # ------------------------------------------------------------------
     # Self / context
@@ -472,43 +470,32 @@ class Program:
         return self._builder.mload(scratch)
 
     # ------------------------------------------------------------------
-    # Internal: free-memory and data-section helpers
+    # Internal: memory + data-section helpers (Venom alloca)
     # ------------------------------------------------------------------
 
     def _alloc_calldata(self, calldata: bytes) -> tuple[IRVariable, int]:
-        """Append *calldata* as a Venom data section, copy into free memory.
+        """Append *calldata* as a Venom data section, copy into a fresh buffer.
 
-        Returns ``(base_fp, blen)`` where ``base_fp`` is the SSA pointer to
-        the start of the buffer in memory and ``blen`` is the unpadded byte
+        Returns ``(base, blen)`` where ``base`` is the SSA pointer to the
+        start of the buffer in memory and ``blen`` is the unpadded byte
         length (the value to pass as ``argsLen`` to ``CALL``).
         """
         if len(calldata) > 0xFFFF:
             raise ValueError(f"calldata too large ({len(calldata)} bytes, max 65535)")
         blen = len(calldata)
-        blen_padded = (blen + 31) & ~31
 
-        label = IRLabel(f"pydefi_calldata_{self._data_section_counter}", is_symbol=True)  # type: ignore[operator]
+        label = IRLabel(f"pydefi_calldata_{self._data_section_counter}", is_symbol=True)
         self._data_section_counter += 1
         self._ctx.append_data_section(label)
         self._ctx.append_data_item(calldata)
 
-        # base_fp = mem[0x40] | (iszero(mem[0x40]) * 0x280)  — defaults to 0x280
-        fp = self._builder.mload(IRLiteral(0x40))  # type: ignore[arg-type]
-        default_fp = self._builder.mul(self._builder.iszero(fp), 0x280)
-        base_fp = self._builder.or_(fp, default_fp)
-        # codecopy(base_fp, &calldata, blen) — memory is zero-initialised, no pad needed
-        self._builder.codecopy(base_fp, label, blen)
-        # advance mem[0x40] on a 32-byte boundary
-        self._builder.mstore(IRLiteral(0x40), self._builder.add(base_fp, blen_padded))  # type: ignore[arg-type]
-        return base_fp, blen
+        base = self._alloc(blen)
+        self._builder.codecopy(base, label, blen)
+        return base, blen
 
     def _alloc(self, size: int) -> IRVariable:
-        """Reserve *size* bytes in free memory, advance ``mem[0x40]``, return base."""
-        fp = self._builder.mload(IRLiteral(0x40))  # type: ignore[arg-type]
-        default_fp = self._builder.mul(self._builder.iszero(fp), 0x280)
-        base = self._builder.or_(fp, default_fp)
-        self._builder.mstore(IRLiteral(0x40), self._builder.add(base, size))  # type: ignore[arg-type]
-        return base
+        """Allocate *size* bytes (rounded up to 32) and return the base pointer."""
+        return self._builder.alloca((size + 31) & ~31)
 
     # ------------------------------------------------------------------
     # External calls
@@ -709,9 +696,10 @@ class Program:
         self._builder.return_(self._to_operand(offset), self._to_operand(length))
 
     def return_word(self, value: ValueLike) -> None:
-        """Convenience: store *value* at ``mem[0]`` and ``RETURN(0, 32)``."""
-        self._builder.mstore(IRLiteral(0), self._to_operand(value))  # type: ignore[arg-type]
-        self._builder.return_(IRLiteral(0), IRLiteral(32))  # type: ignore[arg-type]
+        """Convenience: store *value* into a fresh slot and ``RETURN`` it (32 bytes)."""
+        slot = self._builder.alloca(32)
+        self._builder.mstore(slot, self._to_operand(value))
+        self._builder.return_(slot, IRLiteral(32))
 
     def revert(self, offset: ValueLike = 0, length: ValueLike = 0) -> None:
         """Terminate with ``REVERT(offset, length)`` — revert with memory slice."""

@@ -24,10 +24,9 @@ pragma solidity ^0.8.24;
  * Memory conventions (inside programs)
  * -------------------------------------
  *  Programs execute in a fresh virtual memory context provided by the interpreter.
- *  Recommended layout (used by the Python DSL):
- *  Registers  : memory[0x80 + i*32] for i in 0..15  (16 x 32-byte slots)
- *  Free memory: memory[0x40] tracks the next free byte (initialised to 0x280 on first use)
- *  Dynamic buf: allocated starting from memory[0x280] upward
+ *  The Python DSL (``pydefi.vm.program``) compiles programs through Venom IR,
+ *  which allocates and packs all memory buffers automatically via ``alloca``;
+ *  the DSL does not hand-manage ``memory[0x40]`` or use fixed register slots.
  *
  * Security assumptions
  * --------------------

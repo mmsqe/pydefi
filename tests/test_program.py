@@ -149,30 +149,26 @@ class TestBitwise:
 
 
 # ---------------------------------------------------------------------------
-# Registers
+# Memory slots
 # ---------------------------------------------------------------------------
 
 
-class TestRegisters:
+class TestMemorySlots:
     def test_store_load_roundtrip(self):
         p = Program()
-        p.store_reg(0, p.const(42))
-        p.return_word(p.load_reg(0))
+        s = p.alloc_slot()
+        p.store_slot(s, p.const(42))
+        p.return_word(p.load_slot(s))
         assert _run_int(p, disable_constant_folding=True) == 42
 
-    def test_multiple_registers(self):
+    def test_multiple_slots(self):
         p = Program()
-        p.store_reg(3, p.const(11))
-        p.store_reg(7, p.const(22))
-        p.return_word(p.add(p.load_reg(3), p.load_reg(7)))
+        a = p.alloc_slot()
+        b = p.alloc_slot()
+        p.store_slot(a, p.const(11))
+        p.store_slot(b, p.const(22))
+        p.return_word(p.add(p.load_slot(a), p.load_slot(b)))
         assert _run_int(p, disable_constant_folding=True) == 33
-
-    def test_invalid_register_index_rejected(self):
-        p = Program()
-        with pytest.raises(ValueError, match="0..15"):
-            p.load_reg(16)
-        with pytest.raises(ValueError, match="0..15"):
-            p.store_reg(-1, p.const(0))
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +388,8 @@ class TestTermination:
     def test_implicit_stop(self):
         # Build with no explicit terminator — should auto-stop.
         p = Program()
-        p.store_reg(0, p.const(99))  # produces no stack effect
+        s = p.alloc_slot()
+        p.store_slot(s, p.const(99))  # produces no stack effect
         bytecode = p.build()
         result = mini_evm(bytecode)
         assert not result.is_error
@@ -482,8 +479,9 @@ def _build_assert_program() -> Program:
     """assert_(cond, msg) emits jnz + ok/revert basic blocks — exercises
     PUSHLABEL immediates for the branch targets."""
     p = Program()
-    p.store_reg(0, 1)
-    p.assert_(p.load_reg(0), "should not revert")
+    s = p.alloc_slot()
+    p.store_slot(s, 1)
+    p.assert_(p.load_slot(s), "should not revert")
     p.return_word(99)
     return p
 

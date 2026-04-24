@@ -4,7 +4,7 @@ Compiles DeFiVM.sol and a mock adapter with py-solc-x, deploys on a local
 Anvil mainnet fork, and exercises the SSA :class:`pydefi.vm.Program`
 across:
 
- - Register round-trips (store_reg / load_reg)
+ - Slot round-trips (alloc_slot / store_slot / load_slot)
  - Assertions (assert_, assert_ge, assert_le) with and without Error(string) msgs
  - ETH and ERC-20 balance introspection (eth_balance / erc20_balance_of)
  - External CALL with static calldata
@@ -183,15 +183,16 @@ class TestDeFiVMFork:
     # Stack / register instructions
     # ------------------------------------------------------------------
 
-    async def test_store_load_register(self, ctx):
-        """store_reg / load_reg round-trip a value through memory."""
+    async def test_store_load_slot(self, ctx):
+        """store_slot / load_slot round-trip a value through an alloca'd slot."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
 
         prog = Program()
-        prog.store_reg(0, 0xDEADBEEF)
-        _ = prog.load_reg(0)  # side-effect check: program compiles and runs
+        slot = prog.alloc_slot()
+        prog.store_slot(slot, 0xDEADBEEF)
+        _ = prog.load_slot(slot)  # side-effect check: program compiles and runs
         prog.stop()
         program = prog.build(disable_constant_folding=True)
 
