@@ -34,17 +34,11 @@ Design notes
 appends instructions to the *current* basic block, exposed via
 ``self._builder.current_block()``.
 
-**Memory model.**  All memory is allocated via Venom's ``alloca`` primitive
-— the allocator picks concrete offsets at compile time and packs buffers
-into non-overlapping live ranges.  There is no hand-managed free-memory
-pointer and no fixed register region; mutable slots are requested with
-:meth:`alloc_slot` and addressed via a handle returned from that call.
-
 **Calldata buffers.**  Static calldata for external calls is appended to a
 Venom data section; the body emits ``codecopy`` from the section into a
-fresh memory allocation, applies optional patches via ``mstore``, then
-``call``.  Venom resolves the data-section label to its absolute byte
-position in the compiled output, so no post-processing patches are needed.
+fresh allocation, applies optional patches via ``mstore``, then ``call``.
+Venom resolves the data-section label to its absolute byte position in
+the compiled output, so no post-processing patches are needed.
 
 **Termination.**  A ``Program`` is "open" until the user calls one of
 :meth:`stop`, :meth:`return_`, :meth:`return_word`, :meth:`revert`, or a
