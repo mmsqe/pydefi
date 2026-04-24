@@ -11,7 +11,7 @@ across:
  - Returndata access (returndata_word)
  - Runtime patching of calldata templates (``patches=`` kwarg)
  - Chained calls (first call's output → second call's patched input)
- - High-level ABI builder (call_contract_abi) with Value handles as patches
+ - High-level ABI builder (Program.template) with Value handles as patches
 
 Run with::
 
@@ -36,7 +36,7 @@ from pydefi.abi.amm import UNISWAP_V3_POOL
 from pydefi.pathfinder.graph import PoolGraph, V3PoolEdge
 from pydefi.pathfinder.router import Router
 from pydefi.types import Address, TokenAmount
-from pydefi.vm import Placeholder, Program
+from pydefi.vm import Program
 from pydefi.vm.swap import build_swap_transaction
 from tests.addrs import POOL_WETH_USDC_500, POOL_WETH_USDC_3000
 from tests.live.sol_utils import MOCK_TOKEN_SOL, compile_sol_file, compile_sol_source, deploy, ensure_solc
@@ -480,11 +480,11 @@ class TestDeFiVMFork:
         assert receipt["status"] == 1
 
     # ------------------------------------------------------------------
-    # call_contract_abi with Patch (high-level ABI builder)
+    # Template-based ABI calldata with Value patches
     # ------------------------------------------------------------------
 
-    async def test_call_contract_abi_patch_single_uint256(self, ctx):
-        """call_contract_abi with a Value handle for the uint256 arg auto-patches it."""
+    async def test_template_patch_single_uint256(self, ctx):
+        """template(...) with a Value handle for the uint256 arg auto-patches it."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
@@ -492,11 +492,8 @@ class TestDeFiVMFork:
 
         prog = Program()
         amount = prog.const(7)
-        success = prog.call_contract_abi(
-            adapter,
-            "function double(uint256 x) external pure returns (uint256)",
-            Placeholder(amount),
-        )
+        double = prog.template("function double(uint256 x) external pure returns (uint256)")
+        success = prog.call_contract(adapter, double(x=amount))
         prog.assert_(success)
         prog.assert_(prog.eq(prog.returndata_word(0), 14), "expected 14")
         prog.stop()
@@ -504,8 +501,8 @@ class TestDeFiVMFork:
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-    async def test_call_contract_abi_patch_two_uint256_args(self, ctx):
-        """call_contract_abi with two Value args patches both calldata slots."""
+    async def test_template_patch_two_uint256_args(self, ctx):
+        """template(...) with two Value args patches both calldata slots."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
@@ -514,12 +511,8 @@ class TestDeFiVMFork:
         prog = Program()
         a = prog.const(6)
         b = prog.const(11)
-        success = prog.call_contract_abi(
-            adapter,
-            "function addInputs(uint256 a, uint256 b) external pure returns (uint256)",
-            Placeholder(a),
-            Placeholder(b),
-        )
+        add_inputs = prog.template("function addInputs(uint256 a, uint256 b) external pure returns (uint256)")
+        success = prog.call_contract(adapter, add_inputs(a=a, b=b))
         prog.assert_(success)
         prog.assert_(prog.eq(prog.returndata_word(0), 17), "expected 17")
         prog.stop()
@@ -527,22 +520,22 @@ class TestDeFiVMFork:
         receipt = await w3.eth.get_transaction_receipt(tx)
         assert receipt["status"] == 1
 
-    async def test_call_contract_abi_patch_chained(self, ctx):
-        """Chain two calls: first uses a literal arg; second uses the first's result."""
+    async def test_template_patch_chained(self, ctx):
+        """Chain two calls through one template: first uses a literal, second
+        uses the first's result (a runtime Value becoming a patch)."""
         w3 = ctx["w3"]
         vm = ctx["vm"]
         deployer = ctx["deployer"]
         adapter = ctx["adapter_address"]
 
-        double_sig = "function double(uint256 x) external pure returns (uint256)"
-
         prog = Program()
-        # Call 1: double(5) → 10  (literal arg, no Placeholder needed)
-        s1 = prog.call_contract_abi(adapter, double_sig, 5)
+        double = prog.template("function double(uint256 x) external pure returns (uint256)")
+        # Call 1: double(5) → 10  (literal arg baked into blob)
+        s1 = prog.call_contract(adapter, double(x=5))
         prog.assert_(s1)
         amount = prog.returndata_word(0)
-        # Call 2: double(amount) → 20  (Placeholder-wrapped runtime patch)
-        s2 = prog.call_contract_abi(adapter, double_sig, Placeholder(amount))
+        # Call 2: double(amount) → 20  (Value handle becomes a runtime patch)
+        s2 = prog.call_contract(adapter, double(x=amount))
         prog.assert_(s2)
         prog.assert_(prog.eq(prog.returndata_word(0), 20), "expected 20")
         prog.stop()

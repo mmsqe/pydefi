@@ -7,7 +7,6 @@ from hexbytes import HexBytes
 
 from pydefi.types import BasePool, RouteDAG, SwapProtocol, Token
 from pydefi.vm import (
-    Placeholder,
     Program,
     Value,
     build_execution_program_for_dag,
@@ -258,10 +257,14 @@ class TestCallContract:
         p.return_word(success)
         assert _run_int(p) == 1
 
-    def test_call_with_patches(self):
+    def test_call_with_template(self):
+        # Preferred form: build a CalldataTemplate from an ABI signature and
+        # patch by parameter name instead of hand-computing byte offsets.
+        # Raw-patches / explicit-offset paths remain covered by
+        # test_program_templates.py.
         p = Program()
-        template = b"\x12\x34\x56\x78" + b"\x00" * 32
-        success = p.call_contract(_TARGET, template, patches={4: p.const(0xCAFEBABE)})
+        tmpl = p.template("setValue(uint256 v)")
+        success = p.call_contract(_TARGET, tmpl(v=p.const(0xCAFEBABE)))
         p.return_word(success)
         assert _run_int(p) == 1
 
@@ -272,56 +275,69 @@ class TestCallContract:
 
 
 # ---------------------------------------------------------------------------
-# call_contract_abi (ABI-encoded calldata builder)
+# Template-based ABI calldata
 # ---------------------------------------------------------------------------
 
 
-class TestCallContractAbi:
+class TestCallWithTemplate:
+    """Build calldata via :meth:`Program.template` and pass the resulting
+    :class:`CalldataPayload` to :meth:`call_contract`. Covers static args,
+    runtime :class:`Value` placeholders, and the optional ``function`` keyword.
+    """
+
     def test_static_args_no_patches(self):
         p = Program()
-        success = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, 10**18)
+        xfer = p.template("transfer(address to, uint256 amount)")
+        success = p.call_contract(_TARGET, xfer(to=_TARGET, amount=10**18))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_function_keyword_optional(self):
         p = Program()
-        s1 = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, 1)
-        p.assert_(s1)
-        s2 = p.call_contract_abi(_TARGET, "function transfer(address,uint256)", _TARGET, 2)
-        p.return_word(s2)
+        bare = p.template("transfer(address to, uint256 amount)")
+        qualified = p.template("function transfer(address to, uint256 amount)")
+        assert bare.signature == qualified.signature
+        p.assert_(p.call_contract(_TARGET, bare(to=_TARGET, amount=1)))
+        s = p.call_contract(_TARGET, qualified(to=_TARGET, amount=2))
+        p.return_word(s)
         assert _run_int(p) == 1
 
     def test_no_args(self):
         p = Program()
-        success = p.call_contract_abi(_TARGET, "ping()")
+        ping = p.template("ping()")
+        success = p.call_contract(_TARGET, ping())
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_value_placeholder_uint256(self):
         p = Program()
         amount = p.const(0xDEADBEEF)
-        success = p.call_contract_abi(_TARGET, "set(uint256)", Placeholder(amount))
+        set_tmpl = p.template("set(uint256 v)")
+        success = p.call_contract(_TARGET, set_tmpl(v=amount))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_value_placeholder_address(self):
         p = Program()
         addr = p.addr(_TARGET)
-        success = p.call_contract_abi(_TARGET, "ping(address)", Placeholder(addr))
+        ping = p.template("ping(address a)")
+        success = p.call_contract(_TARGET, ping(a=addr))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_mixed_static_and_value(self):
         p = Program()
         amount = p.const(7)
-        success = p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET, Placeholder(amount))
+        xfer = p.template("transfer(address to, uint256 amount)")
+        success = p.call_contract(_TARGET, xfer(to=_TARGET, amount=amount))
         p.return_word(success)
         assert _run_int(p) == 1
 
     def test_arity_mismatch_rejected(self):
         p = Program()
-        with pytest.raises(ValueError, match="expected 2"):
-            p.call_contract_abi(_TARGET, "transfer(address,uint256)", _TARGET)
+        xfer = p.template("transfer(address,uint256)")
+        with pytest.raises(TypeError, match="takes 2 positional argument"):
+            xfer(_TARGET)
 
 
 # ---------------------------------------------------------------------------
