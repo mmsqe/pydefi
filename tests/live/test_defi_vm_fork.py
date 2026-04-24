@@ -18,6 +18,7 @@ Run with::
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -26,13 +27,15 @@ from eth_contract.contract import ContractFunction
 from eth_contract.erc20 import ERC20
 from eth_contract.utils import send_transaction as eth_send_transaction
 from hexbytes import HexBytes
+from web3 import Web3
 from web3.exceptions import ContractLogicError, Web3RPCError
 from web3.types import Wei
 
-from pydefi.abi.amm import UNISWAP_V3_POOL
-from pydefi.pathfinder.graph import PoolGraph, V3PoolEdge
+from pydefi.abi.amm import UNISWAP_V2_PAIR, UNISWAP_V3_POOL
+from pydefi.abi.amm import UNISWAP_V3_FACTORY as UNISWAP_V3_FACTORY_ABI
+from pydefi.pathfinder.graph import PoolEdge, PoolGraph, V3PoolEdge
 from pydefi.pathfinder.router import Router
-from pydefi.types import Address, TokenAmount
+from pydefi.types import Address, RouteDAG, RouteSplit, RouteSplitLeg, RouteSwap, Token, TokenAmount
 from pydefi.vm import Patch, Program
 from pydefi.vm.program import (
     assert_ge,
@@ -56,8 +59,16 @@ from pydefi.vm.program import (
     sub,
     swap,
 )
-from pydefi.vm.swap import build_swap_transaction
-from tests.addrs import POOL_WETH_USDC_500, POOL_WETH_USDC_3000
+from pydefi.vm.swap import build_swap_transaction, quote_swap_transaction
+from tests.addrs import (
+    DAI,
+    PAIR_WETH_DAI,
+    POOL_DAI_USDC_100,
+    POOL_WETH_USDC_500,
+    POOL_WETH_USDC_3000,
+    UNISWAP_V3_FACTORY,
+    UNISWAP_V3_QUOTER,
+)
 from tests.live.sol_utils import MOCK_TOKEN_SOL, compile_sol_file, compile_sol_source, deploy, ensure_solc
 from tests.test_aggregator import USDC, WETH
 
@@ -1081,16 +1092,18 @@ class TestApproveProxyFork:
 
 
 # ---------------------------------------------------------------------------
-# Swap execution tests — fork with real V3 pools
+# Quote tests — eth_call only, no token transfers
 # ---------------------------------------------------------------------------
 
 
-async def _v3_pool_edge(w3, pool_address: Address, token_in, token_out) -> V3PoolEdge:
-    pool = UNISWAP_V3_POOL(to=POOL_WETH_USDC_500)
-    token0_addr = await pool.fns.token0().call(w3)
-    slot0 = await pool.fns.slot0().call(w3)
-    liquidity = await pool.fns.liquidity().call(w3)
-    fee = await pool.fns.fee().call(w3)
+async def _v3_pool_edge(w3, pool_address, token_in, token_out) -> V3PoolEdge:
+    pool = UNISWAP_V3_POOL(to=pool_address)
+    token0_addr, slot0, liquidity, fee = await asyncio.gather(
+        pool.fns.token0().call(w3),
+        pool.fns.slot0().call(w3),
+        pool.fns.liquidity().call(w3),
+        pool.fns.fee().call(w3),
+    )
     return V3PoolEdge(
         token_in=token_in,
         token_out=token_out,
@@ -1101,6 +1114,204 @@ async def _v3_pool_edge(w3, pool_address: Address, token_in, token_out) -> V3Poo
         liquidity=liquidity,
         is_token0_in=token0_addr.lower() == token_in.address.lower(),
     )
+
+
+async def _v2_pool_edge(w3, pair_address: str, token_in, token_out) -> PoolEdge:
+    pair = UNISWAP_V2_PAIR(to=pair_address)
+    token0_addr, reserves = await asyncio.gather(
+        pair.fns.token0().call(w3),
+        pair.fns.getReserves().call(w3),
+    )
+    is_token0_in = token0_addr.lower() == token_in.address.lower()
+    reserve_in, reserve_out = (reserves[0], reserves[1]) if is_token0_in else (reserves[1], reserves[0])
+    return PoolEdge(
+        token_in=token_in,
+        token_out=token_out,
+        pool_address=pair_address,
+        protocol="UniswapV2",
+        fee_bps=30,
+        reserve_in=reserve_in,
+        reserve_out=reserve_out,
+        extra={"is_token0_in": is_token0_in},
+    )
+
+
+def _leg_to_dag(token_in: Token, leg: RouteSplitLeg) -> RouteDAG:
+    """Convert a :class:`~pydefi.types.RouteSplitLeg` to a linear :class:`~pydefi.types.RouteDAG`."""
+    dag = RouteDAG().from_token(token_in)
+    for action in leg.actions:
+        if isinstance(action, RouteSwap):
+            dag.swap(action.token_out, action.pool)
+    return dag
+
+
+def _assert_quote_within(on_chain: int, off_chain: int, tolerance_bps: int = 100) -> None:
+    assert abs(on_chain - off_chain) * 10_000 <= off_chain * tolerance_bps, (
+        f"on-chain={on_chain}  off-chain={off_chain}  diverge > {tolerance_bps / 100:.2f}%"
+    )
+
+
+async def _quote_split_legs(
+    dag: RouteDAG,
+    amount_in: int,
+    vm_address: str,
+    w3,
+) -> int:
+    """Quote each leg of a split DAG in parallel and return the summed on-chain output."""
+    assert dag.token_in is not None
+    token_in = dag.token_in
+    leg_weights = Router.dag_leg_weights(dag)
+    split_action = dag.actions[0]
+    assert isinstance(split_action, RouteSplit)
+    quotes = await asyncio.gather(
+        *[
+            quote_swap_transaction(
+                _leg_to_dag(token_in, leg),
+                amount_in * weight // 10_000,
+                vm_address,
+                w3,
+                quoter_address=UNISWAP_V3_QUOTER,
+            )
+            for leg, weight in zip(split_action.legs, leg_weights)
+        ]
+    )
+    for quoted, weight in zip(quotes, leg_weights):
+        assert quoted.amount > 0, f"leg weight={weight}bps returned zero on-chain quote"
+    return sum(q.amount for q in quotes)
+
+
+# Synthetic V3 liquidity used in split-quote tests so the optimizer reliably
+# splits across pools regardless of (varying) mainnet depths.
+_SYNTH_V3_LIQUIDITY = 10**15
+_ZERO_ADDR_HEX = "0x" + "0" * 40
+
+
+async def _build_synthetic_v3_graph(w3, token_in, token_out, pool_addresses) -> PoolGraph:
+    """Fetch real V3 pool state in parallel, then rebuild edges with fee-equalized synthetic liquidity."""
+    edges = await asyncio.gather(*[_v3_pool_edge(w3, addr, token_in, token_out) for addr in pool_addresses])
+    graph = PoolGraph()
+    for addr, edge in zip(pool_addresses, edges):
+        graph.add_pool(
+            V3PoolEdge(
+                token_in=token_in,
+                token_out=token_out,
+                pool_address=addr,
+                protocol="UniswapV3",
+                fee_bps=5,
+                sqrt_price_x96=edge.sqrt_price_x96,
+                liquidity=_SYNTH_V3_LIQUIDITY,
+                is_token0_in=edge.is_token0_in,
+            )
+        )
+    return graph
+
+
+def _assert_split_count(dag: RouteDAG, *, expected: int) -> None:
+    weights = Router.dag_leg_weights(dag)
+    assert len(weights) == expected, (
+        f"expected {expected}-leg split with fee-equalized pools, got {len(weights)}: "
+        f"{[f'{w / 100:.0f}%' for w in weights]}"
+    )
+
+
+@pytest.mark.fork
+class TestQuoteFork:
+    """Quote various swap routes via DeFiVM eth_call on a mainnet fork.
+
+    Uses forked mainnet pool state — no DEFI_VM env var needed, no token transfers.
+    """
+
+    async def test_single_hop_v3_quote(self, ctx) -> None:
+        """Single V3 hop: quote 1 WETH→USDC via fee=500 pool."""
+        w3 = ctx["w3"]
+        vm_address = ctx["vm_address"]
+
+        edge = await _v3_pool_edge(w3, POOL_WETH_USDC_500, WETH, USDC)
+        graph = PoolGraph()
+        graph.add_pool(edge)
+
+        route = Router(graph).find_best_route(TokenAmount(WETH, 10**18), USDC)
+        assert route.dag is not None
+        quoted = await quote_swap_transaction(
+            route.dag,
+            route.amount_in.amount,
+            vm_address,
+            w3,
+            quoter_address=UNISWAP_V3_QUOTER,
+        )
+
+        assert quoted.amount > 0
+        _assert_quote_within(quoted.amount, route.amount_out.amount)
+
+    async def test_multi_hop_v2v3_quote(self, ctx) -> None:
+        """Two-hop: WETH→DAI via V2 pair, DAI→USDC via V3 fee=100 stable pool."""
+        w3 = ctx["w3"]
+        vm_address = ctx["vm_address"]
+
+        v2_edge = await _v2_pool_edge(w3, PAIR_WETH_DAI, WETH, DAI)
+        v3_edge = await _v3_pool_edge(w3, POOL_DAI_USDC_100, DAI, USDC)
+
+        graph = PoolGraph()
+        graph.add_pool(v2_edge)
+        graph.add_pool(v3_edge)
+
+        route = Router(graph).find_best_route(TokenAmount(WETH, 10**18), USDC)
+        assert len(route.steps) == 2, f"expected 2-hop route, got {len(route.steps)}"
+        assert route.dag is not None
+
+        quoted = await quote_swap_transaction(
+            route.dag,
+            route.amount_in.amount,
+            vm_address,
+            w3,
+            quoter_address=UNISWAP_V3_QUOTER,
+        )
+        assert quoted.amount > 0
+
+    async def test_split_weth_to_usdc_quote(self, ctx) -> None:
+        """2-leg split: WETH→USDC across fee=500 and fee=3000 V3 pools.
+
+        Uses fee-equalized pools with synthetic liquidity so the optimizer
+        reliably produces a 2-leg split regardless of mainnet pool depths.
+        """
+        w3 = ctx["w3"]
+        vm_address = ctx["vm_address"]
+
+        graph = await _build_synthetic_v3_graph(w3, WETH, USDC, [POOL_WETH_USDC_500, POOL_WETH_USDC_3000])
+
+        amount_in = TokenAmount(WETH, 10**18)
+        dag = Router(graph).find_best_split(amount_in, USDC, step_bps=1000)
+        _assert_split_count(dag, expected=2)
+
+        on_chain_total = await _quote_split_legs(dag, amount_in.amount, vm_address, w3)
+        assert on_chain_total > 0
+
+    async def test_three_pool_weth_usdc_quote(self, ctx) -> None:
+        """3-leg split: 1 WETH→USDC quoted across fee=500, 3000, 10000 V3 pools.
+
+        Uses fee-equalized pools with synthetic liquidity to force a 3-leg split;
+        on-chain quotes still hit the real pools via QuoterV2.
+        """
+        w3 = ctx["w3"]
+        vm_address = ctx["vm_address"]
+
+        factory = UNISWAP_V3_FACTORY_ABI(to=Web3.to_checksum_address(UNISWAP_V3_FACTORY))
+        pool_addrs_raw = await asyncio.gather(
+            *[factory.fns.getPool(WETH.address, USDC.address, fee_tier).call(w3) for fee_tier in (500, 3000, 10000)]
+        )
+        pool_addrs = []
+        for fee_tier, raw in zip((500, 3000, 10000), pool_addrs_raw):
+            assert raw != _ZERO_ADDR_HEX, f"V3 WETH/USDC fee={fee_tier} pool not found on fork"
+            pool_addrs.append(Web3.to_checksum_address(raw))
+
+        graph = await _build_synthetic_v3_graph(w3, WETH, USDC, pool_addrs)
+
+        amount_in = TokenAmount(WETH, 10**18)
+        dag = Router(graph).find_best_split(amount_in, USDC, step_bps=500, max_splits=3)
+        _assert_split_count(dag, expected=3)
+
+        on_chain_total = await _quote_split_legs(dag, amount_in.amount, vm_address, w3)
+        assert on_chain_total > 0
 
 
 _WETH_DEPOSIT = ContractFunction.from_abi("function deposit() external payable")

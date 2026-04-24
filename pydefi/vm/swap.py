@@ -35,12 +35,13 @@ that ``DeFiVM.fallback()`` knows which token to repay:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from eth_abi import encode
 from eth_contract.contract import ContractFunction
-from eth_utils import keccak
 
-from pydefi.types import Address, RouteDAG, RouteSwap, SwapProtocol, SwapTransaction
+from pydefi.abi.vm import DeFiVM
+from pydefi.types import Address, RouteDAG, RouteSwap, SwapProtocol, SwapTransaction, TokenAmount
 from pydefi.vm.builder import Patch, Program
 from pydefi.vm.program import (
     _SWAP2,
@@ -55,6 +56,9 @@ from pydefi.vm.program import (
     ret_u256,
     swap,
 )
+
+if TYPE_CHECKING:
+    from web3 import AsyncWeb3
 
 # ---------------------------------------------------------------------------
 # Pool function ABI signatures — selectors and argument encoding are computed
@@ -427,8 +431,6 @@ def _build_route_swap_segment(
 # High-level transaction builders
 # ---------------------------------------------------------------------------
 
-_EXECUTE_SELECTOR: bytes = keccak(text="execute(bytes)")[:4]
-
 
 def build_swap_transaction(
     dag: RouteDAG,
@@ -459,5 +461,33 @@ def build_swap_transaction(
         recipient=recipient,
         min_final_out=min_final_out,
     )
-    calldata = _EXECUTE_SELECTOR + encode(["bytes"], [bytes(program)])
-    return SwapTransaction(to=vm_address, data=calldata)
+    return SwapTransaction(to=vm_address, data=_encode_execute_calldata(program))
+
+
+def _encode_execute_calldata(program: Program) -> bytes:
+    return DeFiVM.fns.execute(bytes(program)).data
+
+
+async def quote_swap_transaction(
+    dag: RouteDAG,
+    amount_in: int,
+    vm_address: str,
+    w3: "AsyncWeb3",
+    *,
+    quoter_address: Address | None = None,
+) -> TokenAmount:
+    """Simulate a swap via ``eth_call`` on the DeFiVM contract — supports V2 and V3.
+
+    Composes a DeFiVM quote program from *dag* via
+    :func:`~pydefi.vm.dag.build_quote_program_for_dag` and executes it against
+    *vm_address*.  No tokens are transferred; the program reads pool state
+    on-chain and returns the estimated output amount.
+    """
+    from pydefi.vm.dag import build_quote_program_for_dag
+
+    if not dag.actions:
+        raise ValueError("quote_swap_transaction: route DAG must contain at least one action")
+
+    program = build_quote_program_for_dag(dag, amount_in=amount_in, quoter_address=quoter_address)
+    result = await w3.eth.call({"to": vm_address, "data": _encode_execute_calldata(program)})
+    return TokenAmount(token=dag.actions[-1].token_out, amount=int.from_bytes(result[:32], "big"))
