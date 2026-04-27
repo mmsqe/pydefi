@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 from vyper.compiler.settings import Settings, anchor_settings
 from vyper.semantics.types.bytestrings import BytesT, StringT
-from vyper.semantics.types.primitives import AddressT, BoolT, BytesM_T
+from vyper.semantics.types.primitives import AddressT, BytesM_T
 from vyper.semantics.types.shortcuts import UINT256_T
 from vyper.semantics.types.subscriptable import DArrayT, SArrayT, TupleT
 from vyper.venom.basicblock import IRLiteral, IROperand, IRVariable
