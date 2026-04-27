@@ -77,6 +77,14 @@ class ProgramContext(VenomCodegenContext):
         fn = ir_ctx.create_function(fn_name)
         if ir_ctx.entry_function is None:
             ir_ctx.entry_function = fn
+            # VenomCompiler emits functions in dict insertion order. Ensure
+            # the entry function is first once at construction time.
+            functions = ir_ctx.functions
+            if next(iter(functions)) != fn.name:
+                entry_fn = functions.pop(fn.name)
+                reordered = {fn.name: entry_fn, **functions}
+                functions.clear()
+                functions.update(reordered)
         builder = VenomBuilder(ir_ctx, fn)
         super().__init__(module_ctx=_DUMMY_MODULE_T, builder=builder)
 
@@ -225,21 +233,6 @@ class ProgramContext(VenomCodegenContext):
         if flags is None:
             flags = VenomOptimizationFlags()
         run_passes_on(self._ir_ctx, flags)
-
-        # Ensure the entry function is emitted first by the VenomCompiler
-        # (which emits functions in dict-insertion order).  Library functions
-        # created before the entry function (e.g. by build_stdlib) must be
-        # reordered so the bytecode starts at the correct offset.
-        if self._ir_ctx.entry_function is not None:
-            entry_name = self._ir_ctx.entry_function.name
-            functions = self._ir_ctx.functions
-            entry = functions.pop(entry_name)
-            reordered = {entry_name: entry}
-            for name, fn in functions.items():
-                reordered[name] = fn
-            functions.clear()
-            functions.update(reordered)
-
         compiler = VenomCompiler(self._ir_ctx)
         asm = compiler.generate_evm_assembly()
         bytecode, _ = assembly_to_evm(asm)

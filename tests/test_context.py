@@ -18,8 +18,10 @@ from vyper.semantics.types.primitives import AddressT, BytesM_T
 from vyper.semantics.types.shortcuts import UINT256_T
 from vyper.semantics.types.subscriptable import DArrayT, SArrayT, TupleT
 from vyper.venom.basicblock import IRLiteral, IROperand, IRVariable
+from vyper.venom.context import IRContext
 
 from pydefi.vm.context import ProgramContext
+from pydefi.vm.stdlib import build_stdlib
 from tests.conftest import mini_evm
 
 # mini_evm uses the Shanghai fork.  The default Venom EVM version is Prague
@@ -89,6 +91,16 @@ def test_basic_compile():
     ctx.builder.stop()
     bytecode = ctx.compile()
     assert isinstance(bytecode, bytes)
+    assert len(bytecode) > 0
+
+
+def test_stdlib_then_program_compiles():
+    ir_ctx = IRContext()
+    build_stdlib(ir_ctx)
+    ctx = ProgramContext(ir_ctx, "main")
+    ctx.builder.stop()
+    assert next(iter(ir_ctx.functions)) == ir_ctx.entry_function.name
+    bytecode = ctx.compile()
     assert len(bytecode) > 0
 
 
