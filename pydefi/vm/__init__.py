@@ -132,6 +132,7 @@ __all__ = [
     # Venom IR program builder (high-level, typed)
     "ProgramContext",
     "encode_msg",
+    "build_stdlib",
     # Patch type aliases and Patch class
     "Patch",
     "PatchSpec",
