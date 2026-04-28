@@ -109,6 +109,7 @@ from pydefi.vm.program import (
     sub,
     swap,
 )
+from pydefi.vm.stdlib import STDLIB, encode_msg
 from pydefi.vm.swap import (
     V2_AMOUNT_OUT_OFFSET,
     V3_AMOUNT_OUT_OFFSET,
@@ -119,6 +120,7 @@ from pydefi.vm.swap import (
     encode_v3_path,
     v3_pool_swap_calldata,
 )
+from pydefi.vm.venom import ModuleBuilder
 
 __all__ = [
     # In-VM ABI encoding bytecode generators
@@ -126,6 +128,11 @@ __all__ = [
     "emit_abi_encode_packed",
     # Fluent builder
     "Program",
+    # Venom IR module builder
+    "ModuleBuilder",
+    # Venom IR stdlib module
+    "STDLIB",
+    "encode_msg",
     # Patch type aliases and Patch class
     "Patch",
     "PatchSpec",
