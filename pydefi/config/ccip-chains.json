@@ -499,7 +499,7 @@
     "chainFamily": "evm",
     "chainId": 223,
     "chainType": "evm",
-    "displayName": "B\u00b2",
+    "displayName": "B²",
     "feeTokens": [
       "LINK",
       "WBTC",
