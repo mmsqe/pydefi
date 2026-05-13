@@ -35,9 +35,7 @@ _ccip_evm: dict[str, Any] = _ccip_chain_config.get("data", {}).get("evm", {})
 _CCIP_CHAIN_SELECTOR: dict[int, int] = {
     int(cid): int(e["selector"]) for cid, e in _ccip_evm.items() if e.get("supported")
 }
-_CCIP_ROUTER: dict[int, str] = {
-    int(cid): e["router"] for cid, e in _ccip_evm.items() if e.get("supported")
-}
+_CCIP_ROUTER: dict[int, str] = {int(cid): e["router"] for cid, e in _ccip_evm.items() if e.get("supported")}
 
 
 def _ccip_chain_selector(evm_chain_id: int) -> int:
