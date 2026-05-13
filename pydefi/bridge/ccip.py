@@ -26,11 +26,10 @@ from pydefi.types import ZERO_ADDRESS, Address, BridgeQuote, Token, TokenAmount
 EVM_EXTRA_ARGS_V2_TAG: bytes = bytes.fromhex("181dcf10")
 
 # CCIP chain data from https://docs.chain.link/api/ccip/v1/chains?environment=mainnet
-# pydefi/config/ccip-chains.json is a snapshot, keyed by EVM chain ID.
-_ccip_chain_config: dict[str, Any] = json.loads(
+# pydefi/config/ccip-chains.json is ``data.evm`` from that API.
+_ccip_evm: dict[str, Any] = json.loads(
     (Path(__file__).resolve().parent.parent / "config" / "ccip-chains.json").read_text()
 )
-_ccip_evm: dict[str, Any] = _ccip_chain_config.get("data", {}).get("evm", {})
 
 _CCIP_CHAIN_SELECTOR: dict[int, int] = {
     int(cid): int(e["selector"]) for cid, e in _ccip_evm.items() if e.get("supported")
