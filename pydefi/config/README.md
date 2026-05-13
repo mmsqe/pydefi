@@ -11,6 +11,6 @@ Snapshots of chain metadata consumed at import time by bridge modules.
 ### Update
 
 ```bash
-curl -s 'https://docs.chain.link/api/ccip/v1/chains?environment=mainnet' > pydefi/config/ccip-chains.json
+curl -s 'https://docs.chain.link/api/ccip/v1/chains?environment=mainnet' | jq '.' > pydefi/config/ccip-chains.json
 python -m pytest tests/test_bridge.py -k ccip -q
 ```
