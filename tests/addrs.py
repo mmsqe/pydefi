@@ -19,6 +19,9 @@ ZERO_ADDR = ZERO_ADDRESS
 
 #: vitalik.eth — well-funded address used for impersonation in fork tests.
 ETH_WHALE: Address = Address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
+#: Polygon PoS bridge escrow — $1 B+ in mainnet USDC, stable across forks
+#: and never moves spontaneously, so impersonation transfers are reliable.
+USDC_WHALE: Address = Address("0x40ec5B33f54e0E8A33A975908C5BA1c14e5BbbDf")
 #: Analog-Labs EVM interpreter — pre-deployed via CREATE2 on mainnet.
 INTERPRETER_ADDR: Address = Address("0x0000000000001e3F4F615cd5e20c681Cf7d85e8D")
 
@@ -50,6 +53,13 @@ PAIR_WETH_USDC: Address = Address(get_address("PAIR_WETH_USDC", ChainId.ETHEREUM
 PAIR_WETH_DAI: Address = Address(get_address("PAIR_WETH_DAI", ChainId.ETHEREUM))
 PAIR_USDC_DAI: Address = Address(get_address("PAIR_USDC_DAI", ChainId.ETHEREUM))
 PAIR_USDC_USDT: Address = Address(get_address("PAIR_USDC_USDT", ChainId.ETHEREUM))
+
+# ── Aave V3 mainnet ───────────────────────────────────────────────────────────
+# Only the PoolAddressesProvider is pinned — Pool / DataProvider / Oracle are
+# resolved from it on-chain (AaveV3.from_chain), so live tests construct via
+# from_chain rather than pinning the rotating addresses.
+
+AAVE_ADDRESSES_PROVIDER: Address = Address(get_address("AAVE_V3_ADDRESSES_PROVIDER", ChainId.ETHEREUM))
 
 # ── Lucid Labs ────────────────────────────────────────────────────────────────
 

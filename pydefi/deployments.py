@@ -11,8 +11,12 @@ Usage::
 
 from __future__ import annotations
 
+import json
+import re
+from pathlib import Path
+
 from pydefi._utils import decode_address
-from pydefi.types import ChainId, Token
+from pydefi.types import Address, ChainId, Token
 
 _ETH = ChainId.ETHEREUM
 _SEP = ChainId.SEPOLIA
@@ -130,6 +134,31 @@ _CONTRACTS: dict[str, dict[int, str]] = {
 }
 
 
+def _merge_generated(contracts: dict[str, dict[int, str]], filename: str) -> None:
+    """Merge a generated address file (config/<filename>) into *contracts*.
+
+    aave.json and compound.json are produced from upstream registries by
+    config/update.sh. Regenerate with ``bash config/update.sh`` if a file
+    is missing/empty/corrupt."""
+    path = Path(__file__).resolve().parent / "config" / filename
+    hint = "run config/update.sh to (re)generate it"
+    if not path.exists():
+        raise FileNotFoundError(f"{filename} not found: {path} \u2014 {hint}")
+    text = path.read_text()
+    if not text.strip():
+        raise ValueError(f"{filename} is empty: {path} \u2014 {hint}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{filename} is corrupt: {path} ({exc}) \u2014 {hint}") from exc
+    for name, chains in data.items():
+        contracts[name] = {int(cid): addr for cid, addr in chains.items()}
+
+
+_merge_generated(_CONTRACTS, "aave.json")
+_merge_generated(_CONTRACTS, "compound.json")
+
+
 def get_address(name: str, chain_id: int) -> str:
     """Return the deployed address of *name* on *chain_id*.
 
@@ -177,3 +206,28 @@ def chains_for(name: str) -> list[int]:
     if name in _TOKENS:
         return list(_TOKENS[name]["addresses"])
     raise KeyError(f"Unknown deployment name {name!r}")
+
+
+def address_for(name: str, chain_id: int) -> Address:
+    """Like :func:`get_address` but returns a chain-aware :class:`Address`
+    instead of a raw string — saves callers from wrapping in
+    ``Address(decode_address(...))`` at every call site."""
+    return Address(decode_address(get_address(name, chain_id), chain_id))
+
+
+def _normalize_symbol(token_symbol: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", token_symbol.upper()).strip("_")
+
+
+def comet_contract_names() -> list[str]:
+    """All ``COMPOUND_V3_*`` deployment names in the registry, sorted."""
+    return sorted(name for name in _CONTRACTS if name.startswith("COMPOUND_V3_"))
+
+
+def comet_contract_for(token_symbol: str) -> str:
+    """Comet deployment name for *token_symbol*, or :class:`ValueError`
+    listing supported symbols."""
+    name = f"COMPOUND_V3_{_normalize_symbol(token_symbol)}"
+    if name not in _CONTRACTS:
+        raise ValueError(f"Compound V3 has no market for token {token_symbol!r}; supported: {comet_contract_names()}")
+    return name
