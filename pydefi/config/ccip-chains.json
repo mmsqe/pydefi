@@ -1,4 +1,24 @@
 {
+  "1": {
+    "chainFamily": "evm",
+    "chainId": 1,
+    "chainType": "evm",
+    "displayName": "Ethereum",
+    "feeTokens": [
+      "GHO",
+      "LINK",
+      "WETH",
+      "ETH"
+    ],
+    "internalId": "ethereum-mainnet",
+    "registryModule": "0x4855174E9479E211337832E109E7721d43A4CA64",
+    "rmn": "0x411dE17f12D1A34ecC7F45f49844626267c75e81",
+    "router": "0x80226fc0Ee2b096224EeAc085Bb9a8cba1146f7D",
+    "selector": "5009297550715157269",
+    "supported": true,
+    "tokenAdminRegistry": "0xb22764f98dD05c789929716D677382Df22C05Cb6",
+    "tokenPoolFactory": "0x17D8a409fE2ceF2d3808bcB61F14aBEFfc28876e"
+  },
   "10": {
     "chainFamily": "evm",
     "chainId": 10,
@@ -342,25 +362,6 @@
     "tokenAdminRegistry": "0x4b238f757f842280FeA88A1c2B4186b71eF8BC5E",
     "tokenPoolFactory": "0x9A82E768C885DEF7C4b47451Fd4Db53d8B21ed07"
   },
-  "185": {
-    "chainFamily": "evm",
-    "chainId": 185,
-    "chainType": "evm",
-    "displayName": "Mint",
-    "feeTokens": [
-      "LINK",
-      "WETH",
-      "ETH"
-    ],
-    "internalId": "mint-mainnet",
-    "registryModule": "0x3869fE7e385554978Eff78423Fd16B5f0974D260",
-    "rmn": "0xA84f7c3E7d1025EF1F991110B1956c024bb6Ac99",
-    "router": "0x1d86012266F214a368766C2B9329FdCC75B1Ce6b",
-    "selector": "17164792800244661392",
-    "supported": true,
-    "tokenAdminRegistry": "0xfAb243379A10D8090B32BC706288c2187dbe495C",
-    "tokenPoolFactory": "0xE67E30B1b4F80A35852488757C3efc093903651A"
-  },
   "1868": {
     "chainFamily": "evm",
     "chainId": 1868,
@@ -493,25 +494,6 @@
     "supported": true,
     "tokenAdminRegistry": "0x2e1543255119CfB9D3501E32d7f5B244E59A06F4",
     "tokenPoolFactory": "0x5931822f394baBC2AACF4588E98FC77a9f5aa8C9"
-  },
-  "228": {
-    "chainFamily": "evm",
-    "chainId": 228,
-    "chainType": "evm",
-    "displayName": "Mind Network",
-    "feeTokens": [
-      "LINK",
-      "WETH",
-      "ETH"
-    ],
-    "internalId": "mind-mainnet",
-    "registryModule": "0x7bc6fB227983Ad829dF8b210407A589F2EB34f64",
-    "rmn": "0x4F26203d04A57A73df795DBed362d3A8d5C34D0c",
-    "router": "0x3E13485E767D53f938cD4AF502111d3fF8726A2D",
-    "selector": "11690709103138290329",
-    "supported": true,
-    "tokenAdminRegistry": "0x469169915210462F5e01EFBE0822Cf7079F9306b",
-    "tokenPoolFactory": "0xD3F31950e5Ec340b021D0d27454F44Edb7304C18"
   },
   "232": {
     "chainFamily": "evm",
@@ -970,6 +952,25 @@
     "tokenAdminRegistry": "0xf4a170A36D4C656F614d44453f73308Bdb275196",
     "tokenPoolFactory": "0xe8464c353210Cc398A45dB2454FBc5BCd25fFf20"
   },
+  "47763": {
+    "chainFamily": "evm",
+    "chainId": 47763,
+    "chainType": "evm",
+    "displayName": "Neo X",
+    "feeTokens": [
+      "LINK",
+      "WGAS",
+      "GAS"
+    ],
+    "internalId": "neox-mainnet",
+    "registryModule": "0x051665f2455116e929b9972c36d23070F5054Ce0",
+    "rmn": "0x024F6a98712F5d9b7464B871ba36e1CF0BdB2C5d",
+    "router": "0xd18b6b2306920d8Ae13b4A2D06b55AD36A6Fa2C7",
+    "selector": "7222032299962346917",
+    "supported": true,
+    "tokenAdminRegistry": "0x344FCBb30EC9ECf58c8399EDe0430592E6703BC1",
+    "tokenPoolFactory": "0x684bBDaD7Eabc58596DF0c0Ba59Df05FD6a519Bf"
+  },
   "480": {
     "chainFamily": "evm",
     "chainId": 480,
@@ -1283,7 +1284,7 @@
     "displayName": "Kaia",
     "feeTokens": [
       "LINK",
-      "WKAIA",
+      "WKLAY",
       "KAIA"
     ],
     "internalId": "kaia-mainnet",
