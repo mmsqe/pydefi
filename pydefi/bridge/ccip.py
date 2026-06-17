@@ -79,7 +79,7 @@ class CCIP:
         w3: AsyncWeb3,
         src_chain_id: int,
         dst_chain_id: int,
-        router_address: str | None = None,
+        router_address: Address | str | None = None,
         fee_token: Address | None = None,
         fee_token_decimals: int = 18,
         fee_token_symbol: str | None = None,
@@ -88,11 +88,12 @@ class CCIP:
         self.dst_chain_id = dst_chain_id
         self.w3 = w3
 
-        self.router_address = router_address or _CCIP_ROUTER.get(src_chain_id, "")
-        if not self.router_address:
+        router = router_address or _CCIP_ROUTER.get(src_chain_id, "")
+        if not router:
             raise BridgeError(
                 f"CCIP: no Router address known for chain {src_chain_id}. Pass router_address explicitly."
             )
+        self.router_address = Address(router)
 
         self.fee_token: Address = fee_token if fee_token is not None else ZERO_ADDRESS
         # bool subclasses int — reject explicitly so True/False don't sneak in.
@@ -107,6 +108,11 @@ class CCIP:
         self.dst_chain_selector = _ccip_chain_selector(dst_chain_id)
 
     protocol_name: str = "CCIP"
+
+    @property
+    def spender(self) -> Address:
+        """The CCIP Router — the contract ``ccipSend`` pulls ``token_in`` through."""
+        return self.router_address
 
     def _build_message(
         self,
@@ -163,7 +169,7 @@ class CCIP:
         return int(fee)
 
     # -----------------------------------------------------------------------
-    # BaseBridge interface
+    # Bridge interface
     # -----------------------------------------------------------------------
 
     async def get_quote(
@@ -261,7 +267,6 @@ class CCIP:
 
     async def build_bridge_compose_tx(
         self,
-        token_in: Token,
         amount_in: TokenAmount,
         composer_address: Address,
         program: bytes,
@@ -282,6 +287,7 @@ class CCIP:
         """
         if not program:
             raise BridgeError("CCIP: program must not be empty for compose transactions.")
+        token_in = amount_in.token
         message = self._build_message(
             recipient=composer_address,
             token_in=token_in,
