@@ -21,7 +21,11 @@ dependencies = [
     "base58>=2.1.0",
     "vyper @ git+https://github.com/vyperlang/vyper.git@bdf00d314d335565be40bd064975b514e19b7029",
     "networkx>=3.6.1",
+    "titanoboa>=0.2.8",
 ]
+
+[tool.uv.sources]
+titanoboa = { path = "../titanoboa", editable = true }
 
 [project.optional-dependencies]
 indexer = [
@@ -46,7 +50,7 @@ where = ["."]
 include = ["pydefi*"]
 
 [tool.setuptools.package-data]
-pydefi = ["config/*.json"]
+pydefi = ["config/*.json", "venom/*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
