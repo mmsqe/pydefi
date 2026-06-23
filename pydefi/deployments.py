@@ -66,6 +66,7 @@ _TOKENS: dict[str, dict] = {
         "decimals": 6,
         "addresses": {
             _ETH: "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            _SEP: "0xaA8E23Fb1079EA71e0a56F48a2aA51851D8433D0",
             ChainId.MANTRA: "0x3806640578b710d8480910bF51510bc538d2F51A",
             ChainId.KITE: "0x3Fdd283C4c43A60398bf93CA01a8a8BD773a755b",
         },
@@ -175,12 +176,47 @@ def _merge_generated(contracts: dict[str, dict[int, str]], filename: str) -> Non
         contracts[name] = {int(cid): addr for cid, addr in chains.items()}
 
 
+def _merge_cctp(filename: str) -> None:
+    """Merge a chain-keyed CCTP config (config/<filename>) into the registries.
+
+    Shape: ``{chain_id: {"TokenMessengerV2", "MessageTransmitterV2", "USDC", "Name"}}``
+    (cctp.json / cctp-testnet.json, synced by config/update_cctp.py).  Registers the
+    ``CCTP_TOKEN_MESSENGER`` / ``CCTP_MESSAGE_TRANSMITTER`` contracts and back-fills
+    any USDC token address not already curated in :data:`_TOKENS`."""
+    path = Path(__file__).resolve().parent / "config" / filename
+    hint = "run config/update_cctp.py to (re)generate it"
+    if not path.exists():
+        raise FileNotFoundError(f"{filename} not found: {path} — {hint}")
+    text = path.read_text()
+    if not text.strip():
+        raise ValueError(f"{filename} is empty: {path} — {hint}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{filename} is corrupt: {path} ({exc}) — {hint}") from exc
+    for cid_str, entry in data.items():
+        cid = int(cid_str)
+        # setdefault throughout: mainnet (loaded first) is canonical — each file
+        # only fills chains not yet registered. Matters for chain IDs present in
+        # both cctp.json and cctp-testnet.json (e.g. 5115). CCTP's native USDC is
+        # registered under its own CCTP_USDC name rather than the general _TOKENS
+        # "USDC" registry, so it doesn't widen get_token("USDC")/yield scanning.
+        if token_messenger := entry.get("TokenMessengerV2"):
+            _CONTRACTS.setdefault("CCTP_TOKEN_MESSENGER", {}).setdefault(cid, token_messenger)
+        if message_transmitter := entry.get("MessageTransmitterV2"):
+            _CONTRACTS.setdefault("CCTP_MESSAGE_TRANSMITTER", {}).setdefault(cid, message_transmitter)
+        if usdc := entry.get("USDC"):
+            _CONTRACTS.setdefault("CCTP_USDC", {}).setdefault(cid, usdc)
+
+
 _merge_generated(_CONTRACTS, "aave.json")
 _merge_generated(_CONTRACTS, "aave_v4.json")
 _merge_generated(_CONTRACTS, "compound.json")
 _merge_generated(_CONTRACTS, "morpho.json")
 _merge_generated(_CONTRACTS, "uniswap.json")
 _merge_generated(_CONTRACTS, "polymarket.json")
+_merge_cctp("cctp.json")
+_merge_cctp("cctp-testnet.json")
 
 
 def get_address(name: str, chain_id: int) -> Address:

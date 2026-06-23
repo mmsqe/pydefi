@@ -60,8 +60,6 @@ Docs: https://developers.circle.com/cctp/concepts/cctp-on-hypercore
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -70,6 +68,7 @@ from web3 import AsyncWeb3, Web3
 
 from pydefi._utils import address_to_bytes32, erc20_approve_tx
 from pydefi.abi.bridge import CCTP_TOKEN_MESSENGER_V2
+from pydefi.deployments import get_address
 from pydefi.exceptions import BridgeError
 from pydefi.types import Address, BridgeQuote, ChainId, Token, TokenAmount
 
@@ -103,11 +102,8 @@ _IRIS_API_BASE = "https://iris-api.circle.com"
 # ---------------------------------------------------------------------------
 # Well-known CCTP v2 contract addresses
 # ---------------------------------------------------------------------------
-# Loaded from cctp.json.
-
-_config_path = Path(__file__).resolve().parent.parent / "config" / "cctp.json"
-with open(_config_path) as _f:
-    _CCTP_CONFIG: dict[int, dict] = {int(k): v for k, v in json.load(_f).items()}
+# Addresses come from pydefi/config (cctp.json / cctp-testnet.json) via the
+# central deployments registry — see _cctp_address below.
 
 # Hardcoded: chain ID → CCTP domain (stable mapping).
 # Source: https://developers.circle.com/cctp/concepts/supported-chains-and-domains
@@ -138,23 +134,18 @@ _CHAINID_TO_DOMAIN: dict[int, int] = {
 }
 _CCTP_DOMAIN: dict[int, int] = _CHAINID_TO_DOMAIN
 
-# TokenMessengerV2, MessageTransmitterV2, and native USDC per chain
-_TOKEN_MESSENGER_V2: dict[int, Address] = {
-    cid: Address(HexBytes(c["TokenMessengerV2"])) for cid, c in _CCTP_CONFIG.items()
-}
-_MESSAGE_TRANSMITTER_V2: dict[int, Address] = {
-    cid: Address(HexBytes(c["MessageTransmitterV2"])) for cid, c in _CCTP_CONFIG.items()
-}
-_USDC: dict[int, Address] = {}
-for cid, c in _CCTP_CONFIG.items():
-    if "USDC" in c:
-        _USDC[cid] = Address(HexBytes(c["USDC"]))
+def _cctp_address(name: str, chain_id: int) -> Address | None:
+    """Resolve a CCTP contract / USDC :class:`Address` from the deployments
+    registry (pydefi/config), or ``None`` when the chain has no CCTP deployment.
 
-# HyperCore mirrors HyperEVM
-_TOKEN_MESSENGER_V2[ChainId.HYPERCORE] = _TOKEN_MESSENGER_V2[ChainId.HYPEREVM]
-_MESSAGE_TRANSMITTER_V2[ChainId.HYPERCORE] = _MESSAGE_TRANSMITTER_V2[ChainId.HYPEREVM]
-if ChainId.HYPEREVM in _USDC:
-    _USDC[ChainId.HYPERCORE] = _USDC[ChainId.HYPEREVM]
+    HyperCore (Hyperliquid L1) has no CCTP contracts of its own — transfers
+    route through HyperEVM — so it reuses HyperEVM's TokenMessenger / USDC.
+    """
+    lookup_chain = ChainId.HYPEREVM if chain_id == ChainId.HYPERCORE else chain_id
+    try:
+        return get_address(name, lookup_chain)
+    except KeyError:
+        return None
 
 # CctpForwarder contract addresses on HyperEVM (keyed by is_mainnet: bool).
 # The CctpForwarder receives USDC minted by CCTP on HyperEVM and forwards it
@@ -270,7 +261,7 @@ class CCTP:
         self._api_base = api_base_url.rstrip("/")
         self.is_mainnet = is_mainnet
 
-        messenger = token_messenger_address or _TOKEN_MESSENGER_V2.get(src_chain_id)
+        messenger = token_messenger_address or _cctp_address("CCTP_TOKEN_MESSENGER", src_chain_id)
         if not messenger:
             raise BridgeError(
                 f"CCTP: no TokenMessengerV2 address known for chain {src_chain_id}. "
@@ -278,11 +269,12 @@ class CCTP:
             )
         self.token_messenger_address = Address(messenger)
 
-        self.src_usdc_address = src_usdc_address or _USDC.get(src_chain_id)
-        if not self.src_usdc_address:
+        usdc = src_usdc_address or _cctp_address("CCTP_USDC", src_chain_id)
+        if not usdc:
             raise BridgeError(
                 f"CCTP: no USDC address known for chain {src_chain_id}. Pass src_usdc_address explicitly."
             )
+        self.src_usdc_address = Address(usdc)
 
         self.cctp_forwarder_address = cctp_forwarder_address or _CCTP_FORWARDER[is_mainnet]
 
@@ -624,7 +616,7 @@ class CCTP:
         Raises:
             :class:`~pydefi.exceptions.BridgeError`: If no address is known.
         """
-        addr = _MESSAGE_TRANSMITTER_V2.get(chain_id)
+        addr = _cctp_address("CCTP_MESSAGE_TRANSMITTER", chain_id)
         if addr is None:
             raise BridgeError(f"CCTP: no MessageTransmitterV2 address known for chain {chain_id}")
         return addr
@@ -636,7 +628,7 @@ class CCTP:
         Raises:
             :class:`~pydefi.exceptions.BridgeError`: If no address is known.
         """
-        addr = _USDC.get(chain_id)
+        addr = _cctp_address("CCTP_USDC", chain_id)
         if addr is None:
             raise BridgeError(f"CCTP: no USDC address known for chain {chain_id}")
         return addr

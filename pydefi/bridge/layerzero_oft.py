@@ -39,6 +39,11 @@ _LZ_EID: dict[int, int] = {
     480: 30337,  # World Chain
     534352: 30214,  # Scroll
     7777777: 30195,  # Zora
+    # --- testnets ---
+    11155111: 40161,  # Ethereum Sepolia
+    421614: 40231,  # Arbitrum Sepolia
+    11155420: 40232,  # Optimism Sepolia
+    84532: 40245,  # Base Sepolia
 }
 
 # LayerZero v2 executor options (``OptionsBuilder`` TYPE_3 wire format). The
