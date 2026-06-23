@@ -16,11 +16,13 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+tests/*/*.db
 
 # IDE
 .vscode/
 .idea/
 *.tgz
+.claude/
 
 /.env
 /.envrc

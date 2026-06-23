@@ -42,8 +42,15 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from pydefi.abi.codec import codec
 from pydefi.rpc import get_w3
 from pydefi.types import Address, ChainId
+from pydefi.utils import load_local_env
 from tests.addrs import INTERPRETER_ADDR
 from tests.live.sol_utils import compile_interpreter_sync
+
+# Load the repo-root ``.env`` once for the whole live/testnet suite so that
+# SEPOLIA_RPC_URL / SEPOLIA_PRIVATE_KEY / SEPOLIA_DEFI_VM and friends are
+# available to every test module's top-level ``os.getenv`` at collection time,
+# regardless of which file runs.  conftest is imported before any test module.
+load_local_env()
 
 # ---------------------------------------------------------------------------
 # Public RPC
