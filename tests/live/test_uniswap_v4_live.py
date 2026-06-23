@@ -7,12 +7,21 @@ hooks), these read live state via ``StateView`` and assert that local
 pathfinder.
 """
 
+import os
+
 import pytest
+from eth_account import Account
+from eth_contract import Contract
+from eth_contract.erc20 import ERC20
+from eth_contract.utils import send_transaction
+from web3 import Web3
+from web3.types import Wei
 
 from pydefi.amm.uniswap_v4 import UniswapV4
 from pydefi.pathfinder.graph import PoolGraph
 from pydefi.pathfinder.router import Router
 from pydefi.types import ZERO_ADDRESS, TokenAmount
+from pydefi.vm.swap import build_swap_transaction
 from tests.addrs import (
     UNISWAP_V4_POOL_MANAGER,
     UNISWAP_V4_QUOTER,
@@ -20,8 +29,23 @@ from tests.addrs import (
     USDC,
     WETH,
 )
+from tests.live.sepolia_helpers import (
+    USDC_SEP,
+    USDC_SEPOLIA,
+    WETH_SEP,
+    WETH_SEPOLIA,
+    connect,
+    discover_sepolia_v4_weth_usdc_edge,
+    require_env,
+)
 
 _AMOUNT_IN = 10**16  # 0.01 WETH — small enough to stay within the current tick
+
+# Sepolia broadcast env for the DeFiVM V4 swap test appended at the bottom.
+SEPOLIA_RPC_URL = os.getenv("SEPOLIA_RPC_URL", "").strip()
+SEPOLIA_PRIVATE_KEY = os.getenv("SEPOLIA_PRIVATE_KEY", "").strip()
+SEPOLIA_DEFI_VM = os.getenv("SEPOLIA_DEFI_VM", "").strip()
+_WETH_DEPOSIT = Contract.from_abi(["function deposit() external payable"])
 
 
 @pytest.fixture
@@ -106,3 +130,109 @@ class TestUniswapV4Live:
         assert abs(result.implied_fee_pips - 500) <= 5, f"implied {result.implied_fee_pips} pips"
         assert edge.hook_fee_calibrated
         assert abs(edge.lp_fee_pips - 500) <= 5
+
+
+# ===========================================================================
+# Sepolia V4 swap via DeFiVM (ported from swap_route_test, adapted to RouteDAG)
+# ===========================================================================
+@pytest.mark.live
+@pytest.mark.asyncio
+async def test_v4_weth_to_usdc_via_defi_vm() -> None:
+    """Execute a WETH→USDC swap through a Uniswap V4 pool via DeFiVM on Sepolia.
+
+    V4 unlock/settle pattern:
+    1. Sender pre-transfers WETH to DeFiVM.
+    2. DeFiVM calls ``PoolManager.unlock(data)`` where *data* encodes the
+       PoolKey, SwapParams, and settlement addresses.
+    3. PoolManager fires ``unlockCallback(bytes)`` into DeFiVM's ``fallback()``.
+    4. DeFiVM calls ``pm.swap()`` → ``pm.sync(tokenIn)`` → ``erc20.transfer`` →
+       ``pm.settle()`` → ``pm.take(tokenOut, recipient, amountOut)``.
+    5. unlock() returns ``abi.encode(amountOut)`` to the DeFiVM program which
+       verifies it meets the minimum slippage requirement.
+    """
+    require_env("SEPOLIA_RPC_URL", "SEPOLIA_PRIVATE_KEY", "SEPOLIA_DEFI_VM")
+
+    w3 = await connect(SEPOLIA_RPC_URL)
+
+    account = Account.from_key(SEPOLIA_PRIVATE_KEY)
+    sender = Web3.to_checksum_address(account.address)
+    defi_vm = Web3.to_checksum_address(SEPOLIA_DEFI_VM)
+
+    # -- Step 1: Discover V4 pool and build route -------------------------
+    edge = await discover_sepolia_v4_weth_usdc_edge(w3)
+    if edge is None:
+        pytest.skip("No initialised WETH/USDC V4 pool found on Sepolia — pool may not be seeded")
+    print(f"[v4] found: pool_id={edge.pool_id} fee_bps={edge.fee_bps} liquidity={edge.liquidity}")
+
+    # Derive swap amount from the pool's current liquidity depth so the swap
+    # stays well within the active tick range regardless of the current price.
+    # Virtual token1 (WETH) depth at the current tick: L × sqrtP / 2^96.
+    # Using 0.1% of that depth gives ~0.01% price impact — dozens of ticks
+    # of headroom to the nearest boundary.
+    _Q96 = 2**96
+    swap_amount = max(10**12, edge.liquidity * edge.sqrt_price_x96 // _Q96 // 1000)
+    print(f"[v4] swap_amount={swap_amount} ({swap_amount / 10**18:.8f} WETH)")
+
+    graph = PoolGraph()
+    graph.add_pool(edge)
+    route = Router(graph).find_best_route(TokenAmount(WETH_SEP, swap_amount), USDC_SEP)
+    assert route is not None, "Router found no route through V4 pool"
+    dag = route.dag
+    assert dag is not None, "Router route is missing its DAG representation"
+
+    off_chain_out = route.amount_out.amount
+    print(f"[v4] off-chain estimate: {off_chain_out / 10**6:.6f} USDC  route={route!r}")
+    assert off_chain_out > 0, "off-chain amountOut estimate is zero"
+
+    # (quote_swap_transaction raises NotImplementedError for V4; skip quote step)
+
+    # -- Step 2: Pre-fund DeFiVM with WETH --------------------------------
+    # V4 unlock/settle requires DeFiVM to already hold tokenIn; unlike V3 there
+    # is no flash-swap that defers repayment to a callback.
+    weth = ERC20(to=WETH_SEPOLIA)
+    weth_balance = await weth.fns.balanceOf(sender).call(w3)
+    if weth_balance < swap_amount:
+        weth_deposit = _WETH_DEPOSIT(to=WETH_SEPOLIA)
+        await send_transaction(
+            w3,
+            account,
+            to=WETH_SEPOLIA,
+            data=bytes(weth_deposit.fns.deposit().data),
+            value=Wei(swap_amount),
+        )
+        print(f"[v4] wrapped {swap_amount} wei → WETH")
+
+    await send_transaction(
+        w3,
+        account,
+        to=WETH_SEPOLIA,
+        data=bytes(weth.fns.transfer(defi_vm, swap_amount).data),
+        value=Wei(0),
+    )
+    print(f"[v4] transferred {swap_amount} WETH to DeFiVM ({defi_vm})")
+
+    # -- Step 3: Build and broadcast execute(bytes) -----------------------
+    usdc = ERC20(to=USDC_SEPOLIA)
+    usdc_before = await usdc.fns.balanceOf(sender).call(w3)
+
+    min_final_out = off_chain_out * (10_000 - 100) // 10_000  # 1 % slippage
+    tx = build_swap_transaction(dag, swap_amount, defi_vm, sender, min_final_out=min_final_out)
+    print(f"[v4] executing unlock() program  min_out={min_final_out / 10**6:.6f} USDC")
+
+    receipt = await send_transaction(
+        w3,
+        account,
+        to=tx.to,
+        data=tx.data,
+        value=Wei(tx.value),
+        gas=600_000,
+    )
+    tx_hash = receipt["transactionHash"].hex()
+    print(f"[v4] tx {tx_hash} status={receipt['status']}")
+    assert receipt["status"] == 1, f"DeFiVM V4 swap reverted: {tx_hash}"
+
+    # -- Step 4: Verify USDC received -------------------------------------
+    usdc_after = await usdc.fns.balanceOf(sender).call(w3)
+    received = usdc_after - usdc_before
+    print(f"[v4] received {received / 10**6:.6f} USDC  (min={min_final_out / 10**6:.6f})")
+    assert received >= min_final_out, f"received {received} USDC < min_final_out {min_final_out}  tx={tx_hash}"
